@@ -59,7 +59,7 @@ jobs:
         choco install mingw
         Import-Module $env:ChocolateyInstall\helpers\chocolateyProfile.psm1
         refreshenv
-        mingw-get install msys-gmp
+        C:\ProgramData\mingw64\mingw64\bin\mingw-get install msys-gmp
 
     - name: Set reusable strings
       # Turn repeated input strings (such as the build output directory) into step outputs. These step outputs can be used throughout the workflow file.
