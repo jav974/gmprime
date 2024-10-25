@@ -47,3 +47,11 @@ target_link_libraries(gmprime ${GMP_LIBRARIES})
 add_executable(tests tests/main.cpp)
 target_link_libraries(tests PRIVATE gmprime Boost::ut)
 target_include_directories(tests PRIVATE src)
+
+# Enable testing
+enable_testing()
+
+# Run 'tests'
+add_test(NAME tests
+        COMMAND ${CMAKE_CURRENT_BINARY_DIR}/tests
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
