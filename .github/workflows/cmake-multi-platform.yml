@@ -56,7 +56,10 @@ jobs:
     - name: Install GMP on Windows
       if: matrix.os == 'windows-latest'
       run: |
-        choco install gmp
+        git clone https://github.com/microsoft/vcpkg.git
+        cd vcpkg
+        bootstrap-vcpkg.bat
+        vcpkg install gmp:x86-windows
 
     - name: Set reusable strings
       # Turn repeated input strings (such as the build output directory) into step outputs. These step outputs can be used throughout the workflow file.
