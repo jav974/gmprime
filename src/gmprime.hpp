@@ -86,6 +86,9 @@ public:
     template<typename word_t = mp_limb_t, std::enable_if_t<std::is_integral_v<word_t>, bool> = true>
     reference<word_t> operator[](long int index);
 
+    template<typename word_t>
+    reference<word_t> operator[](const word_index<word_t>& index);
+
     template<typename word_t = mp_limb_t, std::enable_if_t<std::is_integral_v<word_t>, bool> = true>
     word_adapter<word_t> as_span(bool reverse = false);
 

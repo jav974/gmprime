@@ -34,6 +34,11 @@ reference<word_t> gmprime::operator[](const long int index) {
     return reference<word_t>(this, index);
 }
 
+template<typename word_t>
+reference<word_t> gmprime::operator[](const word_index<word_t>& index) {
+    return operator[]<word_t, true>(index.index);
+}
+
 template<typename word_t, std::enable_if_t<std::is_integral_v<word_t>, bool>>
 word_adapter<word_t> gmprime::as_span(const bool reverse) {
     return word_adapter<word_t>(*this, reverse);

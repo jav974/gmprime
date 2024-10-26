@@ -286,7 +286,8 @@ suite<"gmprime::accessor"> accessor = [] {
     "[]<bool>="_test = [] {
         gmprime r(4242);
         const auto before = static_cast<bool>(r.operator[]<bool>(0));
-        r.operator[]<bool>(0) = true;
+        // r.operator[]<bool>(0) = true;
+        r[0_bw] = true;
         const auto after = static_cast<bool>(r.operator[]<bool>(0));
 
         expect(before == false);
