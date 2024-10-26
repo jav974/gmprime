@@ -31,17 +31,35 @@ set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3")
 #set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -g")
 #set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -fsanitize=address -fno-omit-frame-pointer")
 
+set(GMPRIME_PUBLIC_INCLUDE_DIRECTORIES  include)
+set(GMPRIME_PRIVATE_INCLUDE_DIRECTORIES src)
+
+file(GLOB_RECURSE GMPRIME_SOURCE_FILES
+        "${GMPRIME_PRIVATE_INCLUDE_DIRECTORIES}/*.cpp"
+        "${GMPRIME_PRIVATE_INCLUDE_DIRECTORIES}/*.hpp*"
+        "${GMPRIME_PRIVATE_INCLUDE_DIRECTORIES}/*.tpp*"
+)
+file(GLOB_RECURSE GMPRIME_INCLUDE_FILES
+        "${GMPRIME_PUBLIC_INCLUDE_DIRECTORIES}/*.hpp*"
+)
+
 # Build gmprime static lib
-add_library(gmprime STATIC
-        src/gmprime.cpp
-        src/gmprime.hpp
-        src/gmprime.tpp
-        src/gmprime_ios.hpp
-        src/gmprime_reference.tpp
-        src/gmprime_stream.tpp
-        src/gmprime_adapter.tpp
-        src/gmprime_literals.hpp)
-target_link_libraries(gmprime ${GMP_LIBRARIES})
+add_library(${PROJECT_NAME} STATIC ${GMPRIME_INCLUDE_FILES} ${GMPRIME_SOURCE_FILES})
+target_link_libraries(${PROJECT_NAME} ${GMP_LIBRARIES})
+target_include_directories(${PROJECT_NAME} PUBLIC ${GMPRIME_PUBLIC_INCLUDE_DIRECTORIES})
+target_include_directories(${PROJECT_NAME} PRIVATE ${GMPRIME_PRIVATE_INCLUDE_DIRECTORIES})
+set_target_properties(${PROJECT_NAME} PROPERTIES PUBLIC_HEADER "${GMPRIME_INCLUDE_FILES}")
+
+# Install rules
+install(TARGETS ${PROJECT_NAME}
+        EXPORT gmprimeConfig
+        LIBRARY DESTINATION lib
+        ARCHIVE DESTINATION lib
+        PUBLIC_HEADER DESTINATION include)
+
+export(EXPORT gmprimeConfig
+        FILE "${CMAKE_CURRENT_BINARY_DIR}/gmprimeConfig.cmake"
+        NAMESPACE gmprime::)
 
 # Create 'tests' executable, linked with gmprime to run tests suites
 add_executable(tests tests/main.cpp)

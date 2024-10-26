@@ -12,7 +12,7 @@ struct word_index {
 template <char... Cs>
 [[nodiscard]] constexpr uint64_t num() {
     static_assert(((Cs >= '0' and Cs <= '9') and ...));
-    uint64_t result{};
+    uint64_t result = 0;
     for (const char c : std::array{Cs...}) {
         result = result * static_cast<uint64_t>(10) + static_cast<uint64_t>(c - '0');
     }

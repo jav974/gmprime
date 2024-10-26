@@ -4,8 +4,8 @@
 #include <functional>
 #include <cstdint>
 #include <gmpxx.h>
-#include "gmprime_ios.hpp"
-#include "gmprime_literals.hpp"
+#include "../src/gmprime_ios.hpp"
+#include "../src/gmprime_literals.hpp"
 
 namespace GMPrime {
 
@@ -126,12 +126,12 @@ private:
     mpz_class _value;
 };
 
-#include "gmprime_reference.tpp"
-#include "gmprime_adapter.tpp"
-#include "gmprime.tpp"
+#include "../src/gmprime_reference.tpp"
+#include "../src/gmprime_adapter.tpp"
+#include "../src/gmprime.tpp"
 
 } // GMPrime
 
-#include "gmprime_stream.tpp" // NOLINT
+#include "../src/gmprime_stream.tpp" // NOLINT
 
 #endif //GMPRIME_HPP
