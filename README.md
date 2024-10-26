@@ -29,6 +29,7 @@ include(FetchContent)
 FetchContent_Declare(
         gmprime
         GIT_REPOSITORY https://github.com/jav974/gmprime.git
+        GIT_TAG main
 )
 FetchContent_MakeAvailable(gmprime)
 target_link_libraries(${PROJECT_NAME} gmprime)
