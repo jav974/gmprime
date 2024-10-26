@@ -4,6 +4,9 @@
 
 using namespace GMPrime;
 
+gmprime::gmprime(): _value(0) {
+}
+
 gmprime::gmprime(const std::string &value, const int base) {
     _value.set_str(value, base);
 }

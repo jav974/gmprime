@@ -1,8 +1,5 @@
 #pragma once
 
-inline gmprime::gmprime(): _value(0) {
-}
-
 template<typename word_t, std::enable_if_t<std::is_arithmetic_v<word_t> && !std::is_same_v<word_t, bool>, bool>>
 gmprime::gmprime(word_t value) {
     if (std::is_floating_point_v<word_t>) {
