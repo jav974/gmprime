@@ -1,3 +1,7 @@
+![Build Status](https://github.com/jav974/gmprime/actions/workflows/cmake-multi-platform.yml/badge.svg)
+![License](https://img.shields.io/github/license/jav974/gmprime)
+![Coverage](https://img.shields.io/codecov/c/github/jav974/gmprime)
+
 # GMPrime
 
 GMPrime is a C++ library that provides a robust wrapper for the GNU Multiple Precision Arithmetic Library (GMP). It allows for deep integration with C++, making it easier to perform high-precision arithmetic operations.

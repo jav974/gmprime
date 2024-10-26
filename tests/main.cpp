@@ -551,7 +551,7 @@ suite<"gmprime::string"> string = [] {
         gmprime v;
         expect(throws([&] {v.load_from_file("files/dummy.txt");}));
 
-        v.load_from_file("../tests/files/dummy.txt");
+        v.load_from_file("../../tests/files/dummy.txt");
         expect(v > 0);
 
         expect(v.operator[]<char>(0) == 'a');
@@ -561,24 +561,24 @@ suite<"gmprime::string"> string = [] {
 
     "file_write"_test = [] {
         gmprime v;
-        v.load_from_file("../tests/files/dummy.txt");
+        v.load_from_file("../../tests/files/dummy.txt");
         expect(v > 0);
 
-        v.save_to_file("../tests/files/dummy.out.txt");
+        v.save_to_file("../../tests/files/dummy.out.txt");
 
         struct stat buffer{};
-        const bool exists = (stat ("../tests/files/dummy.out.txt", &buffer) == 0);
+        const bool exists = (stat ("../../tests/files/dummy.out.txt", &buffer) == 0);
 
         expect(exists) << "Out file not written";
 
         gmprime t;
-        t.load_from_file("../tests/files/dummy.out.txt");
+        t.load_from_file("../../tests/files/dummy.out.txt");
 
         expect(t.operator[]<char>(0) == 'a');
         expect(t.operator[]<char>(1) == 'b');
         expect(t.operator[]<char>(2) == 'c');
 
-        std::remove("../tests/files/dummy.out.txt");
+        std::remove("../../tests/files/dummy.out.txt");
     };
 };
 
