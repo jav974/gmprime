@@ -1,6 +1,6 @@
 ![Build Status](https://github.com/jav974/gmprime/actions/workflows/cmake-multi-platform.yml/badge.svg)
+[![codecov](https://codecov.io/gh/jav974/gmprime/graph/badge.svg?token=QM7E5GTC4S)](https://codecov.io/gh/jav974/gmprime)
 ![License](https://img.shields.io/github/license/jav974/gmprime)
-![Coverage](https://img.shields.io/codecov/c/github/jav974/gmprime)
 
 # GMPrime
 
