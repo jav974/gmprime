@@ -18,6 +18,12 @@ if (BUILD_TESTING AND (PROJECT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR))
     add_test(NAME gmz_sampled_fold COMMAND gmz -m fold -S 1024 t ${GMZ_SAMPLE})
     add_test(NAME gmz_exhaustive COMMAND gmz -S 0 t ${GMZ_SAMPLE})
 
+    # Faster levels, for text and folded data
+    add_test(NAME gmz_level1 COMMAND gmz -1 t ${GMZ_SAMPLE})
+    add_test(NAME gmz_level2 COMMAND gmz -2 -C on t ${GMZ_SAMPLE})
+    add_test(NAME gmz_level1_fold COMMAND gmz -1 -m fold t ${GMZ_SAMPLE})
+    add_test(NAME gmz_level2_fold COMMAND gmz -2 -m fold-full t ${GMZ_SAMPLE})
+
     # Through files, compressing then decompressing, with a forced table size
     add_test(NAME gmz_files COMMAND ${CMAKE_COMMAND} -DGMZ=$<TARGET_FILE:gmz> -DINPUT=${GMZ_SAMPLE}
              -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/sample -DOPTIONS=-T\;18 -P ${CMAKE_CURRENT_SOURCE_DIR}/round_trip.cmake)

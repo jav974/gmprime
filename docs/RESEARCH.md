@@ -165,6 +165,38 @@ gmz with everything kept, compared with the first version (compress / decompress
 Sizes moved by at most 2 bytes, except lcet10.txt (+95 bytes) and plrabn12.txt (+77 bytes), where the 64 KB
 sample picks the capitals transform that the whole file does not.
 
+After the integer arithmetic and the word reads of the fold templates (processor time, the machine being
+loaded by other runs): alice29.txt 1.09 s / 0.48 s, lcet10.txt 1.86 s / 1.24 s, ptt5 1.26 s / 0.78 s,
+kennedy.xls 4.62 s / 4.07 s, so 2.5 to 6.2 times faster than the first version to compress.
+
+### Faster levels
+
+Each lever measured alone over 8 files (floating point version, before the integer arithmetic), size change:
+
+| Cost | Levers |
+|---|---|
+| under 0.1% | no line contexts (byte above), no last 3 bytes, no line-end distance, no class mixer, no capitals comparison (which compresses the sample twice) |
+| 0.2% to 0.8% | nibble buckets (+0.32%), tables of 2^21 slots (+0.22%), orders 0 to 4 and 6 (+0.53%), no chained maps (+0.77%) |
+| 1.4% to 3% | tables of 2^18 slots, orders 0 to 4, no word contexts, a single mixer |
+| never | no prefetching (60% slower), no learning-rate schedule (larger and slower) |
+
+Combined, the curve bends after dropping the chained maps: further levers cost 1.7% for 5% of time, then 2.8%
+for 11%. Two levels were kept, stored in the message header (2 bits):
+
+- `-1`: orders 0 to 4 and 6 in nibble buckets, without the line contexts, the last 3 bytes and the class
+  mixer, tables of 2^21 slots, no capitals comparison;
+- `-2`: the same without the chained maps.
+
+Applied as is to folded data, `-1` cost kennedy.xls 13.7% for 1.4 times the speed: its byte contexts need orders
+5 and 8 (+10% without them). Folded data now only leaves out its text contexts (words, lines, last
+occurrences), +1.7% for the same speed.
+
+| Level | Canterbury total | alice29.txt | lcet10.txt | plrabn12.txt | kennedy.xls |
+|---|---|---|---|---|---|
+| default | 333,834 | 1.09 s / 0.48 s | 1.86 s / 1.24 s | 1.99 s / 1.39 s | 4.62 s / 4.07 s |
+| `-1` | 337,489 (+1.09%) | 0.43 s / 0.29 s | 0.91 s / 0.79 s | 1.00 s / 0.88 s | 3.22 s / 2.92 s |
+| `-2` | 339,839 (+1.80%) | 0.39 s / 0.24 s | 0.87 s / 0.67 s | 0.88 s / 0.75 s | 2.98 s / 2.62 s |
+
 ## Portability: integer arithmetic
 
 Floating point broke the decoding across platforms. The same gmz source, compressing the same files, gave 2 to 4
@@ -191,4 +223,11 @@ Without the checksum, sizes moved by at most 5 bytes (kennedy.xls 12,970 to 12,9
 
 ## Open ideas
 
-- A fast mode trading a little compression: nibble buckets, fewer contexts, smaller tables.
+- Folds below 64 bits (short records, 16-bit samples), and several folds at once for data with nested periods.
+- Numbers across the fold: predict a field from the same field one record above (difference, linear
+  prediction) rather than its bits.
+- Fields within a fold: autocorrelation inside the row splits a record into fields, each with its own contexts.
+- Elastic folds: rows of varying length (text lines, variable records), aligned on a separator.
+- Linear complexity (Berlekamp-Massey) of bit planes and columns: the bits a linear recurrence would generate.
+- Grammars (Re-Pair): the data as the output of a small program, the other way to treat a number as the result
+  of a computation.

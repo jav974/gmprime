@@ -409,15 +409,16 @@ This model compresses `alice29.txt` (152,089 bytes, from the Canterbury corpus) 
 gmz c data.txt data.gmz    # compress
 gmz d data.gmz data.txt    # decompress
 gmz t data.txt             # compress, decompress, check, report
+gmz -1 c data.txt data.gmz # faster, a little larger (-2: a little more of both)
 ```
 
-It analyzes the file first with `analyze_folds`. Data that folds is coded with bit and byte templates across the fold, in 2D and 3D, and pixel runs; anything else with the text model: orders 0 to 8, words, line structure, last occurrences, indirect modeling, four mixers selected by the partial byte, the highest order seen, the previous byte and its class, and chained probability maps. It tries the capitals transform on text, and a bitmap variant on folded data, and keeps the smaller message. The two ways are compared on the first 64 KB, then the data is compressed once. A CRC-32 of the original ends the message: decompressing anything else (a corrupted file, another table size than the compression's) fails instead of writing wrong data. Options: `-m` forces a mode, `-C` the capitals transform, `-S` the sample (0 compresses the data both ways, slower and sometimes a little smaller), `-T` a table size.
+It analyzes the file first with `analyze_folds`. Data that folds is coded with bit and byte templates across the fold, in 2D and 3D, and pixel runs; anything else with the text model: orders 0 to 8, words, line structure, last occurrences, indirect modeling, four mixers selected by the partial byte, the highest order seen, the previous byte and its class, and chained probability maps. It tries the capitals transform on text, and a bitmap variant on folded data, and keeps the smaller message. The two ways are compared on the first 64 KB, then the data is compressed once. A CRC-32 of the original ends the message: decompressing anything else (a corrupted file, another table size than the compression's) fails instead of writing wrong data. Options: `-1` and `-2` choose a faster level (below), `-m` forces a mode, `-C` the capitals transform, `-S` the sample (0 compresses the data both ways, slower and sometimes a little smaller), `-T` a table size.
 
 On the Canterbury corpus, sizes in bytes:
 
 | File | Size | gzip -9 | bzip2 -9 | xz -9e | gmz | Mode found |
 |---|---|---|---|---|---|---|
-| alice29.txt | 152,089 | 54,194 | 43,202 | 48,536 | **35,566** | text + capitals |
+| alice29.txt | 152,089 | 54,194 | 43,202 | 48,536 | **35,567** | text + capitals |
 | asyoulik.txt | 125,179 | 48,803 | 39,569 | 44,600 | **33,545** | text + capitals |
 | lcet10.txt | 426,754 | 144,462 | 107,706 | 119,496 | **86,152** | text + capitals |
 | plrabn12.txt | 481,861 | 194,357 | 145,577 | 165,464 | **123,387** | text + capitals |
@@ -425,19 +426,29 @@ On the Canterbury corpus, sizes in bytes:
 | kennedy.xls | 1,029,744 | 207,053 | 130,280 | 51,876 | **12,969** | fold of 104 bits, layers of 4 |
 | cp.html | 24,603 | 7,960 | 7,624 | 7,660 | **6,177** | text + capitals |
 | fields.c | 11,150 | 3,136 | 3,039 | 3,040 | **2,323** | text + capitals |
-| grammar.lsp | 3,721 | 1,246 | 1,283 | 1,300 | **993** | text |
-| sum | 38,240 | 12,854 | 12,909 | 9,508 | **9,412** | text |
+| grammar.lsp | 3,721 | 1,246 | 1,283 | 1,300 | **994** | text |
+| sum | 38,240 | 12,854 | 12,909 | 9,508 | **9,413** | text |
 | xargs.1 | 4,227 | 1,756 | 1,762 | 1,820 | **1,444** | text + capitals |
 
 The price is speed, as for every context-mixing compressor. On Apple Silicon:
 
 | File | gmz compress | gmz decompress | xz -9e compress | xz decompress |
 |---|---|---|---|---|
-| alice29.txt | 1.2 s | 0.5 s | 0.05 s | 0.01 s |
-| lcet10.txt | 1.8 s | 1.3 s | 0.08 s | 0.01 s |
-| ptt5 | 1.8 s | 1.1 s | 0.15 s | 0.01 s |
-| kennedy.xls | 6.0 s | 5.2 s | 0.40 s | 0.02 s |
+| alice29.txt | 1.1 s | 0.5 s | 0.05 s | 0.01 s |
+| lcet10.txt | 1.9 s | 1.2 s | 0.08 s | 0.01 s |
+| ptt5 | 1.3 s | 0.8 s | 0.15 s | 0.01 s |
+| kennedy.xls | 4.6 s | 4.1 s | 0.40 s | 0.02 s |
+
+The faster levels trade a little size for speed (compress / decompress):
+
+| Level | Canterbury total | alice29.txt | lcet10.txt | kennedy.xls |
+|---|---|---|---|---|
+| default | 333,834 bytes | 1.1 s / 0.5 s | 1.9 s / 1.2 s | 4.6 s / 4.1 s |
+| `-1` | 337,489 bytes (+1.1%) | 0.4 s / 0.3 s | 0.9 s / 0.8 s | 3.2 s / 2.9 s |
+| `-2` | 339,839 bytes (+1.8%) | 0.4 s / 0.2 s | 0.9 s / 0.7 s | 3.0 s / 2.6 s |
+
+For text they keep fewer contexts and mixers, group the slots of each half byte, use smaller tables and skip the capitals comparison; folded data, whose time goes to the fold templates, only loses its text contexts. `-2` also drops the chained maps. The level is stored in the message.
 
 Messages are portable: the same file gives the same message with GCC and Clang, on x86_64 and ARM64, Linux and macOS, and each decodes the others'.
 
-Memory reaches about 800 MB for large inputs (tables are sized for the data, so small files take much less). Decompression runs the same model once, so it takes about as long as compressing does after the comparison. How these times were reached, 2.2 to 4.4 times faster than the first version, is told in [docs/RESEARCH.md](docs/RESEARCH.md).
+Memory reaches about 800 MB for large inputs (tables are sized for the data, so small files take much less). Decompression runs the same model once, so it takes about as long as compressing does after the comparison. How these times were reached, 2.5 to 6 times faster than the first version, is told in [docs/RESEARCH.md](docs/RESEARCH.md).
