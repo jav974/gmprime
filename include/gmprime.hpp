@@ -126,7 +126,9 @@ public:
 
     [[nodiscard]] size_t used_bits() const;
     [[nodiscard]] size_t size_in_base(int base = 2) const;
-    // Bit access works on the magnitude, consistently with word access ([] and as_span)
+    // Bit access works on the magnitude, as GMP stores it, consistently with word access ([], as_span, bits).
+    // Bitwise operators (& | ^ ~ >>) follow two's complement instead, like an int: for a negative number,
+    // get_bit(k) can differ from ((a >> k) & 1), e.g. for -2, bit 2 is 0 in the magnitude and 1 in two's complement.
     [[nodiscard]] bool get_bit(size_t pos) const;
     gmprime& set_bit(size_t pos, bool value);
 
