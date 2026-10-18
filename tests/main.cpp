@@ -8,6 +8,7 @@
 #include <unordered_set>
 #include <boost/ut.hpp>
 #include <gmprime.hpp>
+#include <gmprime_coding.hpp>
 
 using namespace boost::ut;
 using namespace GMPrime;
@@ -1091,6 +1092,349 @@ suite<"gmprime::context_analysis"> context_analysis = [] {
 
         const auto any = aaaa.repetitions(0);
         expect(any.matches == 1 && any.matched_bytes == 3 && any.literals == 1) << "min_length 0 counts as 1";
+    };
+
+    "bytes_round_trip"_test = [] {
+        const std::vector<unsigned char> data{'a', 0, 'b', 0, 0};
+        const auto value = gmprime::from_bytes(data);
+
+        expect(value.bytes() == data) << "high zero bytes kept, like a loaded file";
+        expect(value == 0x620061);
+        expect(gmprime::from_bytes({}).bytes().empty());
+    };
+
+    "autocorrelation"_test = [] {
+        // "ab" repeated: the bits repeat every 16
+        const auto periodic = gmprime::from_bytes(std::vector<unsigned char>{'a', 'b', 'a', 'b', 'a', 'b', 'a', 'b'});
+        const auto self = periodic.autocorrelation(100);
+
+        expect(self.size() == 101);
+        expect(self[0] == 64) << "every bit equals itself";
+        expect(self[16] == 48) << "a period: all of the overlap equal";
+        expect(self[8] < 48);
+        expect(self[64] == 0 && self[100] == 0) << "no overlap";
+    };
+    "autocorrelation_matches_naive"_test = [] {
+        std::string text;
+        random_text(200, 4, 11, text);
+        gmprime value;
+        from_bytes(text, value);
+        const size_t length = 8 * text.size();
+        const auto self = value.autocorrelation(70);
+
+        for (size_t d = 0; d <= 70; ++d) {
+            size_t equal = 0;
+            for (size_t p = 0; p + d < length; ++p) {
+                equal += value.get_bit(p) == value.get_bit(p + d) ? 1 : 0;
+            }
+            expect(self[d] == equal) << "distance" << d;
+        }
+        expect(gmprime(-0x1234).autocorrelation(5) == gmprime(0x1234).autocorrelation(5)) << "on the magnitude";
+    };
+};
+
+suite<"gmprime::coding"> coding_suite = [] {
+    using namespace GMPrime::coding;
+
+    "logistic_domain"_test = [] {
+        expect(std::fabs(stretch(0.5)) < 1e-12);
+        expect(std::fabs(squash(stretch(0.8)) - 0.8) < 1e-12);
+        expect(clamp_probability(0) == 1.0 / 4096 && clamp_probability(1) == 4095.0 / 4096);
+        expect(probability_12(0.5) == 2048 && probability_12(0) == 1 && probability_12(1) == 4095);
+    };
+
+    "bit_counter"_test = [] {
+        bit_counter counter;
+        expect(!counter.seen() && counter.p == 0.5f);
+
+        counter.update(1, 3);
+        expect(counter.seen() && counter.p > 0.8f) << "learns fast at first: rate 1 / 1.5";
+        for (int i = 0; i < 10; ++i) {
+            counter.update(1, 3);
+        }
+        expect(counter.n == 3) << "the count stops at the limit";
+        expect(counter.p > 0.95f);
+    };
+
+    "bit_history"_test = [] {
+        bit_history history;
+        for (int i = 0; i < 3; ++i) {
+            history.update(1);
+        }
+        expect(history.ones() == 3 && history.zeros() == 0);
+
+        history.update(0);
+        expect(history.zeros() == 1 && history.ones() == 2) << "the opposite count beyond 2 is halved, rounded up";
+
+        for (int i = 0; i < 20; ++i) {
+            history.update(0);
+        }
+        expect(history.zeros() == 15 && history.ones() == 2) << "capped at 15, the opposite count no longer halved at 2";
+    };
+
+    "history_map"_test = [] {
+        history_map map;
+        bit_history seen_one;
+        seen_one.update(1);
+        expect(std::fabs(map.p(seen_one) - 0.75) < 1e-6) << "starts from the counts: (1 + 1/2) / (0 + 1 + 1)";
+
+        for (int i = 0; i < 50; ++i) {
+            map.update(seen_one, 0);
+        }
+        expect(map.p(seen_one) < 0.2) << "learns what follows that history in practice";
+    };
+
+    "hashed_tables"_test = [] {
+        hashed_counters counters(10);
+        counters.at(42).update(1, 30);
+        expect(counters.at(42).seen()) << "same hash, same slot";
+
+        const std::vector<uint8_t> history{'a', 'b', 'c'};
+        expect(context_hash(history, 3, 1) != context_hash(history, 3, 2));
+        expect(context_hash(history, 3, 0) != context_hash(history, 2, 1));
+        expect(context_hash(history, 1, 2) == context_hash(std::vector<uint8_t>{0, 'a'}, 2, 2)) << "missing bytes count as 0";
+    };
+
+    "checked_table"_test = [] {
+        // A 2-slot table: find two hashes sharing a slot with different checksums
+        checked_table<context_slot> table(1);
+        uint64_t other = 0;
+        do {
+            ++other;
+        } while ((hash_mix(other) & 1) != (hash_mix(0) & 1) || ((hash_mix(other) >> 56) | 1) == ((hash_mix(0) >> 56) | 1));
+
+        table.at(0).update(1, 30);
+        expect(table.at(0).seen()) << "same context, same statistics";
+
+        expect(!table.at(other).seen()) << "another context resets the slot instead of sharing it";
+        expect(!table.at(0).seen()) << "and the newest context owns it";
+    };
+
+    "context_slot"_test = [] {
+        context_slot slot;
+        expect(!slot.seen());
+        slot.update(1, 30);
+        slot.update(1, 30);
+        expect(slot.seen() && slot.n == 2 && slot.p > 0.9f);
+        expect(slot.history.ones() == 2 && slot.history.zeros() == 0);
+        expect(sizeof(context_slot) == 8);
+    };
+
+    "last_byte_slot"_test = [] {
+        last_byte_slot slot;
+        expect(slot.expected_bit(1, 0) == -1) << "nothing remembered";
+
+        slot.update('a');
+        slot.update('a');
+        expect(slot.byte == 'a' && slot.count == 2);
+        // 'a' = 0b01100001: first bit 0, then 1 once 0 was coded
+        expect(slot.expected_bit(1, 0) == 0);
+        expect(slot.expected_bit(0b10, 1) == 1);
+        expect(slot.expected_bit(0b11, 1) == -1) << "the byte coded so far differs from 'a'";
+
+        slot.update('b');
+        expect(slot.byte == 'b' && slot.count == 1);
+        for (int i = 0; i < 300; ++i) {
+            slot.update('b');
+        }
+        expect(slot.count == 255);
+    };
+
+    "logistic_mixer"_test = [] {
+        logistic_mixer mixer(2, 2, 0.05);
+        for (int i = 0; i < 200; ++i) {
+            mixer.add(1);
+            mixer.add(0.3);
+            mixer.mix(0);
+            mixer.update(1);
+        }
+        mixer.add(1);
+        mixer.add(0.3);
+        expect(mixer.mix(0) > 0.9) << "learns to trust an input that predicts well";
+        mixer.update(1);
+
+        mixer.add(1);
+        mixer.add(0.3);
+        expect(std::fabs(mixer.mix(1) - squash(0.39)) < 1e-9) << "other sets keep their initial weights";
+        mixer.update(1);
+
+        mixer.set_rate(0);
+        mixer.add(1);
+        mixer.add(0.3);
+        const double before = mixer.mix(1);
+        mixer.update(0);
+        mixer.add(1);
+        mixer.add(0.3);
+        expect(mixer.mix(1) == before) << "a zero rate freezes the weights";
+        mixer.update(0);
+    };
+
+    "probability_map"_test = [] {
+        probability_map map(2, 0.1);
+        expect(std::fabs(map.refine(0.7, 0) - 0.7) < 0.02) << "starts close to the identity";
+
+        for (int i = 0; i < 200; ++i) {
+            map.refine(0.7, 0);
+            map.update(0);
+        }
+        expect(map.refine(0.7, 0) < 0.2) << "learns that 0.7 means 0 in context 0";
+        map.update(0);
+        expect(std::fabs(map.refine(0.7, 1) - 0.7) < 0.02) << "context 1 unchanged";
+        map.update(1);
+    };
+
+    "match_model"_test = [] {
+        match_model match(3, 10);
+        std::vector<uint8_t> history;
+        for (const char c : std::string("abcdef abcd")) {
+            history.push_back(static_cast<uint8_t>(c));
+            match.byte_added(history);
+        }
+
+        expect(match.length() == 4) << "abcd seen before, matched back to its start";
+        // Predicts 'e' = 0b01100101 next
+        expect(match.expected_bit(history, 1, 0) == 0);
+        expect(match.expected_bit(history, 0b1011, 3) == 0) << "011 coded so far: e's prefix, next bit 0";
+        expect(match.expected_bit(history, 0b1010, 3) == -1) << "010 coded so far: not e's prefix";
+
+        match.miss();
+        expect(match.length() == 0 && match.expected_bit(history, 1, 0) == -1);
+    };
+
+    "arithmetic_coder"_test = [] {
+        std::string text;
+        random_text(2000, 3, 5, text);
+
+        // An adaptive order-1 bit model, rebuilt identically by the decoder
+        const auto code = [&](auto&& code_bit) {
+            hashed_counters counters(16);
+            uint8_t previous = 0;
+            std::vector<uint8_t> out;
+            for (size_t n = 0; n < text.size(); ++n) {
+                uint32_t c0 = 1;
+                for (int i = 7; i >= 0; --i) {
+                    auto& counter = counters.at(previous * 256u + c0);
+                    const int bit = code_bit(clamp_probability(counter.p), (static_cast<uint8_t>(text[n]) >> i) & 1);
+                    counter.update(bit, 255);
+                    c0 = (c0 << 1) | static_cast<uint32_t>(bit);
+                }
+                previous = static_cast<uint8_t>(c0 & 0xFF);
+                out.push_back(previous);
+            }
+            return out;
+        };
+
+        arithmetic_encoder encoder;
+        code([&](const double p, const int bit) { encoder.encode(bit, p); return bit; });
+        const gmprime compressed = encoder.finish();
+
+        arithmetic_decoder decoder(compressed);
+        const auto decoded = code([&](const double p, int) { return decoder.decode(p); });
+
+        expect(decoded == std::vector<uint8_t>(text.begin(), text.end())) << "decodes what was encoded";
+        expect(compressed.bytes().size() < text.size() / 2) << "3 letters: under 2 bits each";
+    };
+    "arithmetic_coder_extremes"_test = [] {
+        // Certain probabilities, right and wrong, and an empty message
+        arithmetic_encoder encoder;
+        const int bits[] = {1, 1, 0, 1, 0, 0, 1};
+        const double ps[] = {0.999, 0.001, 0.5, 1.0, 0.0, 0.9999, 0.5};
+        for (int i = 0; i < 7; ++i) {
+            encoder.encode(bits[i], ps[i]);
+        }
+        const gmprime compressed = encoder.finish();
+
+        arithmetic_decoder decoder(compressed);
+        bool same = true;
+        for (int i = 0; i < 7; ++i) {
+            same = same && decoder.decode(ps[i]) == bits[i];
+        }
+        expect(same);
+
+        arithmetic_encoder empty;
+        expect(empty.finish().bytes().size() == 4) << "the flush only";
+    };
+
+    "classify"_test = [] {
+        expect(classify('\n') == char_class::newline && classify('\r') == char_class::newline);
+        expect(classify(' ') == char_class::space && classify('\t') == char_class::space);
+        expect(classify('q') == char_class::lowercase && classify('Q') == char_class::uppercase);
+        expect(classify('7') == char_class::digit && classify(',') == char_class::punctuation);
+        expect(classify(0) == char_class::other && classify(0xE9) == char_class::other);
+    };
+
+    "line_tracker"_test = [] {
+        line_tracker lines;
+        std::vector<uint8_t> history;
+        const auto add = [&](const std::string& text) {
+            for (const char c : text) {
+                history.push_back(static_cast<uint8_t>(c));
+                lines.byte_added(history);
+            }
+        };
+
+        add("abc");
+        expect(lines.column(history) == 3 && lines.above(history) == 0) << "no line above yet";
+
+        add("defg\nxy");
+        expect(lines.column(history) == 2);
+        expect(lines.previous_length() == 8) << "abcdefg and its newline";
+        expect(lines.above(history) == 'c') << "same column, previous line";
+
+        add("zzzzzzzzzz");
+        expect(lines.above(history) == 0) << "beyond the previous line";
+    };
+
+    "capitals"_test = [] {
+        const std::string text = "The END. I saw NASA, McDonald and iPhone; the end\n";
+        const std::vector<uint8_t> original(text.begin(), text.end());
+        const auto encoded = capitals_encode(original);
+
+        expect(encoded.has_value());
+        const std::string lowered(encoded->begin(), encoded->end());
+        expect(lowered == "\x01the \x02""end. \x01i saw \x02nasa, McDonald and iPhone; the end\n") << lowered;
+        expect(capitals_decode(*encoded) == original);
+
+        expect(!capitals_encode(std::vector<uint8_t>{'a', 0x01, 'b'}).has_value()) << "escape bytes in the text";
+        expect(!capitals_encode(std::vector<uint8_t>{0x02}).has_value());
+    };
+    "capitals_round_trip"_test = [] {
+        for (uint32_t seed = 1; seed <= 30; ++seed) {
+            std::string text;
+            random_text(300, 26, seed, text);
+            // Uppercase some letters and add separators
+            for (size_t i = 0; i < text.size(); ++i) {
+                const auto r = (seed * 2654435761u + i * 40503u) >> 7;
+                if (r % 5 == 0) text[i] = static_cast<char>(text[i] - 'a' + 'A');
+                if (r % 7 == 0) text[i] = ' ';
+                if (r % 11 == 0) text[i] = '.';
+            }
+            const std::vector<uint8_t> original(text.begin(), text.end());
+            const auto encoded = capitals_encode(original);
+            expect(encoded.has_value() && capitals_decode(*encoded) == original) << text;
+        }
+    };
+
+    "bit_geometry"_test = [] {
+        const std::vector<uint8_t> bytes{0b10000000, 0b00000001, 0b11000000};
+
+        expect(stream_bit(bytes, 0) == 1 && stream_bit(bytes, 1) == 0) << "each byte from its highest bit";
+        expect(stream_bit(bytes, 15) == 1 && stream_bit(bytes, 16) == 1 && stream_bit(bytes, 17) == 1);
+
+        // At bit 17: 1 before is bit 16 (1), 2 before is bit 15 (1), 17 before is bit 0 (1), 30 before is out (0)
+        expect(bit_template(bytes, 17, {1, 2, 17, 30}) == 0b1110);
+        expect(bit_template(bytes, 10, {3, 10}) == 0b01);
+    };
+
+    "cost_profile"_test = [] {
+        cost_profile cost;
+        for (int i = 0; i < 8; ++i) {
+            cost.add(i % 2, 0.5);
+        }
+        cost.add(1, 0.25);
+
+        expect(cost.per_byte().size() == 1 && std::fabs(cost.per_byte()[0] - 8) < 1e-12) << "1 bit at p = 1/2";
+        expect(std::fabs(cost.total() - 10) < 1e-12) << "and the started byte: 2 bits at p = 1/4";
     };
 };
 

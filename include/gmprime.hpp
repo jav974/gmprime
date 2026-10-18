@@ -210,6 +210,13 @@ public:
     // (the longest one), else a literal
     [[nodiscard]] repetition_stats repetitions(size_t min_length = 4) const;
 
+    // FOLDS: self-similarity of the magnitude at every distance up to max_distance bits. result[d] counts
+    // the bits p (over the analyzed bits, p + d included) equal to bit p + d; result[0] is the number of bits.
+    // Peaks of result[d] / (result[0] - d) reveal fold widths: a bitmap's row, a record, a line. Computed on
+    // the whole number with one shift, XOR and popcount per distance (bit order: gmprime's, each byte from
+    // its lowest bit).
+    [[nodiscard]] std::vector<size_t> autocorrelation(size_t max_distance) const;
+
     template<typename word_t, std::enable_if_t<std::is_integral_v<word_t> && !std::is_same_v<word_t, bool>, bool> = true>
     void set_partial_limb(uint64_t index, word_t value);
 
@@ -220,6 +227,12 @@ public:
 
     template<typename word_t, std::enable_if_t<std::is_arithmetic_v<word_t> && !std::is_same_v<word_t, bool>, bool> = true>
     word_t to_primitive() const;
+
+    // Bytes of the number from the lowest, in whole bytes and up to the size of the last loaded file:
+    // the contents of the file save_to_file would write
+    [[nodiscard]] std::vector<unsigned char> bytes() const;
+    // The number holding these bytes, the first one lowest, keeping high zero bytes like a loaded file
+    [[nodiscard]] static gmprime from_bytes(const std::vector<unsigned char>& bytes);
 
     gmprime& load_from_file(const std::string& file_path);
     // Writes the magnitude: a file is a raw payload of bits, the sign is not stored.
@@ -261,8 +274,6 @@ private:
     [[nodiscard]] size_t analyzed_bits() const;
     // Aligned symbols of width bits (1 to 32) over analyzed_bits(), complete ones only
     [[nodiscard]] std::vector<uint32_t> symbols(size_t width) const;
-    // Bytes over analyzed_bits(), from the lowest
-    [[nodiscard]] std::vector<unsigned char> bytes() const;
 
     template<bool is_const>
     friend class bit_window;

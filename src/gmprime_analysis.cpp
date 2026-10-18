@@ -179,6 +179,18 @@ std::vector<uint32_t> gmprime::symbols(const size_t width) const {
     return result;
 }
 
+gmprime gmprime::from_bytes(const std::vector<unsigned char> &bytes) {
+    gmprime result;
+    // GMP's C functions never throw (it aborts on allocation failure): no cleanup to plan for
+    [&]() noexcept {
+        if (!bytes.empty()) {
+            mpz_import(result._value.get_mpz_t(), bytes.size(), -1, 1, 0, 0, bytes.data());
+        }
+    }();
+    result._byte_size = bytes.size();
+    return result;
+}
+
 std::vector<unsigned char> gmprime::bytes() const {
     std::vector<unsigned char> result(analyzed_bits() / CHAR_BIT);
 
@@ -280,6 +292,22 @@ std::vector<uint32_t> gmprime::longest_previous_factors() const {
     }
 
     return lpf;
+}
+
+std::vector<size_t> gmprime::autocorrelation(const size_t max_distance) const {
+    const size_t length = analyzed_bits();
+    const gmprime magnitude = abs(*this);
+    std::vector<size_t> result(max_distance + 1, 0);
+
+    for (size_t d = 0; d <= max_distance && d < length; ++d) {
+        const size_t overlap = length - d;
+        // Bits differing from the one d further: the XOR of the number and its shift, without the top d
+        // bits, where the shifted number is 0 and the XOR only repeats the number
+        const size_t differing = (magnitude ^ (magnitude >> d)).popcount() - (magnitude >> overlap).popcount();
+        result[d] = overlap - differing;
+    }
+
+    return result;
 }
 
 gmprime::repetition_stats gmprime::repetitions(const size_t min_length) const {
