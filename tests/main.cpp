@@ -206,6 +206,61 @@ suite<"gmprime::comparison"> comparison = [] {
         rhs = 100;
         expect((lhs != rhs) == false);
     };
+
+    // Compared exactly, like an int is promoted to double, instead of truncating the floating point value
+    "floating_point_fraction"_test = [] {
+        const gmprime a(5), b(-5);
+
+        expect(!(a == 5.5));
+        expect(a != 5.5);
+        expect(a < 5.5);
+        expect(a <= 5.5);
+        expect(!(a > 5.5));
+        expect(!(a >= 5.5));
+        expect(a > 4.5);
+        expect(a == 5.0);
+        expect(a <= 5.0 && a >= 5.0);
+
+        expect(5.5 > a);
+        expect(!(5.5 == a));
+        expect(4.5 < a);
+
+        expect(b < -4.5);
+        expect(b > -5.5);
+        expect(-5.5f < b);
+    };
+    "floating_point_limits"_test = [] {
+        const gmprime zero, big("1" + std::string(400, '0'));
+        const auto nan = std::numeric_limits<double>::quiet_NaN();
+        const auto inf = std::numeric_limits<double>::infinity();
+
+        expect(zero == -0.0);
+        expect(zero < 1e-300);
+        expect(zero > -1e-300);
+
+        expect(big < inf);
+        expect(-big > -inf);
+        expect(inf > big);
+
+        expect(gmprime(1e300) == 1e300) << "a double converted to gmprime compares equal to itself";
+        expect(gmprime("1" + std::string(300, '0')) != 1e300) << "1e300 is not exactly 10^300";
+
+        // NaN is unordered: every comparison is false, except !=
+        expect(!(zero == nan));
+        expect(zero != nan);
+        expect(!(zero < nan) && !(zero <= nan) && !(zero > nan) && !(zero >= nan));
+        expect(!(nan == zero) && nan != zero);
+    };
+    "floating_point_long_double"_test = [] {
+        // Exact beyond the 53 bits of a double where long double is wider (e.g. x86 Linux, ARM64 Linux)
+        if constexpr (std::numeric_limits<long double>::digits > 61) {
+            const gmprime a = (gmprime(1) << 60) + 1;
+            const long double x = std::ldexp(1.0L, 60) + 1;
+
+            expect(a == x);
+            expect(a - 1 < x);
+        }
+    };
 };
 
 suite<"gmprime::arithmetic"> arithmetic = [] {
@@ -325,6 +380,33 @@ suite<"gmprime::shift"> shift = [] {
         gmprime r(336);
         r >>= 3;
         expect(r == 42);
+    };
+    "shift_negative"_test = [] {
+        gmprime a(42);
+
+        expect(throws<std::domain_error>([&] { static_cast<void>(a << -1); }));
+        expect(throws<std::domain_error>([&] { static_cast<void>(a >> -1); }));
+        expect(throws<std::domain_error>([&] { a <<= -1; }));
+        expect(throws<std::domain_error>([&] { a >>= -1; }));
+        expect(a == 42) << "operand modified by a failed shift";
+    };
+    "shift_left_beyond_capacity"_test = [] {
+        gmprime a(42);
+
+        // GMP aborts the program when a number exceeds its maximum size
+        expect(throws<std::length_error>([&] { static_cast<void>(a << std::numeric_limits<size_t>::max()); }));
+        expect(throws<std::length_error>([&] { a <<= std::numeric_limits<size_t>::max(); }));
+        expect(a == 42) << "operand modified by a failed shift";
+    };
+    "shift_right_huge"_test = [] {
+        // GMP takes shift counts as unsigned long, 32 bits on Windows: a huge count must not be truncated
+        const auto huge = std::numeric_limits<size_t>::max();
+        expect((gmprime(42) >> huge) == 0);
+        expect((gmprime(-42) >> huge) == -1) << "right shift rounds toward minus infinity, like an int";
+
+        gmprime a(42);
+        a >>= huge;
+        expect(a == 0);
     };
 };
 
