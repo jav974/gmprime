@@ -1,8 +1,13 @@
 #ifndef GMPRIME_HPP
 #define GMPRIME_HPP
 
+#include <algorithm>
+#include <climits>
+#include <cmath>
 #include <functional>
 #include <cstdint>
+#include <stdexcept>
+#include <type_traits>
 #include <gmpxx.h>
 #include "../src/gmprime_ios.hpp"
 #include "../src/gmprime_literals.hpp"
@@ -29,6 +34,7 @@ public:
     template<typename word_t = mp_limb_t, std::enable_if_t<std::is_arithmetic_v<word_t> && !std::is_same_v<word_t, bool>, bool> = true>
     gmprime(word_t value); // NOLINT(*-explicit-constructor)
 
+    // Throws std::invalid_argument if value is not a valid number in the given base
     explicit gmprime(const std::string& value, int base = 10);
 
     mpz_class& get_value();
@@ -40,6 +46,7 @@ public:
 
     // ARITHMETIC OPERATORS +=  -=  *=  /=  %=  +   -   *   /   %   ++  --
     // Binary operators are non-member friends so that a primitive left-hand operand converts too (e.g. 5 + a)
+    // Division and modulo by zero throw std::domain_error
     friend gmprime operator+(const gmprime& lhs, const gmprime& rhs);
     friend gmprime operator-(const gmprime& lhs, const gmprime& rhs);
     friend gmprime operator*(const gmprime& lhs, const gmprime& rhs);
@@ -114,11 +121,13 @@ public:
     word_t to_primitive() const;
 
     gmprime& load_from_file(const std::string& file_path);
+    // Writes the magnitude: a file is a raw payload of bits, the sign is not stored.
     // Pads with zero bytes up to the size of the last loaded file: leading zeros of a number
     // (i.e. trailing zero bytes of the file) are not stored by GMP and would otherwise be lost.
     // This size is kept through in-place changes and copies, and reset by assigning a new value.
     void save_to_file(const std::string& file_path) const;
 
+    // Throws std::domain_error for a negative value
     [[nodiscard]] gmprime sqrt() const;
     [[nodiscard]] gmprime pow(unsigned long int n) const;
 
@@ -128,6 +137,14 @@ public:
     [[nodiscard]] gmprime next_prime() const;
     [[nodiscard]] static gmprime factorial(unsigned int n);
 private:
+    // Bit field access on the magnitude, limb by limb with masks and shifts: independent of the
+    // machine endianness and of the word width relative to the limb width. width must not exceed the bits of unsigned_t
+    template<typename unsigned_t>
+    [[nodiscard]] unsigned_t read_bits(size_t pos, size_t width) const;
+
+    template<typename unsigned_t>
+    void write_bits(size_t pos, size_t width, unsigned_t value);
+
     mpz_class _value;
     size_t _byte_size = 0;
 };

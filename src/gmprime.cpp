@@ -1,4 +1,5 @@
 #include <fstream>
+#include <stdexcept>
 #include <vector>
 #include "gmprime.hpp"
 
@@ -8,7 +9,14 @@ gmprime::gmprime(): _value(0) {
 }
 
 gmprime::gmprime(const std::string &value, const int base) {
-    _value.set_str(value, base);
+    // Base 0 detects the base from the prefix (0x, 0b, 0), otherwise GMP supports bases 2 to 62
+    if (base != 0 && (base < 2 || base > 62)) {
+        throw std::invalid_argument("Invalid base " + std::to_string(base));
+    }
+
+    if (_value.set_str(value, base) != 0) {
+        throw std::invalid_argument("Invalid number \"" + value + "\" in base " + std::to_string(base));
+    }
 }
 
 mpz_class & gmprime::get_value() {
@@ -94,12 +102,21 @@ gmprime & gmprime::operator*=(const gmprime &other) {
     return *this;
 }
 
+// GMP raises SIGFPE on division by zero
+static void throw_if_zero_divisor(const mpz_class &divisor) {
+    if (mpz_sgn(divisor.get_mpz_t()) == 0) {
+        throw std::domain_error("Division by zero");
+    }
+}
+
 gmprime & gmprime::operator/=(const gmprime &other) {
+    throw_if_zero_divisor(other._value);
     _value /= other._value;
     return *this;
 }
 
 gmprime & gmprime::operator%=(const gmprime &other) {
+    throw_if_zero_divisor(other._value);
     _value %= other._value;
     return *this;
 }
@@ -258,6 +275,11 @@ void gmprime::save_to_file(const std::string &file_path) const {
 }
 
 gmprime gmprime::sqrt() const {
+    // GMP raises SIGFPE on a negative value
+    if (mpz_sgn(_value.get_mpz_t()) < 0) {
+        throw std::domain_error("Square root of a negative number");
+    }
+
     gmprime result;
     mpz_sqrt(result._value.get_mpz_t(), _value.get_mpz_t());
     return result;
