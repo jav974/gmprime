@@ -1,3 +1,4 @@
+#include <fstream>
 #include <iostream>
 #include <sys/stat.h>
 #include <boost/ut.hpp>
@@ -5,6 +6,41 @@
 
 using namespace boost::ut;
 using namespace GMPrime;
+
+template<typename L, typename R, typename = void>
+struct has_non_member_operators : std::false_type {};
+
+template<typename L, typename R>
+struct has_non_member_operators<L, R, std::void_t<
+    decltype(std::declval<L>() + std::declval<R>()),
+    decltype(std::declval<L>() - std::declval<R>()),
+    decltype(std::declval<L>() * std::declval<R>()),
+    decltype(std::declval<L>() / std::declval<R>()),
+    decltype(std::declval<L>() % std::declval<R>()),
+    decltype(std::declval<L>() & std::declval<R>()),
+    decltype(std::declval<L>() | std::declval<R>()),
+    decltype(std::declval<L>() ^ std::declval<R>()),
+    decltype(std::declval<L>() == std::declval<R>()),
+    decltype(std::declval<L>() < std::declval<R>())>> : std::true_type {};
+
+template<typename L>
+void check_primitive_lhs(const L lhs) {
+    if constexpr (has_non_member_operators<L, gmprime>::value) {
+        const gmprime a(3);
+        expect(lhs + a == 10);
+        expect(lhs - a == 4);
+        expect(lhs * a == 21);
+        expect(lhs / a == 2);
+        expect(lhs % a == 1);
+        expect((lhs & a) == 3);
+        expect((lhs | a) == 7);
+        expect((lhs ^ a) == 4);
+        expect(lhs == gmprime(7));
+        expect(lhs > a);
+    } else {
+        expect(false) << "gmprime operators do not accept a primitive left-hand operand";
+    }
+}
 
 suite<"gmprime::ctor"> ctor = [] {
     "ctor_signed_integer"_test = [] {
@@ -173,6 +209,12 @@ suite<"gmprime::arithmetic"> arithmetic = [] {
         const gmprime r(42);
         expect(-r == -42);
     };
+
+    "primitive_lhs"_test = [] {
+        check_primitive_lhs(7);
+        check_primitive_lhs(7L);
+        check_primitive_lhs(7UL);
+    };
 };
 
 suite<"gmprime::shift"> shift = [] {
@@ -292,6 +334,31 @@ suite<"gmprime::accessor"> accessor = [] {
 
         expect(before == false);
         expect(after == true);
+    };
+
+    "[]<unsigned char>-="_test = [] {
+        gmprime r(0x1000);
+        r[1_ucw] -= 1;
+
+        expect(r == 0xF00);
+    };
+    "[]<bool>_negative"_test = [] {
+        // Bits follow the magnitude, like words do
+        gmprime r(-3);
+
+        expect(r[0_ucw] == 3);
+        expect(r[0_bw] == true);
+        expect(r[1_bw] == true);
+        expect(r[2_bw] == false);
+    };
+    "set_bit_negative"_test = [] {
+        gmprime r(-3);
+
+        r.set_bit(2, true);
+        expect(r == -7);
+
+        r.set_bit(0, false);
+        expect(r == -6);
     };
 };
 
@@ -503,6 +570,36 @@ suite<"gmprime::iterator"> iterator = [] {
             i++;
         }
     };
+
+    "iterator_copy"_test = [] {
+        gmprime r(5);
+        auto it = r.as_span<bool>().begin();
+        const auto copy = it;
+
+        ++it;
+
+        expect(*copy == true);
+        expect(*it == false);
+    };
+
+    "iterator_postfix_increment"_test = [] {
+        gmprime r(5);
+        auto it = r.as_span<bool>().begin();
+        const auto old = it++;
+
+        expect(*old == true);
+        expect(*it == false);
+    };
+
+    "iterator_postfix_decrement"_test = [] {
+        gmprime r(5);
+        auto it = r.as_span<bool>().begin();
+        ++it;
+        const auto old = it--;
+
+        expect(*old == false);
+        expect(*it == true);
+    };
 };
 
 suite<"gmprime::string"> string = [] {
@@ -614,6 +711,52 @@ suite<"gmprime::math"> math = [] {
 
         v = 17;
         expect(!v.is_perfect_power());
+    };
+
+    "file_round_trip_trailing_zeros"_test = [] {
+        const char data[] = {'a', 'b', 'c', '\0', '\0'};
+        const auto in_path = "../../tests/files/trailing_zeros.in.bin";
+        const auto out_path = "../../tests/files/trailing_zeros.out.bin";
+
+        {
+            std::ofstream in(in_path, std::ios::binary);
+            in.write(data, sizeof(data));
+        }
+
+        gmprime v;
+        v.load_from_file(in_path);
+        v.save_to_file(out_path);
+
+        std::ifstream out(out_path, std::ios::binary);
+        const std::string written((std::istreambuf_iterator<char>(out)), std::istreambuf_iterator<char>());
+
+        expect(written == std::string(data, sizeof(data)));
+
+        std::remove(in_path);
+        std::remove(out_path);
+    };
+
+    "file_size_reset_on_assignment"_test = [] {
+        const auto in_path = "../../tests/files/trailing_zeros.in.bin";
+        const auto out_path = "../../tests/files/trailing_zeros.out.bin";
+
+        {
+            std::ofstream in(in_path, std::ios::binary);
+            in.write("a\0\0\0", 4);
+        }
+
+        gmprime v;
+        v.load_from_file(in_path);
+        v = 0x62;
+        v.save_to_file(out_path);
+
+        std::ifstream out(out_path, std::ios::binary);
+        const std::string written((std::istreambuf_iterator<char>(out)), std::istreambuf_iterator<char>());
+
+        expect(written == std::string("b"));
+
+        std::remove(in_path);
+        std::remove(out_path);
     };
 };
 
