@@ -1131,6 +1131,50 @@ suite<"gmprime::context_analysis"> context_analysis = [] {
         }
         expect(gmprime(-0x1234).autocorrelation(5) == gmprime(0x1234).autocorrelation(5)) << "on the magnitude";
     };
+
+    "stream_order"_test = [] {
+        const std::vector<unsigned char> data{0b00000001, 0b11000000, 0};
+        const auto stream = gmprime::from_bytes(data).stream_order();
+
+        expect(stream.bytes() == std::vector<unsigned char>{0b10000000, 0b00000011, 0}) << "each byte reversed, size kept";
+        for (size_t p = 0; p < 24; ++p) {
+            expect(static_cast<int>(stream.get_bit(p)) == GMPrime::coding::stream_bit(data, p)) << "bit" << p;
+        }
+    };
+
+    "analyze_folds"_test = [] {
+        // A bitmap of 60 rows of 200 bits (not a multiple of 8), each row the previous one with a few flips
+        const size_t width = 200, rows = 60;
+        std::vector<unsigned char> bitmap(width * rows / 8, 0);
+        uint32_t seed = 7;
+        std::vector<int> row(width);
+        for (auto& bit : row) {
+            seed = seed * 1664525u + 1013904223u;
+            bit = (seed >> 20) & 1;
+        }
+        for (size_t r = 0; r < rows; ++r) {
+            for (size_t c = 0; c < width; ++c) {
+                seed = seed * 1664525u + 1013904223u;
+                if ((seed >> 16) % 64 == 0) row[c] ^= 1;
+                const size_t p = r * width + c;
+                bitmap[p / 8] = static_cast<unsigned char>(bitmap[p / 8] | (row[c] << (7 - p % 8)));
+            }
+        }
+        const auto folds = gmprime::from_bytes(bitmap).analyze_folds();
+        expect(folds.width == width) << "found the row width:" << folds.width;
+        expect(folds.strong());
+        expect(folds.score < folds.median && (folds.layer == 0 || folds.layer >= 3));
+
+        std::string text;
+        random_text(3000, 26, 9, text);
+        gmprime value;
+        from_bytes(text, value);
+        expect(!value.analyze_folds().strong()) << "text without rows";
+
+        const auto tiny = gmprime(5).analyze_folds();
+        expect(tiny.width == 0 && !tiny.strong()) << "too short to search";
+        expect(value.analyze_folds(100, 50).width == 0) << "no width to search";
+    };
 };
 
 suite<"gmprime::coding"> coding_suite = [] {
@@ -1267,6 +1311,18 @@ suite<"gmprime::coding"> coding_suite = [] {
         mixer.add(0.3);
         expect(mixer.mix(1) == before) << "a zero rate freezes the weights";
         mixer.update(0);
+
+        logistic_mixer one_by_one(3, 1, 0.05), at_once(3, 1, 0.05);
+        const std::vector<double> inputs{0.5, -1, 2};
+        for (int i = 0; i < 20; ++i) {
+            for (const double x : inputs) {
+                one_by_one.add(x);
+            }
+            at_once.add(inputs);
+            expect(one_by_one.mix(0) == at_once.mix(0)) << "adding inputs at once is the same as one by one";
+            one_by_one.update(i % 3 == 0);
+            at_once.update(i % 3 == 0);
+        }
     };
 
     "probability_map"_test = [] {
@@ -1424,6 +1480,28 @@ suite<"gmprime::coding"> coding_suite = [] {
         // At bit 17: 1 before is bit 16 (1), 2 before is bit 15 (1), 17 before is bit 0 (1), 30 before is out (0)
         expect(bit_template(bytes, 17, {1, 2, 17, 30}) == 0b1110);
         expect(bit_template(bytes, 10, {3, 10}) == 0b01);
+    };
+
+    "runs_at"_test = [] {
+        // Stream bits: 00011100 11000000
+        const std::vector<uint8_t> bytes{0b00011100, 0b11000000};
+
+        // Bit 11, rows of 8: left, bit 10 (0) then bit 9 (1): a run of 1; above, bit 3 then 4 and 5 (1), 6 (0): 2
+        const auto runs = runs_at(bytes, 11, 8);
+        expect(runs.left == 1 && runs.above == 2);
+
+        // Bit 6: bits 5, 4, 3 are 1, bit 2 is 0
+        expect(runs_at(bytes, 6, 8).left == 3);
+        expect(runs_at(bytes, 11, 8, 1).above == 1) << "capped at limit";
+        expect(runs_at(bytes, 0, 8).left == 64) << "bits before the start count as 0";
+    };
+
+    "table_bits"_test = [] {
+        expect(table_bits(0) == 16) << "at least min_bits";
+        expect(table_bits(3721) == 17) << "four slots per bit of data: 119,072 slots";
+        expect(table_bits(131072) == 22);
+        expect(table_bits(10'000'000) == 22) << "at most max_bits";
+        expect(table_bits(10'000'000, 24) == 24 && table_bits(100, 22, 10) == 12);
     };
 
     "cost_profile"_test = [] {

@@ -217,6 +217,28 @@ public:
     // its lowest bit).
     [[nodiscard]] std::vector<size_t> autocorrelation(size_t max_distance) const;
 
+    // The same bytes with the bits of each byte reversed: bit p of the result is bit p of the bytes read as a
+    // stream, each byte from its highest bit, the order of a bitmap's pixels (and of coding::stream_bit).
+    // Shifts and autocorrelation of the result then work in stream order, where folds of any width line up.
+    [[nodiscard]] gmprime stream_order() const;
+
+    struct fold_analysis {
+        size_t width = 0;        // best fold width in bits, 0 if the data is too short to search
+        double score = 1;        // bits differing at that width, relative to independent bits: lower is more alike
+        double median = 1;       // median score over the widths searched
+        size_t layer = 0;        // rows per layer of the best 3D view, 3 or more (0: none)
+        double layer_score = 1;  // score at width * layer
+
+        // Whether the fold stands out from the other widths: its score below ratio times the median. 0.4
+        // separates bitmaps and fixed-size records from text, code and executables in the Canterbury corpus.
+        [[nodiscard]] bool strong(const double ratio = 0.4) const {
+            return width > 0 && score < ratio * median;
+        }
+    };
+    // Searches the fold widths from min_width to max_width bits (at most a quarter of the data), in stream
+    // order: the width where bits most resemble the bits one row before, then the best layer of rows
+    [[nodiscard]] fold_analysis analyze_folds(size_t min_width = 64, size_t max_width = 8192) const;
+
     template<typename word_t, std::enable_if_t<std::is_integral_v<word_t> && !std::is_same_v<word_t, bool>, bool> = true>
     void set_partial_limb(uint64_t index, word_t value);
 

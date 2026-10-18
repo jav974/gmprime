@@ -310,6 +310,63 @@ std::vector<size_t> gmprime::autocorrelation(const size_t max_distance) const {
     return result;
 }
 
+gmprime gmprime::stream_order() const {
+    auto data = bytes();
+    for (auto& byte : data) {
+        uint8_t reversed = 0;
+        for (int k = 0; k < CHAR_BIT; ++k) {
+            reversed = static_cast<uint8_t>(reversed | (((byte >> k) & 1) << (CHAR_BIT - 1 - k)));
+        }
+        byte = reversed;
+    }
+    return from_bytes(data);
+}
+
+gmprime::fold_analysis gmprime::analyze_folds(const size_t min_width, const size_t max_width) const {
+    fold_analysis result;
+    const size_t n = analyzed_bits();
+    if (n < 4 * min_width) {
+        return result;
+    }
+
+    const size_t max_distance = std::min(max_width, n / 4);
+    const auto stream = stream_order();
+    const auto self = stream.autocorrelation(max_distance);
+    // Bits differing at random, given the share of ones: the reference for a score of 1
+    const double ones = static_cast<double>(stream.popcount()) / static_cast<double>(n);
+    const double independent = std::max(1e-9, 2 * ones * (1 - ones));
+    const auto score = [&](const size_t d) {
+        return (1 - static_cast<double>(self[d]) / static_cast<double>(n - d)) / independent;
+    };
+
+    std::vector<double> scores;
+    for (size_t d = min_width; d <= max_distance; ++d) {
+        const double s = score(d);
+        scores.push_back(s);
+        if (s < result.score || result.width == 0) {
+            result.score = s;
+            result.width = d;
+        }
+    }
+    if (scores.empty()) {
+        return result;
+    }
+    const auto middle = scores.begin() + static_cast<std::ptrdiff_t>(scores.size() / 2);
+    std::nth_element(scores.begin(), middle, scores.end());
+    result.median = *middle;
+
+    // Layers of 3 rows or more: the rows 1 and 2 above are neighbours already
+    for (size_t h = 3; h * result.width <= max_distance; ++h) {
+        const double s = score(h * result.width);
+        if (result.layer == 0 || s < result.layer_score) {
+            result.layer = h;
+            result.layer_score = s;
+        }
+    }
+
+    return result;
+}
+
 gmprime::repetition_stats gmprime::repetitions(const size_t min_length) const {
     const auto lpf = longest_previous_factors();
     const size_t threshold = std::max<size_t>(min_length, 1);

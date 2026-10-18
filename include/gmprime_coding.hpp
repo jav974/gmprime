@@ -347,6 +347,39 @@ inline uint64_t bit_template(const std::vector<uint8_t>& bytes, const size_t pos
     return context;
 }
 
+// Pixel runs at stream bit pos of a bitmap folded at width bits per row: left, the length of the run of equal
+// bits ending just before pos (1 to limit); above, how many bits the one above pos stays the same toward the
+// right (0 to limit). Bits before the start count as 0.
+struct bitmap_runs {
+    size_t left = 0;
+    size_t above = 0;
+};
+
+inline bitmap_runs runs_at(const std::vector<uint8_t>& bytes, const size_t pos, const size_t width, const size_t limit = 64) {
+    const auto bit = [&](const size_t distance) {
+        return distance <= pos ? stream_bit(bytes, pos - distance) : 0;
+    };
+    bitmap_runs runs;
+    runs.left = 1;
+    while (runs.left < limit && bit(runs.left) == bit(runs.left + 1)) {
+        ++runs.left;
+    }
+    while (runs.above < limit && runs.above + 2 < width && bit(width - runs.above) == bit(width - runs.above - 1)) {
+        ++runs.above;
+    }
+    return runs;
+}
+
+// Size of a context table for data of the given size, in bits of slot count: room for about four slots per
+// bit of data, between min_bits and max_bits (22, 32 MB of context_slot, suits data from 128 KB)
+inline int table_bits(const size_t data_bytes, const int max_bits = 22, const int min_bits = 16) {
+    int bits = 0;
+    while (bits < max_bits && (size_t{1} << bits) < data_bytes * 8 * 4) {
+        ++bits;
+    }
+    return std::max(bits, min_bits);
+}
+
 // Cost of each byte coded with a model, -log2 of the probabilities given to its actual bits: where the bits
 // go, to compare models or study the data
 class cost_profile {
@@ -391,6 +424,11 @@ public:
 
     void add(const double x) {
         _x.push_back(x);
+    }
+
+    // Adds several inputs at once, in order: cheaper than one add per input when they are many
+    void add(const std::vector<double>& inputs) {
+        _x.insert(_x.end(), inputs.begin(), inputs.end());
     }
 
     // Mixes the inputs added since the last update with the weights of set
