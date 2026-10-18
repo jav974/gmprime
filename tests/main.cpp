@@ -852,6 +852,80 @@ suite<"gmprime::bit_analysis"> bit_analysis = [] {
         expect(std::distance(range.begin(), range.end()) == 3);
         expect(std::is_same_v<std::iterator_traits<set_bit_iterator>::iterator_category, std::forward_iterator_tag>);
     };
+
+    "histogram_small"_test = [] {
+        // 0b1101 over 4 bits, sliding windows of 2 bits: bits 0-1 hold 01 (value 1), bits 1-2 hold 10
+        // (value 2, bit 1 being its low bit), bits 2-3 hold 11 (value 3)
+        expect(gmprime(0b1101).histogram(2, 1) == std::vector<size_t>{0, 1, 1, 1});
+        expect(gmprime(0b1101).histogram(2) == std::vector<size_t>{0, 1, 0, 1}) << "aligned: bits 0-1, then 2-3";
+        expect(gmprime(0x0F0F).histogram(4, 8) == std::vector<size_t>{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2})
+            << "step wider than width: the low nibble of each byte";
+        expect(gmprime(1).histogram(8, 0, 24)[0] == 2) << "explicit length: the zero bytes above count";
+        expect(gmprime(-0b1101).histogram(2) == gmprime(0b1101).histogram(2)) << "on the magnitude";
+        expect(gmprime(0b1101).histogram(8) == std::vector<size_t>(256, 0)) << "no complete window";
+    };
+    "histogram_invalid_width"_test = [] {
+        expect(throws<std::invalid_argument>([] { static_cast<void>(gmprime(1).histogram(0)); }));
+        constexpr auto too_wide = gmprime::max_histogram_width + 1;
+        expect(throws<std::invalid_argument>([] { static_cast<void>(gmprime(1).histogram(too_wide)); }));
+    };
+    "histogram_matches_windows"_test = [&] {
+        for (const auto& value : irregular) {
+            for (const size_t width : {1, 3, 8, 13}) {
+                for (const size_t step : {size_t{1}, width, size_t{5}}) {
+                    std::vector<size_t> expected(size_t{1} << width, 0);
+                    for (size_t pos = 0; pos + width <= value.used_bits(); pos += step) {
+                        const uint32_t symbol = value.bits(pos, width);
+                        ++expected[symbol];
+                    }
+                    expect(value.histogram(width, step) == expected);
+                }
+            }
+        }
+    };
+    "histogram_text_file"_test = [] {
+        const auto path = TEST_OUTPUT_DIR "histogram.txt";
+        gmprime text;
+
+        {
+            std::ofstream out(path, std::ios::binary);
+            out << "abca";
+        }
+        text.load_from_file(path);
+        const auto bytes = text.histogram(8);
+        expect(bytes['a'] == 2 && bytes['b'] == 1 && bytes['c'] == 1);
+
+        {
+            std::ofstream out(path, std::ios::binary);
+            out.write("ab\0\0", 4);
+        }
+        text.load_from_file(path);
+        expect(text.histogram(8)[0] == 2) << "the file's high zero bytes count, though GMP does not store them";
+
+        std::remove(path);
+    };
+
+    "entropy"_test = [] {
+        const auto close = [](const double a, const double b) { return std::fabs(a - b) < 1e-12; };
+
+        expect(close(gmprime::entropy({}), 0));
+        expect(close(gmprime::entropy({0, 0}), 0));
+        expect(close(gmprime::entropy({5}), 0)) << "a single symbol carries no information";
+        expect(close(gmprime::entropy({7, 7}), 1));
+        expect(close(gmprime::entropy({3, 1}), 0.8112781244591328));
+        expect(close(gmprime::entropy(std::vector<size_t>(256, 1)), 8)) << "uniform bytes: 8 bits per byte";
+    };
+    "entropy_text"_test = [] {
+        const gmprime same("0x61616161", 0);
+        expect(gmprime::entropy(same.histogram(8)) == 0) << "aaaa";
+
+        // Every byte value once: incompressible byte by byte
+        gmprime all;
+        for (unsigned value = 0; value < 256; ++value) {
+            all.bits(8 * value, 8) = value;
+        }
+        expect(std::fabs(gmprime::entropy(all.histogram(8)) - 8) < 1e-12);
+    };
 };
 
 suite<"gmprime::iterator"> iterator = [] {

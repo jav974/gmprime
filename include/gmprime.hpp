@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <vector>
 #include <gmpxx.h>
 #include "../src/gmprime_ios.hpp"
 #include "../src/gmprime_literals.hpp"
@@ -164,6 +165,18 @@ public:
     // so that for (const size_t pos : (a & mask).set_bits()) does not dangle.
     [[nodiscard]] set_bit_range set_bits() const &;
     [[nodiscard]] set_bit_range set_bits() &&;
+
+    // Occurrences of each symbol of width bits (1 to max_histogram_width): result[s] counts the windows
+    // holding the value s, bit i of a symbol starting at bit start being bit start + i of the number (so a
+    // file's bytes read as little-endian). Windows start every step bits from bit 0: step = width (default)
+    // for aligned symbols, e.g. bytes with width = 8, or step = 1 for a sliding window. Only complete windows within length bits count. length defaults to
+    // the whole number, including the size of the last loaded file: its high zero bytes are part of it.
+    // Throws std::invalid_argument for an invalid width.
+    static constexpr size_t max_histogram_width = 24;
+    [[nodiscard]] std::vector<size_t> histogram(size_t width, size_t step = 0, size_t length = 0) const;
+    // Shannon entropy of a histogram, in bits per symbol: a lower bound on the average size of a symbol
+    // for any code that encodes symbols independently. 0 for an empty histogram.
+    [[nodiscard]] static double entropy(const std::vector<size_t>& histogram);
 
     template<typename word_t, std::enable_if_t<std::is_integral_v<word_t> && !std::is_same_v<word_t, bool>, bool> = true>
     void set_partial_limb(uint64_t index, word_t value);

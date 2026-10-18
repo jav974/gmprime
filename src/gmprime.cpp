@@ -411,6 +411,45 @@ set_bit_range gmprime::set_bits() && {
     return set_bit_range(std::move(*this));
 }
 
+std::vector<size_t> gmprime::histogram(const size_t width, size_t step, size_t length) const {
+    if (width == 0 || width > max_histogram_width) {
+        throw std::invalid_argument("Histogram width must be between 1 and " + std::to_string(max_histogram_width));
+    }
+
+    if (step == 0) {
+        step = width;
+    }
+
+    if (length == 0) {
+        length = std::max(used_bits(), _byte_size * CHAR_BIT);
+    }
+
+    std::vector<size_t> counts(size_t{1} << width, 0);
+
+    for (size_t pos = 0; length >= width && pos <= length - width; pos += step) {
+        ++counts[read_bits<uint32_t>(pos, width)];
+    }
+
+    return counts;
+}
+
+double gmprime::entropy(const std::vector<size_t> &histogram) {
+    size_t total = 0;
+    for (const auto count : histogram) {
+        total += count;
+    }
+
+    double result = 0;
+    for (const auto count : histogram) {
+        if (count != 0) {
+            const auto probability = static_cast<double>(count) / static_cast<double>(total);
+            result -= probability * std::log2(probability);
+        }
+    }
+
+    return result;
+}
+
 std::string gmprime::to_string(const int base) const {
     return _value.get_str(base);
 }
