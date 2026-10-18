@@ -162,6 +162,16 @@ auto self = data.autocorrelation(4096);
 // 104 bits for 13-byte records, about a line length for formatted text
 ```
 
+`analyze_folds` does the search for you, in stream order (each byte from its highest bit, the order of a bitmap's pixels, which `stream_order()` gives to any number), and scores each width against independent bits:
+
+```cpp
+auto folds = data.analyze_folds();  // widths from 64 to 8192 bits
+if (folds.strong()) {               // the best width stands out: bitmap rows, fixed-size records
+    folds.width;                    // bits per row
+    folds.layer;                    // rows per layer, for a 3D view (0: none)
+}
+```
+
 To build a compressor from these measurements, see the [coding toolkit](#coding-toolkit).
 
 ### Integer behavior
@@ -227,7 +237,8 @@ A table takes `2^bits` times the slot size: 32 MB for `checked_table<context_slo
 | `line_tracker` | the 2D view of a text: `column(history)`, `above(history)` (byte at the same column of the previous line), `previous_length()`; `byte_added(history)` after each byte |
 | `capitals_encode(text)`, `capitals_decode(encoded)` | reversible lowercasing: a capitalized word is lowercased behind `0x01`, an all-capitals word behind `0x02`, so that "The" and "the" share statistics; `capitals_encode` returns nothing if the text holds those bytes |
 | `stream_bit(bytes, p)` | bit `p` of bytes read as a stream, each byte from its highest bit, the order of a bitmap's pixels |
-| `bit_template(bytes, pos, distances)` | the stream bits at `pos - d` for each distance `d`, packed into a context. With the fold width `L` found by `gmprime::autocorrelation`, distances such as 1, 2, `L - 1`, `L`, `L + 1` form a 2D neighbourhood, and `L * H` reaches the layer behind in 3D |
+| `bit_template(bytes, pos, distances)` | the stream bits at `pos - d` for each distance `d`, packed into a context. With the fold width `L` found by `gmprime::analyze_folds`, distances such as 1, 2, `L - 1`, `L`, `L + 1` form a 2D neighbourhood, and `L * H` reaches the layer behind in 3D |
+| `runs_at(bytes, pos, width)` | pixel runs of a bitmap folded at `width` bits: `left`, the run of equal bits ending before `pos`, and `above`, how far the bit above stays the same to the right |
 
 ### Coding and measuring
 
@@ -236,6 +247,7 @@ A table takes `2^bits` times the slot size: 32 MB for `checked_table<context_slo
 | `arithmetic_encoder` | `encode(bit, p)` for each bit, then `finish()` returns the message as a `gmprime` |
 | `arithmetic_decoder(code)` | `decode(p)` returns each bit, given the same `p` as the encoder. The decoder must know when to stop: store the length in the message |
 | `cost_profile` | `add(bit, p)` alongside the coder: `per_byte()` gives the bits each byte cost, `total()` the size, to see where a model pays |
+| `table_bits(data_bytes)` | a context table size for the data: about four slots per bit, from 16 to 22 bits, so small inputs take little memory; compressor and decompressor derive it from the stored length |
 
 ### A complete compressor
 
@@ -359,5 +371,37 @@ This model compresses `alice29.txt` (152,089 bytes, from the Canterbury corpus) 
 ### Going further
 
 - **More contexts, more mixers.** Add orders (6, 8), a word context (hash of the current word's letters), `line_tracker` contexts for text; select mixer weights by `c0`, by the previous byte's `classify`, or by the highest order already seen, and mix several mixers with a final one.
-- **Look at the data first.** `gmprime::autocorrelation` reveals fold widths (rows of an image, fixed-size records): for such data, contexts from `bit_template` across the fold beat any byte context.
+- **Look at the data first.** `gmprime::analyze_folds` reveals fold widths (rows of an image, fixed-size records): for such data, contexts from `bit_template` across the fold beat any byte context.
 - **Measure.** `cost_profile` shows which bytes cost the most, and `adaptive_code_length` or `conditional_entropy` how much structure a context order holds.
+
+`examples/gmz.cpp` puts all of this together.
+
+## Example: gmz
+
+`gmz` is a compressor built on gmprime and its coding toolkit, in `examples/` (built with the project, `GMPRIME_BUILD_EXAMPLES` to turn it off):
+
+```sh
+gmz c data.txt data.gmz    # compress
+gmz d data.gmz data.txt    # decompress
+gmz t data.txt             # compress, decompress, check, report
+```
+
+It analyzes the file first with `analyze_folds`. Data that folds is coded with bit and byte templates across the fold, in 2D and 3D, and pixel runs; anything else with the text model: orders 0 to 8, words, line structure, last occurrences, indirect modeling, four mixers selected by the partial byte, the highest order seen, the previous byte and its class, and chained probability maps. It tries the capitals transform on text, and a bitmap variant on folded data, and keeps the smaller message. Options: `-m` forces a mode, `-C` the capitals transform, `-T` a table size.
+
+On the Canterbury corpus, sizes in bytes:
+
+| File | Size | gzip -9 | bzip2 -9 | xz -9e | gmz | Mode found |
+|---|---|---|---|---|---|---|
+| alice29.txt | 152,089 | 54,194 | 43,202 | 48,536 | **35,562** | text + capitals |
+| asyoulik.txt | 125,179 | 48,803 | 39,569 | 44,600 | **33,542** | text + capitals |
+| lcet10.txt | 426,754 | 144,462 | 107,706 | 119,496 | **86,054** | text |
+| plrabn12.txt | 481,861 | 194,357 | 145,577 | 165,464 | **123,305** | text |
+| ptt5 (fax image) | 513,216 | 52,238 | 49,759 | 39,868 | **21,860** | fold of 1728 bits |
+| kennedy.xls | 1,029,744 | 207,053 | 130,280 | 51,876 | **12,968** | fold of 104 bits, layers of 4 |
+| cp.html | 24,603 | 7,960 | 7,624 | 7,660 | **6,173** | text + capitals |
+| fields.c | 11,150 | 3,136 | 3,039 | 3,040 | **2,319** | text + capitals |
+| grammar.lsp | 3,721 | 1,246 | 1,283 | 1,300 | **990** | text |
+| sum | 38,240 | 12,854 | 12,909 | 9,508 | **9,408** | text |
+| xargs.1 | 4,227 | 1,756 | 1,762 | 1,820 | **1,440** | text + capitals |
+
+The price is speed, as for every context-mixing compressor: about 0.9 s to decompress `alice29.txt` and 1.9 s to compress it (two tries, with and without capitals), against hundredths of a second for the others, and up to about 800 MB of memory for large inputs (tables are sized for the data, so small files take much less). Decompression is a single pass of the same model, so it takes about as long as one compression try.
