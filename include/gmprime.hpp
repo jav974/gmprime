@@ -59,6 +59,9 @@ public:
     gmprime& operator%=(const gmprime& other);
     gmprime& operator++();
     gmprime& operator--();
+    // Postfix forms are deleted on purpose: they would copy the whole number to return the old value
+    gmprime operator++(int) = delete;
+    gmprime operator--(int) = delete;
 
     // BINARY OPERATORS &=  &   |=  |   ^=  ^   <<= <<  >>= >>  ~
     gmprime& operator&=(const gmprime& other);

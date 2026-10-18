@@ -25,6 +25,18 @@ struct has_non_member_operators<L, R, std::void_t<
     decltype(std::declval<L>() == std::declval<R>()),
     decltype(std::declval<L>() < std::declval<R>())>> : std::true_type {};
 
+template<typename T, typename = void>
+struct has_postfix_increment : std::false_type {};
+
+template<typename T>
+struct has_postfix_increment<T, std::void_t<decltype(std::declval<T&>()++)>> : std::true_type {};
+
+template<typename T, typename = void>
+struct has_postfix_decrement : std::false_type {};
+
+template<typename T>
+struct has_postfix_decrement<T, std::void_t<decltype(std::declval<T&>()--)>> : std::true_type {};
+
 template<typename L>
 void check_primitive_lhs(const L lhs) {
     if constexpr (has_non_member_operators<L, gmprime>::value) {
@@ -241,6 +253,11 @@ suite<"gmprime::arithmetic"> arithmetic = [] {
         gmprime r(42);
         --r;
         expect(r == 41);
+    };
+    "postfix_deleted"_test = [] {
+        expect(!has_postfix_increment<gmprime>::value);
+        expect(!has_postfix_decrement<gmprime>::value);
+        expect(has_postfix_increment<int>::value) << "trait sanity check";
     };
     "unary+"_test = [] {
         const gmprime r(-42);
