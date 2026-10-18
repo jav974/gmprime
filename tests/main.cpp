@@ -818,7 +818,7 @@ suite<"gmprime::string"> string = [] {
     };
 
     "file_read_not_a_file"_test = [] {
-        // Opening a directory succeeds on Linux, then tellg() fails (on ext4, overlayfs...)
+        // Opening a directory succeeds on Linux, then tellg() returns a meaningless size (LLONG_MAX on ext4)
         const std::string dir_path = TEST_OUTPUT_DIR "a_directory";
         std::filesystem::create_directory(dir_path);
         gmprime v(42);

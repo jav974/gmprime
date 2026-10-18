@@ -1,3 +1,4 @@
+#include <filesystem>
 #include <fstream>
 #include <stdexcept>
 #include <vector>
@@ -234,10 +235,13 @@ gmprime & gmprime::load_from_file(const std::string &file_path) {
         throw std::runtime_error("Error opening file");
     }
 
-    // Determine the size of the file
-    file.seekg(0, std::ios::end);
-    const std::streamsize size = file.tellg();
-    file.seekg(0, std::ios::beg);
+    // Determine the size of the file. Not with seekg/tellg: they give a meaningless size for anything
+    // but a regular file (e.g. on Linux, opening a directory succeeds and tellg() returns LLONG_MAX on ext4)
+    std::error_code error;
+    const auto size = static_cast<std::streamsize>(std::filesystem::file_size(file_path, error));
+    if (error) {
+        throw std::runtime_error("Error reading file size: " + error.message());
+    }
 
     // Read the file into a buffer
     std::vector<char> buffer(size);
@@ -261,21 +265,27 @@ void gmprime::save_to_file(const std::string &file_path) const {
         throw std::runtime_error("Error opening file");
     }
 
-    // Determine the size of the export buffer
-    size_t size;
-    void* data = mpz_export(nullptr, &size, -1, 1, 1, 0, _value.get_mpz_t());
+    // Export into our own buffer: a buffer allocated by GMP would have to be released through
+    // GMP's memory functions, which may be customized (mp_set_memory_functions)
+    const auto mpz = _value.get_mpz_t();
+    std::vector<char> buffer(mpz_sgn(mpz) == 0 ? 0 : (mpz_sizeinbase(mpz, 2) + CHAR_BIT - 1) / CHAR_BIT);
+    size_t size = 0;
+    if (!buffer.empty()) {
+        mpz_export(buffer.data(), &size, -1, 1, 1, 0, mpz);
+    }
 
     // Write the data to the file
-    file.write(static_cast<const char*>(data), static_cast<std::streamsize>(size));
+    file.write(buffer.data(), static_cast<std::streamsize>(size));
 
     if (_byte_size > size) {
         const std::vector<char> padding(_byte_size - size, 0);
         file.write(padding.data(), static_cast<std::streamsize>(padding.size()));
     }
-    file.close();
 
-    // Free the allocated memory for export
-    free(data);
+    file.close();
+    if (!file) {
+        throw std::runtime_error("Error writing file");
+    }
 }
 
 gmprime gmprime::sqrt() const {
