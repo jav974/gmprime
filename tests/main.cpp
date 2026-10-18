@@ -1120,6 +1120,10 @@ suite<"gmprime::string"> string = [] {
         std::istringstream sign_only("-");
         sign_only >> b;
         expect(sign_only.fail() && b == 2);
+
+        std::istringstream blank("   ");
+        blank >> b;
+        expect(blank.fail() && blank.eof() && b == 2) << "nothing but whitespace, like an int";
     };
     "stream_round_trip"_test = [] {
         const gmprime original("-123456789abcdef0123456789abcdef", 16);
