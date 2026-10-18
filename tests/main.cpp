@@ -1015,6 +1015,123 @@ suite<"gmprime::string"> string = [] {
         t.str("");
     };
 
+    "ostream_format_like_int"_test = [] {
+        using flags = std::ios_base::fmtflags;
+        const flags bases[] = {std::ios_base::dec, std::ios_base::oct, std::ios_base::hex};
+        const flags options[] = {
+            flags{}, std::ios_base::showbase, std::ios_base::uppercase, std::ios_base::showpos,
+            std::ios_base::showbase | std::ios_base::uppercase,
+            std::ios_base::showbase | std::ios_base::showpos | std::ios_base::uppercase,
+        };
+        const flags adjustments[] = {flags{}, std::ios_base::left, std::ios_base::right, std::ios_base::internal};
+        const long values[] = {0, 1, 42, 255, 4096, 123456789};
+
+        const auto check = [](const flags format, const long value) {
+            std::ostringstream expected, actual;
+            for (auto *s : {&expected, &actual}) {
+                s->flags(format);
+                s->width(14);
+                s->fill('*');
+            }
+            expected << value;
+            actual << gmprime(value);
+            expect(actual.str() == expected.str()) << "gmprime" << actual.str() << "int" << expected.str();
+        };
+
+        for (const auto base : bases)
+            for (const auto option : options)
+                for (const auto adjustment : adjustments)
+                    for (const auto value : values) {
+                        check(base | option | adjustment, value);
+                        // An int prints its two's complement in octal and hexadecimal: compare signs in decimal only
+                        if (base == std::ios_base::dec)
+                            check(base | option | adjustment, -value);
+                    }
+    };
+
+    "ostream_format_beyond_int"_test = [] {
+        std::ostringstream t;
+        t << std::showbase << std::hex << gmprime(-255) << ' ' << std::uppercase << gmprime(-255);
+        expect(t.str() == "-0xff -0XFF") << "a negative number prints as a sign and its magnitude";
+        t.str("");
+
+        t << std::nouppercase << gmprime::bin << gmprime(5) << ' ' << std::uppercase << gmprime(5) << ' ' << gmprime(0);
+        expect(t.str() == "0b101 0B101 0");
+        t.str("");
+
+        t << std::noshowbase << std::nouppercase << std::hex << std::setw(10) << std::internal << std::setfill('0')
+          << gmprime(-255);
+        expect(t.str() == "-0000000ff");
+        t.str("");
+
+        std::wostringstream w;
+        w << std::showbase << std::hex << gmprime(255);
+        expect(w.str() == L"0xff") << "wide streams";
+    };
+
+    "istream"_test = [] {
+        std::istringstream t("  42 -17 +5 123456789012345678901234567890");
+        gmprime a, b, c, d;
+        t >> a >> b >> c >> d;
+
+        expect(!t.fail());
+        expect(a == 42 && b == -17 && c == 5);
+        expect(d == gmprime("123456789012345678901234567890"));
+    };
+    "istream_bases"_test = [] {
+        gmprime a, b, c, d;
+
+        std::istringstream hex("ff 0xFF");
+        hex >> std::hex >> a >> b;
+        expect(a == 255 && b == 255);
+
+        std::istringstream oct("17");
+        oct >> std::oct >> c;
+        expect(c == 15);
+
+        std::istringstream bin("101 0b11");
+        bin >> gmprime::bin >> a >> b;
+        expect(a == 5 && b == 3);
+
+        // No base set: detected from the prefix, like %i
+        std::istringstream detect("0x1f 017 0b101 42 -0x10 0");
+        detect.unsetf(std::ios_base::basefield);
+        gmprime e, f;
+        detect >> a >> b >> c >> d >> e >> f;
+        expect(a == 31 && b == 15 && c == 5 && d == 42 && e == -16 && f == 0);
+    };
+    "istream_stops_and_fails"_test = [] {
+        gmprime a(1), b(2);
+
+        std::istringstream rest("42abc");
+        rest >> a;
+        expect(a == 42 && !rest.fail());
+        expect(rest.peek() == 'a') << "reading stops at the first character that is not a digit";
+
+        std::istringstream invalid("abc");
+        invalid >> b;
+        expect(invalid.fail());
+        expect(b == 2) << "value modified by a failed read";
+
+        std::istringstream end("42");
+        end >> a;
+        expect(end.eof() && !end.fail());
+
+        std::istringstream sign_only("-");
+        sign_only >> b;
+        expect(sign_only.fail() && b == 2);
+    };
+    "stream_round_trip"_test = [] {
+        const gmprime original("-123456789abcdef0123456789abcdef", 16);
+        std::stringstream t;
+        t << std::showbase << std::hex << original;
+
+        gmprime read;
+        t.unsetf(std::ios_base::basefield);
+        t >> read;
+        expect(read == original);
+    };
+
     "ostream_bin_sticky"_test = [] {
         const gmprime a(5), b(6), c(255);
         std::stringstream t;
