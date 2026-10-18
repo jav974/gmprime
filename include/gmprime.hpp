@@ -97,6 +97,8 @@ public:
     explicit operator bool() const;
 
     // COMPARISON OPERATORS  ==  <=  >=  <  >  !=
+    // With a floating point value, the comparison is exact, without converting either side (see gmprime.tpp):
+    // gmprime(5) < 5.5 is true, and NaN compares unordered (every comparison false, except !=)
     friend bool operator==(const gmprime& lhs, const gmprime& rhs);
     friend bool operator!=(const gmprime& lhs, const gmprime& rhs);
     friend bool operator<=(const gmprime& lhs, const gmprime& rhs);
