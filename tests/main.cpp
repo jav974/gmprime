@@ -3,6 +3,8 @@
 #include <limits>
 #include <stdexcept>
 #include <sys/stat.h>
+#include <unordered_map>
+#include <unordered_set>
 #include <boost/ut.hpp>
 #include <gmprime.hpp>
 
@@ -935,6 +937,32 @@ suite<"gmprime::helper"> helper = [] {
         expect(gmprime(-42).to_primitive<__int128>() == -42);
     };
 #endif
+
+    "hash"_test = [] {
+        const std::hash<gmprime> hash;
+        const gmprime big("123456789012345678901234567890");
+
+        expect(hash(gmprime(42)) == hash(gmprime("42")));
+        expect(hash(big) == hash(gmprime("123456789012345678901234567890")));
+        expect(hash(gmprime()) == hash(gmprime(0)));
+
+        // The size of the last loaded file is not part of equality, so not of the hash either
+        gmprime loaded;
+        loaded.load_from_file(TEST_FILES_DIR "dummy.txt");
+        const gmprime rebuilt(loaded.to_string());
+        expect(loaded == rebuilt);
+        expect(hash(loaded) == hash(rebuilt));
+
+        const std::unordered_set<gmprime> set{gmprime(1), gmprime(-1), gmprime(1), big};
+        expect(set.size() == 3);
+        expect(set.count(gmprime("-1")) == 1);
+
+        std::unordered_map<gmprime, int> map;
+        map[gmprime(5)] = 1;
+        map[gmprime("5")] += 1;
+        expect(map.size() == 1);
+        expect(map.at(5) == 2);
+    };
 
     "used_words"_test = [] {
         gmprime v(ULONG_LONG_MAX);

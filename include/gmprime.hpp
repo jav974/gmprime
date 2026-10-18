@@ -162,6 +162,17 @@ private:
 
 } // GMPrime
 
+namespace std {
+
+// Hashes the value only (sign and limbs), consistently with operator==: the size of the last
+// loaded file is not part of it
+template<>
+struct hash<GMPrime::gmprime> {
+    size_t operator()(const GMPrime::gmprime& value) const noexcept;
+};
+
+} // std
+
 #include "../src/gmprime_stream.tpp" // NOLINT
 
 #endif //GMPRIME_HPP

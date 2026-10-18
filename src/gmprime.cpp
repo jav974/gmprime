@@ -318,3 +318,18 @@ gmprime gmprime::factorial(const unsigned int n) {
     mpz_fac_ui(result._value.get_mpz_t(), n);
     return result;
 }
+
+size_t std::hash<gmprime>::operator()(const gmprime &value) const noexcept {
+    // GMP keeps numbers normalized (no high zero limb), so equal values have the same limbs
+    const auto mpz = value.get_value().get_mpz_t();
+    const auto limbs = mpz_limbs_read(mpz);
+    const auto size = mpz_size(mpz);
+    auto seed = std::hash<int>{}(mpz_sgn(mpz));
+
+    // Same mixing as boost::hash_combine
+    for (size_t i = 0; i < size; ++i) {
+        seed ^= std::hash<mp_limb_t>{}(limbs[i]) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+    }
+
+    return seed;
+}
