@@ -6,6 +6,8 @@
 //
 //   -m MODE   auto (default), text, fold (full and bitmap variants tried), fold-full, bitmap
 //   -C MODE   capitals transform for text: auto (tried both ways, default), on, off
+//   -S BYTES  ways compared on the first BYTES bytes, then the data compressed once (default 65536); 0 compresses
+//             the data both ways and keeps the smaller message, slower and sometimes a little smaller
 //   -T BITS   context table size in bits of slot count, instead of one sized for the data (the decompressor
 //             needs the same value)
 //
@@ -105,15 +107,24 @@ public:
 
         // Each context: its probability, its history's probability across contexts, and a deterministic input
         // when only one bit value was ever seen
+        const auto input = [&](const double x) {
+            _x.push_back(static_cast<float>(x));
+        };
         size_t highest_seen = 0;
         for (size_t t = 0; t < _contexts; ++t) {
             const uint64_t key = t < _byte_contexts ? _hashes[t] ^ (static_cast<uint64_t>(_c0) * 0x9E3779B97F4A7C15ull) : _hashes[t];
             auto& slot = _tables[t].at(key);
             _slots[t] = &slot;
-            _x.push_back(slot.seen() ? stretch(clamp_probability(slot.p)) : 0.0);
-            _x.push_back(stretch(clamp_probability(_maps[t].p(slot.history))));
+            if (t < _byte_contexts && _bit_count < 7) {
+                // The slots of the next bit, whichever it is, fetched while this one is computed
+                const uint64_t next = static_cast<uint64_t>(_c0) << 1;
+                _tables[t].prefetch(_hashes[t] ^ (next * 0x9E3779B97F4A7C15ull));
+                _tables[t].prefetch(_hashes[t] ^ ((next | 1) * 0x9E3779B97F4A7C15ull));
+            }
+            input(slot.seen() ? stretch_fast(slot.p) : 0.0);
+            input(stretch_fast(_maps[t].p(slot.history)));
             const int zeros = slot.history.zeros(), ones = slot.history.ones();
-            _x.push_back(zeros == 0 && ones > 0 ? ones / 4.0 : ones == 0 && zeros > 0 ? -zeros / 4.0 : 0.0);
+            input(zeros == 0 && ones > 0 ? ones / 4.0 : ones == 0 && zeros > 0 ? -zeros / 4.0 : 0.0);
             if (slot.seen() && t < _orders.size()) {
                 highest_seen = t + 1;
             }
@@ -123,10 +134,10 @@ public:
         const uint32_t length = _match.length();
         _bucket = _expected < 0 ? 0 : std::min(length, 31u) + 1;
         const double sign = _expected == 1 ? 1.0 : -1.0;
-        _x.push_back(_expected < 0 ? 0.0 : sign * stretch(clamp_probability(_match_counters[_bucket].p)));
-        _x.push_back(_expected < 0 ? 0.0 : sign * std::min(length, 32u) / 16.0);
+        input(_expected < 0 ? 0.0 : sign * stretch_fast(_match_counters[_bucket].p));
+        input(_expected < 0 ? 0.0 : sign * std::min(length, 32u) / 16.0);
         const size_t match_state = _expected < 0 ? 0 : length < 16 ? 1 : length < 32 ? 2 : 3;
-        _x.push_back(0.3);
+        input(0.3);
 
         const size_t sets[] = {
             _c0,
@@ -135,9 +146,9 @@ public:
             static_cast<size_t>(classify(_last)) * 256 + _c0,
             _fold_set,
         };
+        // Every mixer reads the same inputs, without copying them
         for (size_t i = 0; i < _mixers.size(); ++i) {
-            _mixers[i].add(_x);
-            _final.add(stretch(_mixers[i].mix(sets[i])));
+            _final.add(stretch_fast(_mixers[i].mix(_x, sets[i])));
         }
         _final.add(0.3);
         _mixed = _final.mix(0);
@@ -280,7 +291,7 @@ private:
     last_byte_slot *_word_slot = nullptr, *_three_slot = nullptr;
     std::vector<logistic_mixer> _mixers;
     logistic_mixer _final;
-    std::vector<double> _x;
+    std::vector<float> _x;
     probability_map _map1, _map2;
     match_model _match;
     bit_counter _match_counters[33];
@@ -362,48 +373,57 @@ struct choice {
     bool capitals = false;
 };
 
-// Analyzes the data, then compresses it the way that gives the smallest message among those tried
-choice compress_best(const gmprime& file, const std::string& mode, const std::string& capitals_mode, const int forced_table_bits) {
+// Analyzes the data, then compresses it the way that gives the smaller message: with or without the capitals
+// transform for text, with the full or the bitmap model for folded data, unless the options impose one. The
+// two ways are compared on the first sample bytes, then the whole data is compressed once the better way;
+// with sample 0, or data that fits in the sample, both are compressed whole and the smaller message kept.
+choice compress_best(const gmprime& file, const std::string& mode, const std::string& capitals_mode, const int forced_table_bits,
+                     const size_t sample) {
     const auto data = file.bytes();
     choice best;
 
-    const auto folds = file.analyze_folds();
+    // The first 128 KB find the same folds as the whole data, much sooner
+    const auto folds = file.analyze_folds(64, 8192, 131072);
     best.cfg.fold = mode == "fold" || mode == "fold-full" || mode == "bitmap" || (mode == "auto" && folds.strong());
     if (best.cfg.fold) {
         best.cfg.width = folds.width;
         best.cfg.layer = folds.layer < 256 ? folds.layer : 0;
     }
+    best.cfg.bitmap = mode == "bitmap";
 
-    // Capitals transform: for text only, tried both ways unless told otherwise
     const auto lowered = capitals_encode(data);
-    const bool try_capitals = !best.cfg.fold && lowered.has_value() && capitals_mode != "off";
-    if (capitals_mode != "on" || !try_capitals) {
-        best.code = compress(data, best.cfg, false, forced_table_bits);
-    }
+    best.capitals = capitals_mode == "on" && !best.cfg.fold && lowered.has_value();
+    const bool compare_capitals = capitals_mode == "auto" && !best.cfg.fold && lowered.has_value();
+    const bool compare_bitmap = best.cfg.fold && (mode == "auto" || mode == "fold");
 
-    // Folded data: the bitmap variant too, the smaller kept
-    if (best.cfg.fold && mode != "fold-full") {
+    if (compare_capitals || compare_bitmap) {
+        const bool whole = sample == 0 || data.size() <= sample;
+        const auto first = [&](const std::vector<uint8_t>& bytes) {
+            return whole ? bytes : std::vector<uint8_t>(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(sample));
+        };
         config variant = best.cfg;
-        variant.bitmap = true;
-        auto code = compress(data, variant, false, forced_table_bits);
-        if (mode == "bitmap" || code.bytes().size() < best.code.bytes().size()) {
-            best.code = std::move(code);
+        variant.bitmap = compare_bitmap;
+        auto plain = compress(first(data), best.cfg, false, forced_table_bits);
+        auto other = compare_capitals ? compress(first(*lowered), best.cfg, true, forced_table_bits)
+                                      : compress(first(data), variant, false, forced_table_bits);
+
+        if (other.bytes().size() < plain.bytes().size()) {
+            best.capitals = compare_capitals;
             best.cfg = variant;
+            plain = std::move(other);
+        }
+        if (whole) {
+            best.code = std::move(plain);
+            return best;
         }
     }
 
-    if (try_capitals) {
-        auto code = compress(*lowered, best.cfg, true, forced_table_bits);
-        if (capitals_mode == "on" || code.bytes().size() < best.code.bytes().size()) {
-            best.code = std::move(code);
-            best.capitals = true;
-        }
-    }
+    best.code = compress(best.capitals ? *lowered : data, best.cfg, best.capitals, forced_table_bits);
     return best;
 }
 
 int usage() {
-    std::fprintf(stderr, "usage: gmz [-m auto|text|fold|fold-full|bitmap] [-C auto|on|off] [-T bits] c|d INPUT OUTPUT\n"
+    std::fprintf(stderr, "usage: gmz [-m auto|text|fold|fold-full|bitmap] [-C auto|on|off] [-S bytes] [-T bits] c|d INPUT OUTPUT\n"
                          "       gmz [options] t INPUT\n");
     return 2;
 }
@@ -413,11 +433,13 @@ int usage() {
 int main(int argc, char** argv) {
     std::string mode = "auto", capitals_mode = "auto";
     int forced_table_bits = 0;
+    size_t sample = 65536;
     int arg = 1;
     for (; arg + 1 < argc && argv[arg][0] == '-'; arg += 2) {
         const std::string flag = argv[arg];
         if (flag == "-m") mode = argv[arg + 1];
         else if (flag == "-C") capitals_mode = argv[arg + 1];
+        else if (flag == "-S") sample = std::stoul(argv[arg + 1]);
         else if (flag == "-T") forced_table_bits = std::stoi(argv[arg + 1]);
         else return usage();
     }
@@ -439,7 +461,7 @@ int main(int argc, char** argv) {
     }
 
     const auto start = std::chrono::steady_clock::now();
-    const auto best = compress_best(input, mode, capitals_mode, forced_table_bits);
+    const auto best = compress_best(input, mode, capitals_mode, forced_table_bits, sample);
     if (command == "c") {
         best.code.save_to_file(argv[arg + 2]);
         return 0;
