@@ -152,6 +152,28 @@ size_t covered = parse.matched_bytes;              // also parse.matches, parse.
 
 Entropy estimates keep decreasing with the order, as contexts get too rare to be measured reliably: `adaptive_code_length` is the honest figure, the bits a context model actually takes to code the data while learning it, comparable to the output of a real compressor. Repetitions are what dictionary compressors (LZ77, xz) reference, and no context model sees them.
 
+### Folds
+
+Fold a bit field at width L, like fabric, and bits L apart stack up. `autocorrelation` measures, for every distance, how many bits equal the one that far ahead, with one shift, XOR and popcount of the whole number per distance:
+
+```cpp
+auto self = data.autocorrelation(4096);
+// Peaks of self[d] / (self[0] - d) are fold widths: 1728 bits for the rows of a fax image,
+// 104 bits for 13-byte records, about a line length for formatted text
+```
+
+`analyze_folds` does the search for you, in stream order (each byte from its highest bit, the order of a bitmap's pixels, which `stream_order()` gives to any number), and scores each width against independent bits:
+
+```cpp
+auto folds = data.analyze_folds();  // widths from 64 to 8192 bits
+if (folds.strong()) {               // the best width stands out: bitmap rows, fixed-size records
+    folds.width;                    // bits per row
+    folds.layer;                    // rows per layer, for a 3D view (0: none)
+}
+```
+
+To build a compressor from these measurements, see the [coding toolkit](#coding-toolkit).
+
 ### Integer behavior
 
 A `gmprime` is used like an `int`: arithmetic, bitwise and comparison operators (with a primitive on either side), `if (a)`, streams with every formatting flag (`std::showbase`, `std::setw`...) and `>>`, `abs`, `gcd`, `lcm`, `to_string`, `std::hash` and `std::numeric_limits`. Comparisons with a floating point value are exact: `gmprime(5) < 5.5`.
@@ -165,3 +187,221 @@ The differences are deliberate:
 - A negative number prints as a sign and its magnitude in every base (`-0xff`), where an `int` prints its two's complement in octal and hexadecimal.
 - There is no implicit conversion to a primitive, which could truncate: use `to_primitive<T>()`.
 - Mixed arithmetic with a floating point value converts it to `gmprime` first, truncating it: `a + 0.5` is `a`. Use `a.to_primitive<double>() + 0.5` for a floating point result.
+
+## Coding toolkit
+
+`#include <gmprime_coding.hpp>` adds the tools to build a compressor on gmprime: models that predict each bit of the data from what precedes it, and an arithmetic coder that turns those predictions into a compressed message, itself a `gmprime` to save, load or analyze like any other.
+
+### Principles
+
+- **Bit by bit.** Each byte is coded from its highest bit. While coding a byte, `c0` holds the bits coded so far behind a leading 1 (1 at the start of the byte, up to 255), and `bit_count` how many there are. Contexts usually combine the previous bytes with `c0`.
+- **A probability per bit.** A model gives the probability `p` that the next bit is 1. The coder spends about `-log2(p)` bits on a 1 and `-log2(1 - p)` on a 0, so good predictions mean a small message. `clamp_probability` keeps `p` within what the coder handles.
+- **Causal models, identical on both sides.** For every bit: ask the model for `p`, code (or decode) the bit, then let the model learn it. Models only use what precedes the bit, so the decoder, running the same code on the bits it has decoded, makes the same predictions.
+- **Same build, same platform.** Models compute in floating point (`std::log`, `std::exp`): a message is guaranteed to decode with a decoder built like the encoder, on the same platform.
+
+### Probabilities
+
+| Tool | Role |
+|---|---|
+| `stretch(p)`, `squash(x)` | the logistic domain, `ln(p / (1 - p))` and its inverse, where predictions are mixed |
+| `clamp_probability(p)`, `probability_12(p)` | keep `p` within the coder's 12 bits |
+| `bit_counter` | adaptive probability: `update(bit, limit)` moves `p` toward the bit at rate `1 / (n + 1.5)`, fast at first, then more slowly as `n` grows up to `limit` (high for stable data, low to follow changes); `seen()` tells whether it learned anything |
+| `bit_history` | the counts of 0s and 1s seen in a context in one byte (`zeros()`, `ones()`, up to 15), recent bits weighing more |
+| `history_map` | indirect modeling: `p(history)` is the probability learned, across every context, for contexts with that history; `update(history, bit)` after coding. Rare contexts know little alone, their history generalizes |
+
+### Contexts
+
+| Tool | Role |
+|---|---|
+| `context_hash(history, pos, order)` | hash of the `order` bytes before `pos`, distinct per order |
+| `hashed_table<T>(bits)` | `2^bits` slots of type `T`; `at(hash)` returns the slot of a context, colliding contexts sharing it; `hashed_counters` holds `bit_counter`s |
+| `checked_table<T>(bits)` | the same with an 8-bit checksum in each slot: a context landing on another's slot resets it rather than sharing its statistics (`T` needs a `check` field) |
+| `context_slot` | 8 bytes per context: a probability (as `bit_counter`), its `bit_history` and the checksum; `update(bit, limit)` updates both |
+| `last_byte_slot` | the byte that followed the context last time and how many times in a row (`update(byte)`); `expected_bit(c0, bit_count)` predicts its next bit, or -1 if the byte coded so far disagrees |
+
+A table takes `2^bits` times the slot size: 32 MB for `checked_table<context_slot>(22)`.
+
+### Mixing
+
+| Tool | Role |
+|---|---|
+| `logistic_mixer(inputs, sets, rate)` | combines predictions: `add(x)` each input (usually `stretch(p)`, 0 for "no idea"), `mix(set)` returns `p`, `update(bit)` learns the weights. Each set has its own weights, chosen by a small context (e.g. `c0`), so the mixer learns whom to trust when; `set_rate` changes the learning rate, e.g. decreasing over time |
+| `probability_map(contexts, rate)` | refines a probability given a context: `refine(p, context)`, then `update(bit)`. Averaged with its input, it corrects what the mixer systematically gets wrong |
+| `match_model(min_length)` | finds the last earlier occurrence of the last `min_length` bytes and predicts that what followed comes again: `byte_added(history)` after each byte, `expected_bit(history, c0, bit_count)`, `length()` of the match, `miss()` when a prediction fails |
+
+### Text and bit geometry
+
+| Tool | Role |
+|---|---|
+| `classify(byte)` | the `char_class` of a byte (newline, space, lowercase, uppercase, digit, punctuation, other), a good mixer set or context for text |
+| `line_tracker` | the 2D view of a text: `column(history)`, `above(history)` (byte at the same column of the previous line), `previous_length()`; `byte_added(history)` after each byte |
+| `capitals_encode(text)`, `capitals_decode(encoded)` | reversible lowercasing: a capitalized word is lowercased behind `0x01`, an all-capitals word behind `0x02`, so that "The" and "the" share statistics; `capitals_encode` returns nothing if the text holds those bytes |
+| `stream_bit(bytes, p)` | bit `p` of bytes read as a stream, each byte from its highest bit, the order of a bitmap's pixels |
+| `bit_template(bytes, pos, distances)` | the stream bits at `pos - d` for each distance `d`, packed into a context. With the fold width `L` found by `gmprime::analyze_folds`, distances such as 1, 2, `L - 1`, `L`, `L + 1` form a 2D neighbourhood, and `L * H` reaches the layer behind in 3D |
+| `runs_at(bytes, pos, width)` | pixel runs of a bitmap folded at `width` bits: `left`, the run of equal bits ending before `pos`, and `above`, how far the bit above stays the same to the right |
+
+### Coding and measuring
+
+| Tool | Role |
+|---|---|
+| `arithmetic_encoder` | `encode(bit, p)` for each bit, then `finish()` returns the message as a `gmprime` |
+| `arithmetic_decoder(code)` | `decode(p)` returns each bit, given the same `p` as the encoder. The decoder must know when to stop: store the length in the message |
+| `cost_profile` | `add(bit, p)` alongside the coder: `per_byte()` gives the bits each byte cost, `total()` the size, to see where a model pays |
+| `table_bits(data_bytes)` | a context table size for the data: about four slots per bit, from 16 to 22 bits, so small inputs take little memory; compressor and decompressor derive it from the stored length |
+
+### A complete compressor
+
+A model mixing orders 1 to 4 (with their bit histories) and a match model, shared by the compressor and the decompressor:
+
+```cpp
+#include <gmprime_coding.hpp>
+
+using namespace GMPrime;
+using namespace GMPrime::coding;
+
+class model {
+public:
+    model(): _mixer(2 * 4 + 2 + 1, 256, 0.005), _map(256 * 256, 0.02), _match(6) {
+        for (int i = 0; i < 4; ++i) {
+            _tables.emplace_back(22);
+        }
+    }
+
+    // Probability that the next bit is 1
+    double p() {
+        for (size_t i = 0; i < _tables.size(); ++i) {
+            _slots[i] = &_tables[i].at(context_hash(_history, _history.size(), i + 1) * 256 + _c0);
+            _mixer.add(_slots[i]->seen() ? stretch(clamp_probability(_slots[i]->p)) : 0.0);
+            _mixer.add(stretch(clamp_probability(_maps[i].p(_slots[i]->history))));
+        }
+        _expected = _match.expected_bit(_history, _c0, _bit_count);
+        const double sign = _expected == 1 ? 1.0 : -1.0;
+        _mixer.add(_expected < 0 ? 0.0 : sign * std::min(_match.length(), 32u) / 4.0);
+        _mixer.add(_expected < 0 ? 0.0 : sign);
+        _mixer.add(0.3);  // bias
+
+        const double mixed = _mixer.mix(_c0);
+        const uint8_t previous = _history.empty() ? 0 : _history.back();
+        return clamp_probability((mixed + 3 * _map.refine(mixed, previous * 256u + _c0)) / 4);
+    }
+
+    // Learns the bit, after it was coded or decoded
+    void update(const int bit) {
+        _mixer.update(bit);
+        _map.update(bit);
+        for (size_t i = 0; i < _tables.size(); ++i) {
+            _maps[i].update(_slots[i]->history, bit);
+            _slots[i]->update(bit, 60);
+        }
+        if (_expected >= 0 && bit != _expected) {
+            _match.miss();
+        }
+        _c0 = (_c0 << 1) | static_cast<uint32_t>(bit);
+        if (++_bit_count == 8) {
+            _history.push_back(static_cast<uint8_t>(_c0));
+            _match.byte_added(_history);
+            _c0 = 1;
+            _bit_count = 0;
+        }
+    }
+
+private:
+    std::vector<checked_table<context_slot>> _tables;
+    history_map _maps[4];
+    context_slot* _slots[4] = {};
+    logistic_mixer _mixer;
+    probability_map _map;
+    match_model _match;
+    std::vector<uint8_t> _history;
+    uint32_t _c0 = 1;
+    int _bit_count = 0, _expected = -1;
+};
+
+gmprime compress(const std::vector<uint8_t>& data) {
+    arithmetic_encoder encoder;
+    for (int i = 31; i >= 0; --i) {
+        encoder.encode(static_cast<int>(data.size() >> i) & 1, 0.5);  // the length, for the decoder
+    }
+    model m;
+    for (const uint8_t byte : data) {
+        for (int i = 7; i >= 0; --i) {
+            const int bit = (byte >> i) & 1;
+            encoder.encode(bit, m.p());
+            m.update(bit);
+        }
+    }
+    return encoder.finish();
+}
+
+std::vector<uint8_t> decompress(const gmprime& code) {
+    arithmetic_decoder decoder(code);
+    size_t size = 0;
+    for (int i = 0; i < 32; ++i) {
+        size = (size << 1) | static_cast<size_t>(decoder.decode(0.5));
+    }
+    model m;
+    std::vector<uint8_t> data;
+    while (data.size() < size) {
+        int byte = 0;
+        for (int i = 0; i < 8; ++i) {
+            const int bit = decoder.decode(m.p());
+            m.update(bit);
+            byte = (byte << 1) | bit;
+        }
+        data.push_back(static_cast<uint8_t>(byte));
+    }
+    return data;
+}
+```
+
+Used with files:
+
+```cpp
+gmprime file;
+file.load_from_file("alice29.txt");
+compress(file.bytes()).save_to_file("alice29.gmc");
+
+gmprime code;
+code.load_from_file("alice29.gmc");
+std::vector<uint8_t> data = decompress(code);
+```
+
+This model compresses `alice29.txt` (152,089 bytes, from the Canterbury corpus) to 38,869 bytes, where bzip2 -9 gives 43,202 and xz -9e 48,536. A research compressor adding the text tools, more orders and a second mixer reaches 1.95 bits per character on it, and folding at the width found by `autocorrelation` halves what xz achieves on a fax image.
+
+### Going further
+
+- **More contexts, more mixers.** Add orders (6, 8), a word context (hash of the current word's letters), `line_tracker` contexts for text; select mixer weights by `c0`, by the previous byte's `classify`, or by the highest order already seen, and mix several mixers with a final one.
+- **Look at the data first.** `gmprime::analyze_folds` reveals fold widths (rows of an image, fixed-size records): for such data, contexts from `bit_template` across the fold beat any byte context.
+- **Measure.** `cost_profile` shows which bytes cost the most, and `adaptive_code_length` or `conditional_entropy` how much structure a context order holds.
+
+`examples/gmz.cpp` puts all of this together.
+
+## Example: gmz
+
+`gmz` is a compressor built on gmprime and its coding toolkit, in `examples/` (built with the project, `GMPRIME_BUILD_EXAMPLES` to turn it off):
+
+```sh
+gmz c data.txt data.gmz    # compress
+gmz d data.gmz data.txt    # decompress
+gmz t data.txt             # compress, decompress, check, report
+```
+
+It analyzes the file first with `analyze_folds`. Data that folds is coded with bit and byte templates across the fold, in 2D and 3D, and pixel runs; anything else with the text model: orders 0 to 8, words, line structure, last occurrences, indirect modeling, four mixers selected by the partial byte, the highest order seen, the previous byte and its class, and chained probability maps. It tries the capitals transform on text, and a bitmap variant on folded data, and keeps the smaller message. Options: `-m` forces a mode, `-C` the capitals transform, `-T` a table size.
+
+On the Canterbury corpus, sizes in bytes:
+
+| File | Size | gzip -9 | bzip2 -9 | xz -9e | gmz | Mode found |
+|---|---|---|---|---|---|---|
+| alice29.txt | 152,089 | 54,194 | 43,202 | 48,536 | **35,562** | text + capitals |
+| asyoulik.txt | 125,179 | 48,803 | 39,569 | 44,600 | **33,542** | text + capitals |
+| lcet10.txt | 426,754 | 144,462 | 107,706 | 119,496 | **86,054** | text |
+| plrabn12.txt | 481,861 | 194,357 | 145,577 | 165,464 | **123,305** | text |
+| ptt5 (fax image) | 513,216 | 52,238 | 49,759 | 39,868 | **21,860** | fold of 1728 bits |
+| kennedy.xls | 1,029,744 | 207,053 | 130,280 | 51,876 | **12,968** | fold of 104 bits, layers of 4 |
+| cp.html | 24,603 | 7,960 | 7,624 | 7,660 | **6,173** | text + capitals |
+| fields.c | 11,150 | 3,136 | 3,039 | 3,040 | **2,319** | text + capitals |
+| grammar.lsp | 3,721 | 1,246 | 1,283 | 1,300 | **990** | text |
+| sum | 38,240 | 12,854 | 12,909 | 9,508 | **9,408** | text |
+| xargs.1 | 4,227 | 1,756 | 1,762 | 1,820 | **1,440** | text + capitals |
+
+The price is speed, as for every context-mixing compressor: about 0.9 s to decompress `alice29.txt` and 1.9 s to compress it (two tries, with and without capitals), against hundredths of a second for the others, and up to about 800 MB of memory for large inputs (tables are sized for the data, so small files take much less). Decompression is a single pass of the same model, so it takes about as long as one compression try.

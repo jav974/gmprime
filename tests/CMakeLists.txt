@@ -28,5 +28,7 @@ enable_testing()
 add_test(NAME tests
         COMMAND ${CMAKE_CURRENT_BINARY_DIR}/tests
         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+# A slow run fails instead of holding up the others
+set_tests_properties(tests PROPERTIES TIMEOUT 120)
 
 include(CTest)
