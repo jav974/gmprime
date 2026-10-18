@@ -1631,6 +1631,136 @@ suite<"gmprime::coding"> coding_suite = [] {
         expect(table_bits(10'000'000, 24) == 24 && table_bits(100, 22, 10) == 12);
     };
 
+    "x86_branches"_test = [] {
+        // Two calls to the target 0x1000, from offsets 0 and 0x100: different relative operands, the same bytes once absolute
+        std::vector<uint8_t> code(0x110, 0x90);
+        const auto call = [&](const size_t at, const uint32_t relative) {
+            code[at] = 0xE8;
+            for (size_t k = 0; k < 4; ++k) {
+                code[at + 1 + k] = static_cast<uint8_t>(relative >> (8 * k));
+            }
+        };
+        call(0, 0x1000);
+        call(0x100, 0x1000 - 0x100);
+        code[0x80] = 0xE9;                     // JMP with a far target (top byte 12): left alone
+        code[0x84] = 0x12;
+        const auto original = code;
+        x86_branches(code, true);
+        expect(std::equal(code.begin() + 1, code.begin() + 5, code.begin() + 0x101)) << "the same target, the same bytes";
+        expect(code[0x81] == original[0x81] && code[0x84] == 0x12);
+        x86_branches(code, false);
+        expect(code == original);
+
+        // A conditional jump (0F 85, JNE rel32) changes only on request
+        code[0x40] = 0x0F;
+        code[0x41] = 0x85;
+        code[0x42] = 0x10;
+        code[0x43] = code[0x44] = code[0x45] = 0;
+        auto plain = code, with_jcc = code;
+        x86_branches(plain, true);
+        x86_branches(with_jcc, true, true);
+        expect(plain[0x42] == 0x10 && with_jcc[0x42] == 0x50) << "0x10 + 0x40";
+        x86_branches(with_jcc, false, true);
+        expect(with_jcc == code);
+
+        // Any data comes back, operands overlapping included; conditional jumps on request
+        std::string text;
+        random_text(3000, 26, 9, text);
+        std::vector<uint8_t> noise(text.begin(), text.end());
+        for (size_t i = 0; i < noise.size(); i += 7) {
+            noise[i] = i % 3 == 0 ? 0xE8 : i % 3 == 1 ? 0x0F : 0x85;
+            noise[(i * 31) % noise.size()] = i % 2 ? 0x00 : 0xFF;
+        }
+        for (const bool jcc : {false, true}) {
+            auto copy = noise;
+            x86_branches(copy, true, jcc);
+            expect(copy != noise);
+            x86_branches(copy, false, jcc);
+            expect(copy == noise) << "jcc" << jcc;
+        }
+        std::vector<uint8_t> tiny{0xE8, 0, 0, 0};
+        x86_branches(tiny, true);
+        expect(tiny == std::vector<uint8_t>{0xE8, 0, 0, 0}) << "shorter than a call";
+
+        expect(x86_branch_density(code) == 2 * 10000 / code.size()) << "two near calls, the far jump not counted";
+        expect(x86_branch_density(code, 0x50, 0x20) == 0 && x86_branch_density(code, 0x200) == 0);
+        expect(x86_branch_density(std::vector<uint8_t>(noise.begin(), noise.begin() + 100), 0, 0) == 0);
+    };
+
+    "x86_parser"_test = [] {
+        // Hand-assembled 32-bit instructions, one of each kind the decoder tells apart
+        const std::vector<std::vector<uint8_t>> instructions{
+            {0x90}, {0x01, 0xC8}, {0x04, 0x05}, {0x05, 1, 2, 3, 4}, {0x06}, {0x50}, {0x74, 0x10}, {0x89, 0x45, 0xFC},
+            {0x9A, 1, 2, 3, 4, 5, 6}, {0xA1, 1, 2, 3, 4}, {0xB0, 7}, {0xB8, 1, 2, 3, 4}, {0xD1, 0xE0}, {0xD9, 0xC0},
+            {0xE2, 0xFE}, {0x8D, 0x04, 0x24}, {0x8B, 0x04, 0x25, 1, 2, 3, 4}, {0x68, 1, 2, 3, 4}, {0x69, 0xC0, 1, 2, 3, 4},
+            {0x6A, 1}, {0x83, 0xC0, 1}, {0xC2, 8, 0}, {0xC8, 8, 0, 1}, {0xEA, 1, 2, 3, 4, 5, 6}, {0xF6, 0xC0, 1},
+            {0xF7, 0xC0, 1, 2, 3, 4}, {0xF7, 0xD0}, {0xC3}, {0x66, 0xB8, 1, 2}, {0x67, 0x8B, 0x46, 1}, {0x67, 0x8B, 0x06, 1, 2},
+            {0x0F, 0x05}, {0x0F, 0x84, 1, 2, 3, 4}, {0x0F, 0x70, 0xC0, 1}, {0x0F, 0xAF, 0xC1}, {0x0F, 0x38, 0x00, 0xC1},
+            {0x0F, 0x3A, 0x0F, 0xC1, 8}, {0x8B, 0x80, 1, 2, 3, 4}, {0x0F, 0x1F, 0x40, 0x00}, {0xE8, 1, 2, 3, 4},
+            {0x8B, 0x05, 1, 2, 3, 4}, {0xF0, 0x2E, 0x3E, 0x26, 0x36, 0x64, 0x65, 0xF2, 0xF3, 0x90}};
+        const uint32_t opcodes[] = {0x90, 0x01, 0x04, 0x05, 0x06, 0x50, 0x74, 0x89, 0x9A, 0xA1, 0xB0, 0xB8, 0xD1, 0xD9, 0xE2, 0x8D,
+                                    0x8B, 0x68, 0x69, 0x6A, 0x83, 0xC2, 0xC8, 0xEA, 0xF6, 0xF7, 0xF7, 0xC3, 0xB8, 0x8B, 0x8B, 0x105,
+                                    0x184, 0x170, 0x1AF, 0x200, 0x30F, 0x8B, 0x11F, 0xE8, 0x8B, 0x90};
+        x86_parser parser;
+        bool boundaries = true;
+        for (size_t i = 0; i < instructions.size(); ++i) {
+            for (const auto byte : instructions[i]) {
+                parser.byte_added(byte);
+            }
+            boundaries = boundaries && parser.next_field() == x86_parser::opcode && parser.length() == 0 && parser.previous(1) == opcodes[i];
+            expect(boundaries) << "instruction" << i;
+        }
+        expect(parser.previous(2) == 0x8B && parser.previous(4) == 0x11F);
+
+        // Within an instruction: MOV [EBP - 4], EAX
+        parser.byte_added(0x89);
+        expect(parser.next_field() == x86_parser::modrm && parser.current() == 0x89);
+        parser.byte_added(0x45);
+        expect(parser.next_field() == x86_parser::displacement && parser.index() == 0 && parser.modrm_byte() == 0x45);
+        parser.byte_added(0xFC);
+        expect(parser.previous_modrm() == 0x45);
+        parser.byte_added(0x66);
+        expect(parser.prefixes() == 0x66 && parser.length() == 1);
+
+        // 64-bit: REX prefixes, 8-byte immediates and addresses
+        x86_parser long_mode(true);
+        const std::vector<uint8_t> code64{0x48, 0xB8, 1, 2, 3, 4, 5, 6, 7, 8, 0x48, 0x8B, 0x05, 1, 2, 3, 4,
+                                          0xA1, 1, 2, 3, 4, 5, 6, 7, 8, 0x41, 0x50, 0x67, 0x8B, 0x06, 0xC3};
+        for (const auto byte : code64) {
+            long_mode.byte_added(byte);
+        }
+        expect(long_mode.next_field() == x86_parser::opcode && long_mode.previous(1) == 0xC3 && long_mode.previous(2) == 0x8B);
+        expect(long_mode.previous(3) == 0x50 && long_mode.previous(4) == 0xA1);
+    };
+
+    "machine_code_detection"_test = [] {
+        std::vector<uint8_t> code32, code64;
+        for (int i = 0; i < 200; ++i) {
+            for (const uint8_t b : {0x8B, 0x45, 0x08, 0x89, 0x04, 0x24, 0xE8, 0x10, 0x00, 0x00, 0x00}) {
+                code32.push_back(b);
+            }
+            for (const uint8_t b : {0x48, 0x8B, 0x45, 0x08, 0x48, 0x89, 0x04, 0x24, 0x4C, 0x8D, 0x05, 0x01}) {
+                code64.push_back(b);
+            }
+        }
+        expect(!x86_long_mode(code32) && x86_long_mode(code64));
+        expect(!x86_long_mode(std::vector<uint8_t>{}));
+
+        const std::string text = "Plain text, with\ttabs and\r\nnewlines.";
+        expect(control_density(std::vector<uint8_t>(text.begin(), text.end())) == 0);
+        expect(control_density(std::vector<uint8_t>{0, 'a', 0x1B, 0x7F}) == 7500 && control_density({}) == 0);
+        expect(control_density(std::vector<uint8_t>{'a', 'b', 0, 0}, 2) == 0) << "only the first count bytes";
+    };
+
+    "sparse_hash"_test = [] {
+        const std::vector<uint8_t> history{'a', 'b', 'c', 'd'};
+        expect(sparse_hash(history, 4, {2}) != sparse_hash(history, 4, {3}));
+        expect(sparse_hash(history, 4, {1, 2}) != sparse_hash(history, 4, {1, 2}, 0xF0));
+        expect(sparse_hash(history, 4, {2}) == sparse_hash(std::vector<uint8_t>{'x', 'y', 'c', 'z'}, 4, {2})) << "only the bytes asked for";
+        expect(sparse_hash(history, 1, {2}) == sparse_hash(std::vector<uint8_t>{0, 0}, 2, {2})) << "missing bytes count as 0";
+        expect(sparse_hash(history, 4, {1}, 0xF0) == sparse_hash(std::vector<uint8_t>{'a', 'b', 'c', 'o'}, 4, {1}, 0xF0)) << "masked";
+    };
+
     "mixed_radix"_test = [] {
         // (2 * 1 + 0) * 5 + 4
         const std::vector<gmprime> digits{2, 0, 4}, radices{3, 1, 5};

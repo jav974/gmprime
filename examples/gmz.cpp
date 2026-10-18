@@ -14,10 +14,14 @@
 //             messages 1.1% and 1.8% larger over the Canterbury corpus. Fewer contexts and mixers, nibble buckets,
 //             smaller tables, no capitals comparison; folded data only loses its text contexts; -2 also drops the
 //             chained maps. The level is stored in the message for the decompressor
+//   -x MODE   machine code: auto (default), off, bin (sparse contexts for binary data), 32 or 64 (x86 code)
 //
 // The file is first analyzed with gmprime::analyze_folds. Data that folds (bitmap rows, fixed-size records)
 // is coded with bit and byte templates across the fold, in 2D and 3D; anything else with the text model:
 // context orders, words, line structure, last occurrences, indirect modeling, four mixers and chained maps.
+// Binary data (10% of control bytes) adds sparse contexts; x86 code (frequent CALL and JMP with near targets)
+// has its branch targets made absolute, and instruction contexts from a light decoder in place of the text
+// contexts.
 // The compressed message is a gmprime: the arithmetic coder's output, saved and loaded like any number.
 #include <chrono>
 #include <cstdio>
@@ -39,6 +43,8 @@ struct config {
     size_t layer = 0;       // rows per layer of the 3D view, 0 for none
     int level = 0;          // 0: the smallest messages; 1 and 2: faster, a little larger
     int table_bits = 0;     // context tables of 2^table_bits slots
+    bool binary = false;    // sparse contexts, for data with control bytes
+    int x86 = 0;            // x86 code, branch transform and instruction contexts: 0 none, 1 32-bit, 2 64-bit
 };
 
 // Context tables for the data and the level: one bit smaller for the faster levels
@@ -48,7 +54,7 @@ int table_size(const size_t data_bytes, const config& cfg, const int forced_tabl
 
 class model {
 public:
-    explicit model(const config& cfg): _cfg(cfg), _final(1, 1, 131), _map1(256 * 256, 1311), _map2(size_t{1} << 16, 1311), _match(6) {
+    explicit model(const config& cfg): _cfg(cfg), _final(1, 1, 131), _map1(256 * 256, 1311), _map2(size_t{1} << 16, 1311), _map3(size_t{1} << 16, 1311), _match(6) {
         // Byte contexts, left out by the bitmap variant: orders with their counter limits (stable statistics for
         // low orders, adaptive ones above), words, line structure, last occurrences. For text, the faster levels
         // keep fewer orders, in nibble buckets, and leave out the line contexts and the last 3 bytes, which gain
@@ -65,7 +71,16 @@ public:
         _full_text = bytes && !fast;
         _buckets = bytes && fast_text;
         _maps_on = cfg.level < 2;
-        _byte_contexts = _orders.size() + (_text ? 2 + 1 + 1 : 0) + (_full_text ? 2 + 1 + 1 : 0);
+        // Binary data at level 0: sparse contexts. x86 code: instruction contexts too, in place of the text
+        // contexts, which gain nothing there once these are in
+        _sparse = bytes && !fast && cfg.binary ? (cfg.x86 > 0 ? 5 : 8) : 0;
+        _code = bytes && !fast && cfg.x86 > 0 ? 7 : 0;
+        if (_code > 0) {
+            _text = _full_text = false;
+            _parser.emplace(cfg.x86 == 2);
+            _last_instruction = std::make_unique<checked_table<last_byte_slot>>(cfg.table_bits - 2);
+        }
+        _byte_contexts = _orders.size() + _sparse + _code + (_text ? 2 + 1 + 1 : 0) + (_full_text ? 2 + 1 + 1 : 0);
 
         // Fold contexts: bit templates of three sizes and pixel runs (keyed alone), byte templates with the
         // partial byte, one row above, two rows above, and one layer behind
@@ -132,6 +147,14 @@ public:
         if (cfg.fold) {
             _mixers.emplace_back(inputs, 256, 197);
             _set_kinds.push_back(4);
+        }
+        // Code: weights selected by the instruction field with the partial byte, and by the opcode with the bit
+        // position
+        if (_code > 0) {
+            _mixers.emplace_back(inputs, 64 * 256, 197);
+            _set_kinds.push_back(5);
+            _mixers.emplace_back(inputs, 1024 * 8, 197);
+            _set_kinds.push_back(6);
         }
         _final = logistic_mixer(_mixers.size() + 1, 1, 131, 65536 / static_cast<int>(_mixers.size()));
         _x.reserve(inputs);
@@ -202,6 +225,8 @@ public:
             static_cast<size_t>(_last) * 8 + static_cast<size_t>(_bit_count),
             static_cast<size_t>(classify(_last)) * 256 + _c0,
             _fold_set,
+            _code_state * 256 + _c0,
+            _code_opcode * 8 + static_cast<size_t>(_bit_count),
         };
         // Every mixer reads the same inputs, without copying them
         for (size_t i = 0; i < _mixers.size(); ++i) {
@@ -216,7 +241,12 @@ public:
         // Chained maps: order 1, then order 2 refining the first
         const int p1 = _map1.refine(_mixed, static_cast<size_t>(_last) * 256 + _c0);
         const int p2 = _map2.refine(p1, (hash_mix(context_hash(_history, _history.size(), 2)) ^ _c0) & 0xFFFF);
-        return clamp_probability((_mixed + p1 + 2 * p2) / 4);
+        if (_code == 0) {
+            return clamp_probability((_mixed + p1 + 2 * p2) / 4);
+        }
+        // Code: a third map, on the instruction field and opcode
+        const int p3 = _map3.refine(_mixed, (_code_key * 256 + _c0) & 0xFFFF);
+        return clamp_probability((_mixed + p1 + p2 + p3) / 4);
     }
 
     // Learns the bit, after it was coded or decoded
@@ -238,6 +268,9 @@ public:
         if (_maps_on) {
             _map1.update(bit);
             _map2.update(bit);
+            if (_code > 0) {
+                _map3.update(bit);
+            }
         }
 
         ++_bits;
@@ -293,6 +326,11 @@ private:
             }
         }
         _match.byte_added(_history);
+        if (_code > 0) {
+            _parser->byte_added(byte);
+            _instruction_slot->update(byte);
+            _instruction_slot2->update(byte);
+        }
         if (_text) {
             _word_slot->update(byte);
         }
@@ -302,6 +340,64 @@ private:
         new_byte();
     }
 
+    // Binary data: bytes 2 and 3 back alone, the high nibbles of the last 4, bytes 4 and 8 back, the 2 last bytes
+    // with the position in a 32-bit word; and for data that is not x86 code, contexts of 32-bit words: the
+    // bytes of the current word so far with the byte 4 back, or with the whole previous word, and the bytes 4
+    // and 8 back with the position in the word
+    void sparse_contexts(size_t& t, const size_t pos) {
+        const auto& h = _history;
+        const uint64_t column = pos & 3;
+        _hashes[t++] = sparse_hash(h, pos, {2});
+        _hashes[t++] = sparse_hash(h, pos, {3});
+        _hashes[t++] = sparse_hash(h, pos, {1, 2, 3, 4}, 0xF0);
+        _hashes[t++] = sparse_hash(h, pos, {4, 8});
+        _hashes[t++] = sparse_hash(h, pos, {1, 2}) + column;
+        if (_sparse > 5) {
+            static const std::initializer_list<size_t> word[4] = {{4}, {1, 4}, {1, 2, 4}, {1, 2, 3, 4}};
+            static const std::initializer_list<size_t> words[4] = {{1, 2, 3, 4}, {1, 2, 3, 4, 5}, {1, 2, 3, 4, 5, 6}, {1, 2, 3, 4, 5, 6, 7}};
+            _hashes[t++] = sparse_hash(h, pos, word[column]) + column * 11;
+            _hashes[t++] = sparse_hash(h, pos, words[column]) + column * 13;
+            _hashes[t++] = sparse_hash(h, pos, {4, 8}) + column * 17 + 1;
+        }
+    }
+
+    // x86 code: the field of the next byte in its instruction (opcode, ModRM, SIB, displacement, immediate) and
+    // its index there, with the opcode (and the prefixes, or the last ones while at the opcode), the ModRM once
+    // past it, the previous instructions' opcodes and ModRM, and what followed the last time in the same place
+    void code_contexts(size_t& t, const size_t pos) {
+        const auto& x = *_parser;
+        const uint64_t field = x.next_field(), index = static_cast<uint64_t>(std::min(x.index(), 7));
+        const uint64_t state = field * 8 + index, op = x.current();
+        const bool at_opcode = field == x86_parser::opcode;
+        const uint64_t at = at_opcode ? x.prefixes() : op | uint64_t{x.prefixes() & 0xFF} << 12;
+        const uint64_t modrm = field >= x86_parser::sib ? x.modrm_byte() : 0;
+        const uint64_t p1 = x.previous(1), p2 = x.previous(2), p3 = x.previous(3), pm = x.previous_modrm();
+        const uint64_t b1 = pos >= 1 ? _history[pos - 1] : 0, b2 = pos >= 2 ? _history[pos - 2] : 0;
+        const uint64_t place = state << 24 | at << 8 | modrm;
+
+        const uint64_t key = place * 0x9E3779B97F4A7C15ull;
+        _instruction_slot = &_last_instruction->at(key + 0x31);
+        _instruction_slot2 = &_last_instruction->at(key + b1 * 0x2545F4914F6CDD1Dull + 0x77);
+        const uint64_t last1 = _instruction_slot->count > 0 ? _instruction_slot->byte : 256u;
+        const uint64_t last2 = _instruction_slot2->count > 0 ? _instruction_slot2->byte : 256u;
+
+        const uint64_t hashes[] = {
+            place,
+            at_opcode ? (state << 40 | p1 << 20 | p2 | uint64_t{1} << 60) : place << 8 | b1,
+            state << 40 | at << 20 | p1,
+            at_opcode ? (p1 << 40 | p2 << 20 | p3 | uint64_t{1} << 60) : place << 16 | b1 << 8 | b2,
+            state << 40 | at << 20 | p1 << 8 | pm,
+            place << 9 | last1,
+            (state << 9 | last1) << 9 | last2,
+        };
+        for (size_t k = 0; k < 7; ++k) {
+            _hashes[t++] = hash_mix(hashes[k] + (k + 1) * 0x51ED27) + 4242;
+        }
+        _code_state = static_cast<size_t>(std::min<uint64_t>(state, 63));
+        _code_opcode = static_cast<size_t>(op & 0x3FF);
+        _code_key = hash_mix(state << 16 | (at_opcode ? p1 : op));
+    }
+
     void new_byte() {
         _c0 = 1;
         _bit_count = 0;
@@ -309,6 +405,12 @@ private:
         size_t t = 0;
         for (const auto order : _orders) {
             _hashes[t++] = context_hash(_history, pos, order);
+        }
+        if (_sparse > 0) {
+            sparse_contexts(t, pos);
+        }
+        if (_code > 0) {
+            code_contexts(t, pos);
         }
         if (!_text) {
             return;
@@ -361,7 +463,7 @@ private:
     std::vector<logistic_mixer> _mixers;
     logistic_mixer _final;
     std::vector<int> _x;
-    probability_map _map1, _map2;
+    probability_map _map1, _map2, _map3;
     match_model _match;
     bit_counter _match_counters[33];
     line_tracker _lines;
@@ -371,6 +473,11 @@ private:
     int _bit_count = 0, _expected = -1;
     uint8_t _last = 0;
     uint64_t _word = 0, _previous_word = 0;
+    size_t _sparse = 0, _code = 0, _code_state = 0, _code_opcode = 0;
+    uint64_t _code_key = 0;
+    std::optional<x86_parser> _parser;
+    std::unique_ptr<checked_table<last_byte_slot>> _last_instruction;
+    last_byte_slot *_instruction_slot = nullptr, *_instruction_slot2 = nullptr;
     int _mixed = 32768;
 };
 
@@ -389,7 +496,7 @@ size_t decode_number(arithmetic_decoder& decoder, const int bits) {
 }
 
 // Header, at p = 1/2: payload size (32 bits), fold (1), bitmap (1), capitals (1), fold width (16), layer (8),
-// level (2). Then
+// level (2), binary (1), x86 (2). Then
 // the payload, and the CRC-32 of the original data (32 bits), so that decoding to anything else is detected
 gmprime compress(const std::vector<uint8_t>& payload, config cfg, const bool capitals, const int forced_table_bits,
                  const uint32_t check) {
@@ -401,6 +508,8 @@ gmprime compress(const std::vector<uint8_t>& payload, config cfg, const bool cap
     encode_number(encoder, cfg.width, 16);
     encode_number(encoder, cfg.layer, 8);
     encode_number(encoder, static_cast<size_t>(cfg.level), 2);
+    encode_number(encoder, cfg.binary ? 1 : 0, 1);
+    encode_number(encoder, static_cast<size_t>(cfg.x86), 2);
 
     cfg.table_bits = table_size(payload.size(), cfg, forced_table_bits);
     model m(cfg);
@@ -427,6 +536,8 @@ std::optional<std::vector<uint8_t>> decompress(const gmprime& code, const int fo
     cfg.width = decode_number(decoder, 16);
     cfg.layer = decode_number(decoder, 8);
     cfg.level = static_cast<int>(decode_number(decoder, 2));
+    cfg.binary = decode_number(decoder, 1) == 1;
+    cfg.x86 = static_cast<int>(decode_number(decoder, 2));
 
     cfg.table_bits = table_size(size, cfg, forced_table_bits);
     model m(cfg);
@@ -443,6 +554,9 @@ std::optional<std::vector<uint8_t>> decompress(const gmprime& code, const int fo
     }
     const auto check = static_cast<uint32_t>(decode_number(decoder, 32));
     auto data = capitals ? capitals_decode(payload) : std::move(payload);
+    if (cfg.x86 > 0) {
+        x86_branches(data, false);
+    }
     if (crc32(data) != check) {
         return std::nullopt;
     }
@@ -460,11 +574,20 @@ struct choice {
 // two ways are compared on the first sample bytes, then the whole data is compressed once the better way;
 // with sample 0, or data that fits in the sample, both are compressed whole and the smaller message kept.
 choice compress_best(const gmprime& file, const std::string& mode, const std::string& capitals_mode, const int forced_table_bits,
-                     const size_t sample, const int level) {
-    const auto data = file.bytes();
+                     const size_t sample, const int level, const std::string& code_mode) {
+    auto data = file.bytes();
     const uint32_t check = crc32(data);
     choice best;
     best.cfg.level = level;
+
+    // Binary data: 10% of control bytes (below, mostly text, the sparse contexts cost more time than they gain). x86 code: 0.5% of CALL or JMP opcodes with a near target, 64-bit if
+    // REX.W prefixes are common; its branches are made absolute
+    best.cfg.binary = code_mode == "auto" ? control_density(data) >= 1000 : code_mode != "off";
+    best.cfg.x86 = code_mode == "32" ? 1 : code_mode == "64" ? 2 : code_mode != "auto" ? 0
+                 : best.cfg.binary && x86_branch_density(data) >= 50 ? (x86_long_mode(data) ? 2 : 1) : 0;
+    if (best.cfg.x86 > 0) {
+        x86_branches(data, true);
+    }
 
     // The first 128 KB find the same folds as the whole data, much sooner
     const auto folds = file.analyze_folds(64, 8192, 131072);
@@ -475,7 +598,7 @@ choice compress_best(const gmprime& file, const std::string& mode, const std::st
     }
     best.cfg.bitmap = mode == "bitmap";
 
-    const auto lowered = capitals_encode(data);
+    const auto lowered = best.cfg.x86 > 0 ? std::nullopt : capitals_encode(data);
     best.capitals = capitals_mode == "on" && !best.cfg.fold && lowered.has_value();
     // The faster levels skip comparing capitals, which compresses the sample twice
     const bool compare_capitals = capitals_mode == "auto" && level == 0 && !best.cfg.fold && lowered.has_value();
@@ -508,7 +631,8 @@ choice compress_best(const gmprime& file, const std::string& mode, const std::st
 }
 
 int usage() {
-    std::fprintf(stderr, "usage: gmz [-1|-2] [-m auto|text|fold|fold-full|bitmap] [-C auto|on|off] [-S bytes] [-T bits] c|d INPUT OUTPUT\n"
+    std::fprintf(stderr, "usage: gmz [-1|-2] [-m auto|text|fold|fold-full|bitmap] [-C auto|on|off] [-x auto|off|bin|32|64] [-S bytes]\n"
+                         "           [-T bits] c|d INPUT OUTPUT\n"
                          "       gmz [options] t INPUT\n");
     return 2;
 }
@@ -516,7 +640,7 @@ int usage() {
 } // namespace
 
 int main(int argc, char** argv) {
-    std::string mode = "auto", capitals_mode = "auto";
+    std::string mode = "auto", capitals_mode = "auto", code_mode = "auto";
     int forced_table_bits = 0;
     size_t sample = 65536;
     int level = 0;
@@ -531,6 +655,8 @@ int main(int argc, char** argv) {
         const char* value = argv[arg + 1];
         if (flag == "-m") mode = value;
         else if (flag == "-C") capitals_mode = value;
+        else if (flag == "-x" && (std::string(value) == "auto" || std::string(value) == "off" || std::string(value) == "bin"
+                                  || std::string(value) == "32" || std::string(value) == "64")) code_mode = value;
         else if (flag == "-S") sample = std::stoul(value);
         else if (flag == "-T") forced_table_bits = std::stoi(value);
         else return usage();
@@ -559,7 +685,7 @@ int main(int argc, char** argv) {
     }
 
     const auto start = std::chrono::steady_clock::now();
-    const auto best = compress_best(input, mode, capitals_mode, forced_table_bits, sample, level);
+    const auto best = compress_best(input, mode, capitals_mode, forced_table_bits, sample, level, code_mode);
     if (command == "c") {
         best.code.save_to_file(argv[arg + 2]);
         return 0;
@@ -572,6 +698,7 @@ int main(int argc, char** argv) {
     const size_t size = best.code.bytes().size();
     std::printf("%zu -> %zu bytes, %.3f bits/byte, %s, %.1f s, %s%s", data.size(), size, data.empty() ? 0.0 : 8.0 * size / data.size(),
                 same ? "round trip ok" : "ROUND TRIP FAILED", seconds, best.cfg.fold ? "fold" : "text", best.capitals ? " + capitals" : "");
+    std::printf("%s%s", best.cfg.binary ? " + binary" : "", best.cfg.x86 == 1 ? " + x86-32" : best.cfg.x86 == 2 ? " + x86-64" : "");
     if (best.cfg.fold) {
         std::printf(" (width %zu bits, layer %zu%s)", best.cfg.width, best.cfg.layer, best.cfg.bitmap ? ", bitmap" : "");
     }

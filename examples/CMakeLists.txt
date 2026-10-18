@@ -24,6 +24,14 @@ if (BUILD_TESTING AND (PROJECT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR))
     add_test(NAME gmz_level1_fold COMMAND gmz -1 -m fold t ${GMZ_SAMPLE})
     add_test(NAME gmz_level2_fold COMMAND gmz -2 -m fold-full t ${GMZ_SAMPLE})
 
+    # Machine code models forced on the sample: binary, x86 in 32 and 64 bits, at the faster level the branch
+    # transform alone
+    add_test(NAME gmz_binary COMMAND gmz -x bin t ${GMZ_SAMPLE})
+    add_test(NAME gmz_binary_fold COMMAND gmz -x bin -m fold t ${GMZ_SAMPLE})
+    add_test(NAME gmz_x86 COMMAND gmz -x 32 t ${GMZ_SAMPLE})
+    add_test(NAME gmz_x86_64 COMMAND gmz -x 64 t ${GMZ_SAMPLE})
+    add_test(NAME gmz_x86_level1 COMMAND gmz -1 -x 32 t ${GMZ_SAMPLE})
+
     # Through files, compressing then decompressing, with a forced table size
     add_test(NAME gmz_files COMMAND ${CMAKE_COMMAND} -DGMZ=$<TARGET_FILE:gmz> -DINPUT=${GMZ_SAMPLE}
              -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/sample -DOPTIONS=-T\;18 -P ${CMAKE_CURRENT_SOURCE_DIR}/round_trip.cmake)
@@ -37,7 +45,8 @@ if (BUILD_TESTING AND (PROJECT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR))
     add_test(NAME gmz_unknown_option COMMAND gmz -q t ${GMZ_SAMPLE})
     add_test(NAME gmz_missing_command COMMAND gmz -m text)
     add_test(NAME gmz_unknown_command COMMAND gmz x ${GMZ_SAMPLE})
-    set_tests_properties(gmz_unknown_option gmz_missing_command gmz_unknown_command PROPERTIES WILL_FAIL TRUE)
+    add_test(NAME gmz_unknown_code_mode COMMAND gmz -x 16 t ${GMZ_SAMPLE})
+    set_tests_properties(gmz_unknown_option gmz_missing_command gmz_unknown_command gmz_unknown_code_mode PROPERTIES WILL_FAIL TRUE)
 endif ()
 
 if (BUILD_TESTING AND (PROJECT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR))

@@ -114,6 +114,61 @@ positions, most on small streams. But it sees only the counts: any structure bey
 by far. Uses: small sparse side streams (exception positions, flags), sets and permutations (a dictionary), and
 it is the one tool so far where big-number arithmetic is the algorithm itself.
 
+### Broad evaluation
+
+Calgary (18 files), Silesia (12 files, 212 MB) and the first 10 MB of enwik8, every gmz size a verified round
+trip (gmz before the integer arithmetic and the machine code models), against paq8px v217 at -8 and zpaq at
+-m5. Bits per byte:
+
+| Corpus | brotli -q 11 | xz -9e | zpaq -m5 | paq8px -8 | gmz |
+|---|---|---|---|---|---|
+| Calgary | 2.108 | 2.174 | 1.772 | 1.480 | 1.680 |
+| enwik8, 10 MB | 2.164 | 2.176 | 1.673 | 1.420 | 1.659 |
+| Silesia | 1.871 | 1.829 | 1.476 | (too slow) | 1.539 |
+
+- gmz is smaller than every standard tool on every file, by 6% to 45%.
+- Against zpaq it wins on text (nci -7.3%, reymont -3.3%, samba -2.5%) and loses on ooffice (+21.8%), sao
+  (+12.8%), mozilla (+6.1%) and osdb (+4.5%).
+- paq8px stays 13% to 17% ahead on text and 33% on xml, at 11 to 19 KB/s against gmz's 90 to 135 KB/s for a
+  round trip. On Silesia it took over 20 minutes for some files, so only xml and x-ray were completed (x-ray:
+  gmz 4.4% larger).
+
+Where gmz lost, the model did not fit the data:
+- **Fold detection is too strict.** Forced fold mode gives sao -11.4% (records of 28 bytes, now below zpaq),
+  mr -8.9% (it reaches the 8192-bit limit), geo and obj2 -4.2%; fold mode is almost never worse than text.
+- **x86 code had no model.** The E8/E9 transform alone gains 15% on ooffice.
+- **Silesia's mozilla is not x86** but Alpha (Tru64) binaries: no branch transform applies.
+
+### Machine code
+
+Gains on a 2 MB slice of ooffice (Windows DLLs, x86) and of x86-64 code, each step added to the previous ones:
+
+| Step | ooffice | x86-64 |
+|---|---|---|
+| E8/E9 transform (reversible: encoding from the end, decoding from the start) | -14.9% | -27.8% |
+| instruction contexts: field and index in the instruction, opcode, ModRM, previous opcodes | -9.2% | -12.6% |
+| 3 previous opcodes; previous opcode with its ModRM | -1.7% | |
+| indirect: the byte seen last time at the same place in an instruction | -1.4% | -2% |
+| 5 sparse contexts (bytes 2 and 3 back alone, high nibbles, bytes 4 and 8 back, 32-bit alignment) | -1.5% | |
+| mixers selected by the instruction state and by the opcode, a map on the instruction state | -0.6% | |
+
+The text contexts then gain 0.03% for twice the time on x86 code: they are left out there. Also measured:
+- transforming conditional jumps too loses 1.2%, as zpaq and xz found;
+- the minimum match length (4, 6, 9) and the counter limits (127, 1023) make no difference.
+
+The full ooffice drops from 2,151,593 to 1,542,295 bytes (-28.3%, zpaq 1,766,663), in 1.4 times the time.
+
+Sparse contexts also help binary data that is not code: sum -8.9%, geo -8.3%, obj2 -8.1% (68k code, still 29%
+behind paq8px), obj1 -5.6%, osdb -4.2%, sao -2.0%, mr -1.7%, x-ray -1.0%, for 30% to 60% more time.
+
+Detection, never wrong on text:
+- **binary:** 10% of control bytes. At 1%, samba (mostly source text) paid 35% more time for 0.2%.
+- **x86:** 50 near CALL or JMP per 10,000 bytes (x86 code 280 to 313, Alpha 11, kennedy.xls 4, text 0).
+- **64-bit:** frequent REX.W prefixes.
+
+Forcing a wrong guess costs alice29.txt +6.2% as x86 and +0.5% as binary. A threshold still splits poorly
+(trans at 9% gains 1%, a samba slice at 14.5% gains 0.3%): comparing on the sample, as for capitals, would.
+
 ## Speed
 
 Starting point: about 150 KB/s per pass, and gmz compresses twice (with and without capitals, or full and bitmap

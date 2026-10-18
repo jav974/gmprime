@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <initializer_list>
 #include <memory>
 #include <new>
 #include <optional>
@@ -614,6 +615,305 @@ inline int table_bits(const size_t data_bytes, const int max_bits = 22, const in
         ++bits;
     }
     return std::max(bits, min_bits);
+}
+
+// MACHINE CODE
+
+// Reversible x86 branch transform (E8/E9, as zpaq, paq8 and xz's BCJ filter): the 32-bit relative target of
+// each CALL (E8) and JMP (E9), and with jcc of each conditional jump (0F 80..8F), becomes absolute by adding
+// the instruction's offset, so that the calls to one function, scattered through the code with different
+// relative operands, become the same bytes. Only operands whose top byte is 00 or FF (targets within 16 MB
+// either way) are changed, and only their low 24 bits, modulo 2^24, so that the top byte stays what decides.
+// Encoding runs from the end and decoding from the start: a place is then decided, both ways, on bytes
+// before it in their original state and bytes after it in their transformed state, even where operands
+// overlap. Any data can be transformed: on data that is not code it only costs a little.
+inline void x86_branches(std::vector<uint8_t>& bytes, const bool encode, const bool jcc = false) {
+    const size_t n = bytes.size();
+    if (n < 5) {
+        return;
+    }
+    const auto place = [&](const size_t i) {
+        size_t operand = 0;
+        if ((bytes[i] & 0xFE) == 0xE8) {
+            operand = i + 1;
+        } else if (jcc && i + 6 <= n && bytes[i] == 0x0F && (bytes[i + 1] & 0xF0) == 0x80) {
+            operand = i + 2;
+        }
+        if (operand == 0 || (bytes[operand + 3] != 0x00 && bytes[operand + 3] != 0xFF)) {
+            return;
+        }
+        const auto offset = static_cast<uint32_t>(i);
+        uint32_t a = bytes[operand] | static_cast<uint32_t>(bytes[operand + 1]) << 8 | static_cast<uint32_t>(bytes[operand + 2]) << 16;
+        a = (encode ? a + offset : a - offset) & 0xFFFFFF;
+        bytes[operand] = static_cast<uint8_t>(a);
+        bytes[operand + 1] = static_cast<uint8_t>(a >> 8);
+        bytes[operand + 2] = static_cast<uint8_t>(a >> 16);
+    };
+    if (encode) {
+        for (size_t i = n - 5 + 1; i-- > 0;) {
+            place(i);
+        }
+    } else {
+        for (size_t i = 0; i + 5 <= n; ++i) {
+            place(i);
+        }
+    }
+}
+
+// How much a stretch of bytes looks like x86 code: CALL or JMP opcodes followed by a near target (top byte 00
+// or FF) per 10000 bytes. Compiled x86 and x86-64 code has 150 to 350, text none, other data and the code of
+// other processors a few
+inline size_t x86_branch_density(const std::vector<uint8_t>& bytes, const size_t first = 0, size_t count = ~size_t{0}) {
+    const size_t end = first + std::min(count, bytes.size() - std::min(first, bytes.size()));
+    size_t near = 0;
+    for (size_t i = first; i + 5 <= end; ++i) {
+        if ((bytes[i] & 0xFE) == 0xE8 && (bytes[i + 4] == 0x00 || bytes[i + 4] == 0xFF)) {
+            ++near;
+        }
+    }
+    return end > first ? near * 10000 / (end - first) : 0;
+}
+
+// Light x86 instruction decoder, fed a byte at a time: tells where the next byte stands in its instruction
+// (opcode, ModRM, SIB, displacement, immediate), the opcode of the current instruction and of the ones before.
+// Contexts keyed by these let a model predict an opcode from the previous instructions across their operands,
+// or a displacement from its addressing mode, which byte contexts cannot. In 64-bit mode, 40..4F are REX
+// prefixes. Any byte stream is accepted: on data that is not code the fields are wrong but harmless, and on
+// code a wrong guess resynchronizes within a few instructions.
+class x86_parser {
+public:
+    enum field : uint8_t { opcode = 0, escape, modrm, sib, displacement, immediate };
+
+    explicit x86_parser(const bool long_mode = false): _long(long_mode) {
+    }
+
+    void byte_added(const uint8_t byte) {
+        ++_index;
+        ++_length;
+        switch (_field) {
+        case opcode:
+            if (is_prefix(byte)) {
+                _prefixes = (_prefixes << 8 | byte) & 0xFFFFFF;
+                _operand16 = _operand16 || byte == 0x66;
+                _address16 = _address16 || byte == 0x67;
+                _rex_w = _long && (byte & 0xF8) == 0x48;
+                _index = 0;
+                return;
+            }
+            _op = byte;
+            if (byte == 0x0F) {
+                enter(escape);
+                return;
+            }
+            opcode_known(one_byte_flags(byte));
+            return;
+        case escape:
+            if (_op == 0x0F && (byte == 0x38 || byte == 0x3A)) {
+                _op = byte == 0x38 ? 0x200 : 0x300;
+                _index = 0;
+                return;
+            }
+            _op = (_op == 0x0F ? 0x100 : _op) | byte;
+            opcode_known(_op >= 0x300 ? static_cast<uint8_t>(MODRM | I8) : _op >= 0x200 ? static_cast<uint8_t>(MODRM) : two_byte_flags(byte));
+            return;
+        case modrm:
+            _modrm = byte;
+            modrm_known();
+            return;
+        case sib:
+            if ((byte & 7) == 5 && (_modrm >> 6) == 0) {
+                _disp = 4;
+            }
+            operands();
+            return;
+        case displacement:
+            if (--_disp == 0) {
+                operands();
+            }
+            return;
+        case immediate:
+            if (--_imm == 0) {
+                done();
+            }
+            return;
+        }
+    }
+
+    // Field of the next byte, its index in the field, and the instruction's opcode: 0..FF, 100..1FF for 0F xx,
+    // 200..3FF for 0F 38 xx and 0F 3A xx; for the opcode field itself, the last prefixes
+    [[nodiscard]] field next_field() const { return _field; }
+    [[nodiscard]] int index() const { return _index; }
+    [[nodiscard]] uint32_t current() const { return _op; }
+    [[nodiscard]] uint8_t modrm_byte() const { return _modrm; }
+    [[nodiscard]] uint32_t prefixes() const { return _prefixes; }
+    // Opcode of the k-th instruction before the current one, k from 1 to 4
+    [[nodiscard]] uint32_t previous(const int k) const { return _previous[k - 1]; }
+    // Bytes since the start of the current instruction, prefixes included
+    [[nodiscard]] int length() const { return _length; }
+    // ModRM of the previous instruction, 0 if none
+    [[nodiscard]] uint8_t previous_modrm() const { return _previous_modrm; }
+
+private:
+    enum flags : uint8_t { NONE = 0, MODRM = 1, I8 = 2, I16 = 4, IZ = 8, IV = 16, ADDR = 32, FAR = 64, GROUP3 = 128 };
+
+    bool is_prefix(const uint8_t b) const {
+        return b == 0x26 || b == 0x2E || b == 0x36 || b == 0x3E || b == 0x64 || b == 0x65 || b == 0x66 || b == 0x67
+               || b == 0xF0 || b == 0xF2 || b == 0xF3 || (_long && (b & 0xF0) == 0x40);
+    }
+
+    static uint8_t one_byte_flags(const uint8_t b) {
+        if (b < 0x40) {
+            const int low = b & 7;
+            return low < 4 ? MODRM : low == 4 ? I8 : low == 5 ? IZ : NONE;
+        }
+        if (b < 0x60) return NONE;
+        if (b >= 0x70 && b < 0x80) return I8;
+        if (b >= 0x84 && b < 0x90) return MODRM;
+        if (b >= 0x90 && b < 0xA0) return b == 0x9A ? FAR : NONE;
+        if (b >= 0xA0 && b < 0xA4) return ADDR;
+        if (b >= 0xB0 && b < 0xB8) return I8;
+        if (b >= 0xB8 && b < 0xC0) return IV;
+        if (b >= 0xD0 && b < 0xD4) return MODRM;
+        if (b >= 0xD8 && b < 0xE0) return MODRM;
+        if (b >= 0xE0 && b < 0xE8) return I8;
+        switch (b) {
+        case 0x62: case 0x63: case 0x8C: case 0x8D: case 0x8E: case 0x8F: case 0xC4: case 0xC5: case 0xFE: case 0xFF:
+            return MODRM;
+        case 0x68: case 0xA9: case 0xE8: case 0xE9: return IZ;
+        case 0x69: case 0x81: case 0xC7: return MODRM | IZ;
+        case 0x6A: case 0xA8: case 0xCD: case 0xD4: case 0xD5: case 0xEB: return I8;
+        case 0x6B: case 0x80: case 0x82: case 0x83: case 0xC0: case 0xC1: case 0xC6: return MODRM | I8;
+        case 0xC2: case 0xCA: return I16;
+        case 0xC8: return I16 | I8;
+        case 0xEA: return FAR;
+        case 0xF6: case 0xF7: return MODRM | GROUP3;
+        default: return NONE;
+        }
+    }
+
+    static uint8_t two_byte_flags(const uint8_t b) {
+        if ((b >= 0x05 && b <= 0x0B) || b == 0x0E || (b >= 0x30 && b < 0x38) || b == 0x77 || b == 0xA0 || b == 0xA1
+            || b == 0xA2 || b == 0xA8 || b == 0xA9 || b == 0xAA || (b >= 0xC8 && b < 0xD0)) {
+            return NONE;
+        }
+        if (b >= 0x80 && b < 0x90) return IZ;
+        if ((b >= 0x70 && b < 0x74) || b == 0x0F || b == 0xA4 || b == 0xAC || b == 0xBA || b == 0xC2 || b == 0xC4 || b == 0xC5 || b == 0xC6) {
+            return MODRM | I8;
+        }
+        return MODRM;
+    }
+
+    void enter(const field f) {
+        _field = f;
+        _index = 0;
+    }
+
+    void opcode_known(const uint8_t f) {
+        _flags = f;
+        _disp = 0;
+        const int z = _operand16 ? 2 : 4;
+        _imm = (f & I8 ? 1 : 0) + (f & I16 ? 2 : 0) + (f & IZ ? z : 0) + (f & IV ? (_rex_w ? 8 : z) : 0)
+               + (f & ADDR ? (_long ? 8 : _address16 ? 2 : 4) : 0) + (f & FAR ? z + 2 : 0);
+        if (f & MODRM) {
+            enter(modrm);
+        } else {
+            operands();
+        }
+    }
+
+    void modrm_known() {
+        const int mod = _modrm >> 6, rm = _modrm & 7;
+        if ((_flags & GROUP3) && ((_modrm >> 3) & 7) < 2) {
+            _imm += _op == 0xF6 ? 1 : (_operand16 ? 2 : 4);
+        }
+        if (mod == 3) {
+            operands();
+            return;
+        }
+        if (_address16 && !_long) {
+            _disp = mod == 1 ? 1 : mod == 2 || (mod == 0 && rm == 6) ? 2 : 0;
+            operands();
+            return;
+        }
+        _disp = mod == 1 ? 1 : mod == 2 || (mod == 0 && rm == 5) ? 4 : 0;
+        if (rm == 4) {
+            enter(sib);
+        } else {
+            operands();
+        }
+    }
+
+    // After the opcode, ModRM and SIB: the displacement, then the immediate, then the next instruction
+    void operands() {
+        if (_disp > 0) {
+            if (_field != displacement) enter(displacement);
+        } else if (_imm > 0) {
+            enter(immediate);
+        } else {
+            done();
+        }
+    }
+
+    void done() {
+        for (int k = 3; k > 0; --k) {
+            _previous[k] = _previous[k - 1];
+        }
+        _previous[0] = _op;
+        _previous_modrm = (_flags & MODRM) ? _modrm : 0;
+        _modrm = 0;
+        _prefixes = 0;
+        _operand16 = _address16 = _rex_w = false;
+        _length = 0;
+        enter(opcode);
+    }
+
+    bool _long;
+    field _field = opcode;
+    int _index = 0, _disp = 0, _imm = 0, _length = 0;
+    uint8_t _flags = 0, _modrm = 0, _previous_modrm = 0;
+    uint32_t _op = 0, _prefixes = 0, _previous[4] = {};
+    bool _operand16 = false, _address16 = false, _rex_w = false;
+};
+
+// Whether x86 code is 64-bit: REX.W prefixes (48) before the opcodes that most often follow them (MOV, LEA,
+// arithmetic, TEST, MOVSXD), against the same opcodes after 8B or 89 alone, on the first count bytes
+inline bool x86_long_mode(const std::vector<uint8_t>& bytes, const size_t count = 1 << 20) {
+    size_t rex = 0, plain = 0;
+    const size_t end = std::min(count, bytes.size());
+    for (size_t i = 1; i + 1 < end; ++i) {
+        const uint8_t b = bytes[i];
+        if (b == 0x89 || b == 0x8B || b == 0x8D || b == 0x85 || b == 0x63 || b == 0x83 || b == 0x39 || b == 0x3B) {
+            if (bytes[i - 1] == 0x48 || bytes[i - 1] == 0x49 || bytes[i - 1] == 0x4C || bytes[i - 1] == 0x4D) ++rex; else ++plain;
+        }
+    }
+    return rex * 4 > plain;
+}
+
+// BINARY DATA
+
+// Share of control bytes (0..8, 14..31, 127: neither text nor whitespace) in the first count bytes, per 10000.
+// Text has none; executables, tables and images have from 5% to 90%
+inline size_t control_density(const std::vector<uint8_t>& bytes, const size_t count = 1 << 20) {
+    const size_t end = std::min(count, bytes.size());
+    size_t control = 0;
+    for (size_t i = 0; i < end; ++i) {
+        const uint8_t b = bytes[i];
+        control += b < 9 || (b > 13 && b < 32) || b == 127;
+    }
+    return end > 0 ? control * 10000 / end : 0;
+}
+
+// Hash of the bytes at the given distances before pos in history (missing ones count as 0), each masked:
+// sparse contexts, which skip bytes (distance 2 alone, 4 and 8 for 32-bit columns) or keep only high bits
+// (mask F0), for binary data where the nearest bytes are not the most telling ones. Distinct per distance set
+// and mask, and from context_hash
+inline uint64_t sparse_hash(const std::vector<uint8_t>& history, const size_t pos, std::initializer_list<size_t> distances,
+                            const uint8_t mask = 0xFF) {
+    uint64_t h = 0x2545F4914F6CDD1Dull + mask;
+    for (const auto d : distances) {
+        h = (h ^ (d * 0x1000 + (pos >= d ? history[pos - d] & mask : 0))) * 0x100000001B3ull;
+    }
+    return hash_mix(h);
 }
 
 // ENUMERATIVE CODING
