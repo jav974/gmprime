@@ -104,3 +104,17 @@ n.bits(0, 4) = 0u;               // keeps the low 4 bits of the value, like a C 
 
 std::cout << gmprime::hex << n;  // 123456789abcde0
 ```
+
+### Integer behavior
+
+A `gmprime` is used like an `int`: arithmetic, bitwise and comparison operators (with a primitive on either side), `if (a)`, streams with every formatting flag (`std::showbase`, `std::setw`...) and `>>`, `abs`, `gcd`, `lcm`, `to_string`, `std::hash` and `std::numeric_limits`. Comparisons with a floating point value are exact: `gmprime(5) < 5.5`.
+
+Where an `int` has undefined behavior or overflows, a `gmprime` throws: `std::domain_error` on division by zero, a negative shift count or the square root of a negative number, `std::length_error` on a left shift beyond what GMP can hold.
+
+The differences are deliberate:
+
+- Only the prefix forms of `++` and `--` exist, to avoid copying a large number for nothing.
+- Bit access (`[]`, `get_bit`, `bits`, `as_span`) reads the magnitude as GMP stores it, while bitwise operators (`&`, `|`, `^`, `~`, `>>`) follow two's complement like an `int`. For -2, `get_bit(2)` is 0 but `((a >> 2) & 1)` is 1.
+- A negative number prints as a sign and its magnitude in every base (`-0xff`), where an `int` prints its two's complement in octal and hexadecimal.
+- There is no implicit conversion to a primitive, which could truncate: use `to_primitive<T>()`.
+- Mixed arithmetic with a floating point value converts it to `gmprime` first, truncating it: `a + 0.5` is `a`. Use `a.to_primitive<double>() + 0.5` for a floating point result.

@@ -206,6 +206,61 @@ suite<"gmprime::comparison"> comparison = [] {
         rhs = 100;
         expect((lhs != rhs) == false);
     };
+
+    // Compared exactly, like an int is promoted to double, instead of truncating the floating point value
+    "floating_point_fraction"_test = [] {
+        const gmprime a(5), b(-5);
+
+        expect(!(a == 5.5));
+        expect(a != 5.5);
+        expect(a < 5.5);
+        expect(a <= 5.5);
+        expect(!(a > 5.5));
+        expect(!(a >= 5.5));
+        expect(a > 4.5);
+        expect(a == 5.0);
+        expect(a <= 5.0 && a >= 5.0);
+
+        expect(5.5 > a);
+        expect(!(5.5 == a));
+        expect(4.5 < a);
+
+        expect(b < -4.5);
+        expect(b > -5.5);
+        expect(-5.5f < b);
+    };
+    "floating_point_limits"_test = [] {
+        const gmprime zero, big("1" + std::string(400, '0'));
+        const auto nan = std::numeric_limits<double>::quiet_NaN();
+        const auto inf = std::numeric_limits<double>::infinity();
+
+        expect(zero == -0.0);
+        expect(zero < 1e-300);
+        expect(zero > -1e-300);
+
+        expect(big < inf);
+        expect(-big > -inf);
+        expect(inf > big);
+
+        expect(gmprime(1e300) == 1e300) << "a double converted to gmprime compares equal to itself";
+        expect(gmprime("1" + std::string(300, '0')) != 1e300) << "1e300 is not exactly 10^300";
+
+        // NaN is unordered: every comparison is false, except !=
+        expect(!(zero == nan));
+        expect(zero != nan);
+        expect(!(zero < nan) && !(zero <= nan) && !(zero > nan) && !(zero >= nan));
+        expect(!(nan == zero) && nan != zero);
+    };
+    "floating_point_long_double"_test = [] {
+        // Exact beyond the 53 bits of a double where long double is wider (e.g. x86 Linux, ARM64 Linux)
+        if constexpr (std::numeric_limits<long double>::digits > 61) {
+            const gmprime a = (gmprime(1) << 60) + 1;
+            const long double x = std::ldexp(1.0L, 60) + 1;
+
+            expect(a == x);
+            expect(a - 1 < x);
+        }
+    };
 };
 
 suite<"gmprime::arithmetic"> arithmetic = [] {
@@ -325,6 +380,33 @@ suite<"gmprime::shift"> shift = [] {
         gmprime r(336);
         r >>= 3;
         expect(r == 42);
+    };
+    "shift_negative"_test = [] {
+        gmprime a(42);
+
+        expect(throws<std::domain_error>([&] { static_cast<void>(a << -1); }));
+        expect(throws<std::domain_error>([&] { static_cast<void>(a >> -1); }));
+        expect(throws<std::domain_error>([&] { a <<= -1; }));
+        expect(throws<std::domain_error>([&] { a >>= -1; }));
+        expect(a == 42) << "operand modified by a failed shift";
+    };
+    "shift_left_beyond_capacity"_test = [] {
+        gmprime a(42);
+
+        // GMP aborts the program when a number exceeds its maximum size
+        expect(throws<std::length_error>([&] { static_cast<void>(a << std::numeric_limits<size_t>::max()); }));
+        expect(throws<std::length_error>([&] { a <<= std::numeric_limits<size_t>::max(); }));
+        expect(a == 42) << "operand modified by a failed shift";
+    };
+    "shift_right_huge"_test = [] {
+        // GMP takes shift counts as unsigned long, 32 bits on Windows: a huge count must not be truncated
+        const auto huge = std::numeric_limits<size_t>::max();
+        expect((gmprime(42) >> huge) == 0);
+        expect((gmprime(-42) >> huge) == -1) << "right shift rounds toward minus infinity, like an int";
+
+        gmprime a(42);
+        a >>= huge;
+        expect(a == 0);
     };
 };
 
@@ -933,6 +1015,127 @@ suite<"gmprime::string"> string = [] {
         t.str("");
     };
 
+    "ostream_format_like_int"_test = [] {
+        using flags = std::ios_base::fmtflags;
+        const flags bases[] = {std::ios_base::dec, std::ios_base::oct, std::ios_base::hex};
+        const flags options[] = {
+            flags{}, std::ios_base::showbase, std::ios_base::uppercase, std::ios_base::showpos,
+            std::ios_base::showbase | std::ios_base::uppercase,
+            std::ios_base::showbase | std::ios_base::showpos | std::ios_base::uppercase,
+        };
+        const flags adjustments[] = {flags{}, std::ios_base::left, std::ios_base::right, std::ios_base::internal};
+        const long values[] = {0, 1, 42, 255, 4096, 123456789};
+
+        const auto check = [](const flags format, const long value) {
+            std::ostringstream expected, actual;
+            for (auto *s : {&expected, &actual}) {
+                s->flags(format);
+                s->width(14);
+                s->fill('*');
+            }
+            expected << value;
+            actual << gmprime(value);
+            expect(actual.str() == expected.str()) << "gmprime" << actual.str() << "int" << expected.str();
+        };
+
+        for (const auto base : bases)
+            for (const auto option : options)
+                for (const auto adjustment : adjustments)
+                    for (const auto value : values) {
+                        check(base | option | adjustment, value);
+                        // An int prints its two's complement in octal and hexadecimal: compare signs in decimal only
+                        if (base == std::ios_base::dec)
+                            check(base | option | adjustment, -value);
+                    }
+    };
+
+    "ostream_format_beyond_int"_test = [] {
+        std::ostringstream t;
+        t << std::showbase << std::hex << gmprime(-255) << ' ' << std::uppercase << gmprime(-255);
+        expect(t.str() == "-0xff -0XFF") << "a negative number prints as a sign and its magnitude";
+        t.str("");
+
+        t << std::nouppercase << gmprime::bin << gmprime(5) << ' ' << std::uppercase << gmprime(5) << ' ' << gmprime(0);
+        expect(t.str() == "0b101 0B101 0");
+        t.str("");
+
+        t << std::noshowbase << std::nouppercase << std::hex << std::setw(10) << std::internal << std::setfill('0')
+          << gmprime(-255);
+        expect(t.str() == "-0000000ff");
+        t.str("");
+
+        std::wostringstream w;
+        w << std::showbase << std::hex << gmprime(255);
+        expect(w.str() == L"0xff") << "wide streams";
+    };
+
+    "istream"_test = [] {
+        std::istringstream t("  42 -17 +5 123456789012345678901234567890");
+        gmprime a, b, c, d;
+        t >> a >> b >> c >> d;
+
+        expect(!t.fail());
+        expect(a == 42 && b == -17 && c == 5);
+        expect(d == gmprime("123456789012345678901234567890"));
+    };
+    "istream_bases"_test = [] {
+        gmprime a, b, c, d;
+
+        std::istringstream hex("ff 0xFF");
+        hex >> std::hex >> a >> b;
+        expect(a == 255 && b == 255);
+
+        std::istringstream oct("17");
+        oct >> std::oct >> c;
+        expect(c == 15);
+
+        std::istringstream bin("101 0b11");
+        bin >> gmprime::bin >> a >> b;
+        expect(a == 5 && b == 3);
+
+        // No base set: detected from the prefix, like %i
+        std::istringstream detect("0x1f 017 0b101 42 -0x10 0");
+        detect.unsetf(std::ios_base::basefield);
+        gmprime e, f;
+        detect >> a >> b >> c >> d >> e >> f;
+        expect(a == 31 && b == 15 && c == 5 && d == 42 && e == -16 && f == 0);
+    };
+    "istream_stops_and_fails"_test = [] {
+        gmprime a(1), b(2);
+
+        std::istringstream rest("42abc");
+        rest >> a;
+        expect(a == 42 && !rest.fail());
+        expect(rest.peek() == 'a') << "reading stops at the first character that is not a digit";
+
+        std::istringstream invalid("abc");
+        invalid >> b;
+        expect(invalid.fail());
+        expect(b == 2) << "value modified by a failed read";
+
+        std::istringstream end("42");
+        end >> a;
+        expect(end.eof() && !end.fail());
+
+        std::istringstream sign_only("-");
+        sign_only >> b;
+        expect(sign_only.fail() && b == 2);
+
+        std::istringstream blank("   ");
+        blank >> b;
+        expect(blank.fail() && blank.eof() && b == 2) << "nothing but whitespace, like an int";
+    };
+    "stream_round_trip"_test = [] {
+        const gmprime original("-123456789abcdef0123456789abcdef", 16);
+        std::stringstream t;
+        t << std::showbase << std::hex << original;
+
+        gmprime read;
+        t.unsetf(std::ios_base::basefield);
+        t >> read;
+        expect(read == original);
+    };
+
     "ostream_bin_sticky"_test = [] {
         const gmprime a(5), b(6), c(255);
         std::stringstream t;
@@ -1213,6 +1416,34 @@ suite<"gmprime::helper"> helper = [] {
         map[gmprime("5")] += 1;
         expect(map.size() == 1);
         expect(map.at(5) == 2);
+    };
+
+    "free_functions"_test = [] {
+        const gmprime a(-12), b(18), zero;
+
+        expect(abs(a) == 12);
+        expect(abs(b) == 18);
+        expect(abs(zero) == 0);
+
+        expect(gcd(a, b) == 6) << "always >= 0, like std::gcd";
+        expect(gcd(zero, zero) == 0);
+        expect(gcd(a, 8) == 4) << "a primitive operand converts";
+        expect(lcm(a, b) == 36) << "always >= 0, like std::lcm";
+        expect(lcm(a, zero) == 0);
+
+        using std::to_string;
+        expect(to_string(a) == "-12");
+        expect(to_string(42) == "42") << "std::to_string stays available";
+    };
+
+    "numeric_limits"_test = [] {
+        using limits = std::numeric_limits<gmprime>;
+
+        expect(limits::is_specialized);
+        expect(limits::is_integer && limits::is_signed && limits::is_exact);
+        expect(!limits::is_bounded && !limits::is_modulo);
+        expect(limits::radix == 2);
+        expect(limits::max() == 0) << "meaningless for an unbounded type, gmprime() like the primary template";
     };
 
     "used_words"_test = [] {

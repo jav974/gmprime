@@ -72,13 +72,20 @@ public:
     gmprime& operator&=(const gmprime& other);
     gmprime& operator|=(const gmprime& other);
     gmprime& operator^=(const gmprime& other);
-    gmprime& operator<<=(size_t shift);
-    gmprime& operator>>=(size_t shift);
+    // Shift counts of any integer type. A negative count throws std::domain_error, a left shift beyond the
+    // maximum size of a GMP number throws std::length_error (GMP would abort the program). Right shifts round
+    // toward minus infinity, like an int.
+    template<typename shift_t, std::enable_if_t<std::is_integral_v<shift_t> && !std::is_same_v<shift_t, bool>, bool> = true>
+    gmprime& operator<<=(shift_t shift);
+    template<typename shift_t, std::enable_if_t<std::is_integral_v<shift_t> && !std::is_same_v<shift_t, bool>, bool> = true>
+    gmprime& operator>>=(shift_t shift);
     friend gmprime operator&(const gmprime& lhs, const gmprime& rhs);
     friend gmprime operator|(const gmprime& lhs, const gmprime& rhs);
     friend gmprime operator^(const gmprime& lhs, const gmprime& rhs);
-    gmprime operator<<(size_t shift) const;
-    gmprime operator>>(size_t shift) const;
+    template<typename shift_t, std::enable_if_t<std::is_integral_v<shift_t> && !std::is_same_v<shift_t, bool>, bool> = true>
+    gmprime operator<<(shift_t shift) const;
+    template<typename shift_t, std::enable_if_t<std::is_integral_v<shift_t> && !std::is_same_v<shift_t, bool>, bool> = true>
+    gmprime operator>>(shift_t shift) const;
     gmprime operator~() const;
 
     // UNARY OPERATORS -    +
@@ -90,6 +97,8 @@ public:
     explicit operator bool() const;
 
     // COMPARISON OPERATORS  ==  <=  >=  <  >  !=
+    // With a floating point value, the comparison is exact, without converting either side (see gmprime.tpp):
+    // gmprime(5) < 5.5 is true, and NaN compares unordered (every comparison false, except !=)
     friend bool operator==(const gmprime& lhs, const gmprime& rhs);
     friend bool operator!=(const gmprime& lhs, const gmprime& rhs);
     friend bool operator<=(const gmprime& lhs, const gmprime& rhs);
@@ -117,7 +126,9 @@ public:
 
     [[nodiscard]] size_t used_bits() const;
     [[nodiscard]] size_t size_in_base(int base = 2) const;
-    // Bit access works on the magnitude, consistently with word access ([] and as_span)
+    // Bit access works on the magnitude, as GMP stores it, consistently with word access ([], as_span, bits).
+    // Bitwise operators (& | ^ ~ >>) follow two's complement instead, like an int: for a negative number,
+    // get_bit(k) can differ from ((a >> k) & 1), e.g. for -2, bit 2 is 0 in the magnitude and 1 in two's complement.
     [[nodiscard]] bool get_bit(size_t pos) const;
     gmprime& set_bit(size_t pos, bool value);
 
@@ -172,6 +183,12 @@ private:
     [[nodiscard]] gmprime read_window(size_t pos, size_t width) const;
     void write_window(size_t pos, size_t width, const gmprime& value);
 
+    // Shift count as an unsigned integer, std::domain_error if negative
+    template<typename shift_t>
+    static uintmax_t shift_count(shift_t shift);
+    void shift_left(uintmax_t count);
+    void shift_right(uintmax_t count);
+
     template<bool is_const>
     friend class bit_window;
 
@@ -184,6 +201,16 @@ private:
 #include "../src/gmprime_bit_window.tpp"
 #include "../src/gmprime.tpp"
 
+// Free functions, found by argument-dependent lookup like the ones for an int: abs(a), gcd(a, b).
+// std::to_string cannot be overloaded (adding overloads to std is undefined behavior), so call
+// to_string unqualified, after using std::to_string if needed.
+[[nodiscard]] gmprime abs(const gmprime& value);
+// Always >= 0, and gcd(0, 0) = 0, like std::gcd
+[[nodiscard]] gmprime gcd(const gmprime& a, const gmprime& b);
+// Always >= 0, and 0 if either is 0, like std::lcm
+[[nodiscard]] gmprime lcm(const gmprime& a, const gmprime& b);
+[[nodiscard]] std::string to_string(const gmprime& value);
+
 } // GMPrime
 
 namespace std {
@@ -193,6 +220,49 @@ namespace std {
 template<>
 struct hash<GMPrime::gmprime> {
     size_t operator()(const GMPrime::gmprime& value) const noexcept;
+};
+
+// An unbounded integer: the members that only make sense for bounded or floating point types are zero,
+// false, or gmprime(), like the primary template
+template<>
+class numeric_limits<GMPrime::gmprime> {
+public:
+    static constexpr bool is_specialized = true;
+    static constexpr bool is_signed = true;
+    static constexpr bool is_integer = true;
+    static constexpr bool is_exact = true;
+    static constexpr bool has_infinity = false;
+    static constexpr bool has_quiet_NaN = false;
+    static constexpr bool has_signaling_NaN = false;
+#if __cplusplus < 202302L
+    static constexpr float_denorm_style has_denorm = denorm_absent;
+    static constexpr bool has_denorm_loss = false;
+#endif
+    static constexpr float_round_style round_style = round_toward_zero;
+    static constexpr bool is_iec559 = false;
+    static constexpr bool is_bounded = false;
+    static constexpr bool is_modulo = false;
+    static constexpr int digits = 0;
+    static constexpr int digits10 = 0;
+    static constexpr int max_digits10 = 0;
+    static constexpr int radix = 2;
+    static constexpr int min_exponent = 0;
+    static constexpr int min_exponent10 = 0;
+    static constexpr int max_exponent = 0;
+    static constexpr int max_exponent10 = 0;
+    // Division by zero throws an exception rather than trapping
+    static constexpr bool traps = false;
+    static constexpr bool tinyness_before = false;
+
+    static GMPrime::gmprime min() { return {}; }
+    static GMPrime::gmprime max() { return {}; }
+    static GMPrime::gmprime lowest() { return {}; }
+    static GMPrime::gmprime epsilon() { return {}; }
+    static GMPrime::gmprime round_error() { return {}; }
+    static GMPrime::gmprime infinity() { return {}; }
+    static GMPrime::gmprime quiet_NaN() { return {}; }
+    static GMPrime::gmprime signaling_NaN() { return {}; }
+    static GMPrime::gmprime denorm_min() { return {}; }
 };
 
 } // std
