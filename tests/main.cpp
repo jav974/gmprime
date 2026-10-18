@@ -1571,6 +1571,16 @@ suite<"gmprime::coding"> coding_suite = [] {
         expect(table_bits(10'000'000, 24) == 24 && table_bits(100, 22, 10) == 12);
     };
 
+    "crc32"_test = [] {
+        const std::string text = "123456789";
+        const std::vector<uint8_t> bytes(text.begin(), text.end());
+        expect(crc32(bytes) == 0xCBF43926u) << "the standard check value";
+        expect(crc32({}) == 0);
+
+        const std::vector<uint8_t> first(bytes.begin(), bytes.begin() + 4), rest(bytes.begin() + 4, bytes.end());
+        expect(crc32(rest, crc32(first)) == crc32(bytes)) << "continued over parts";
+    };
+
     "cost_profile"_test = [] {
         cost_profile cost;
         for (int i = 0; i < 8; ++i) {

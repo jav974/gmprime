@@ -248,6 +248,7 @@ A table takes `2^bits` times the slot size: 32 MB for `checked_table<context_slo
 | `arithmetic_encoder` | `encode(bit, p)` for each bit, then `finish()` returns the message as a `gmprime` |
 | `arithmetic_decoder(code)` | `decode(p)` returns each bit, given the same `p` as the encoder. The decoder must know when to stop: store the length in the message |
 | `cost_profile` | `add(bit, p)` alongside the coder: `per_byte()` gives the bits each byte cost, `total()` the size, to see where a model pays |
+| `crc32(bytes)` | the CRC-32 of bytes (as zip and png): stored with a message, it tells whether decoding gave back the original data |
 | `table_bits(data_bytes)` | a context table size for the data: about four slots per bit, from 16 to 22 bits, so small inputs take little memory; compressor and decompressor derive it from the stored length |
 
 ### A complete compressor
@@ -387,23 +388,23 @@ gmz d data.gmz data.txt    # decompress
 gmz t data.txt             # compress, decompress, check, report
 ```
 
-It analyzes the file first with `analyze_folds`. Data that folds is coded with bit and byte templates across the fold, in 2D and 3D, and pixel runs; anything else with the text model: orders 0 to 8, words, line structure, last occurrences, indirect modeling, four mixers selected by the partial byte, the highest order seen, the previous byte and its class, and chained probability maps. It tries the capitals transform on text, and a bitmap variant on folded data, and keeps the smaller message. The two ways are compared on the first 64 KB, then the data is compressed once. Options: `-m` forces a mode, `-C` the capitals transform, `-S` the sample (0 compresses the data both ways, slower and sometimes a little smaller), `-T` a table size.
+It analyzes the file first with `analyze_folds`. Data that folds is coded with bit and byte templates across the fold, in 2D and 3D, and pixel runs; anything else with the text model: orders 0 to 8, words, line structure, last occurrences, indirect modeling, four mixers selected by the partial byte, the highest order seen, the previous byte and its class, and chained probability maps. It tries the capitals transform on text, and a bitmap variant on folded data, and keeps the smaller message. The two ways are compared on the first 64 KB, then the data is compressed once. A CRC-32 of the original ends the message: decompressing anything else (a corrupted file, another table size than the compression's) fails instead of writing wrong data. Options: `-m` forces a mode, `-C` the capitals transform, `-S` the sample (0 compresses the data both ways, slower and sometimes a little smaller), `-T` a table size.
 
 On the Canterbury corpus, sizes in bytes:
 
 | File | Size | gzip -9 | bzip2 -9 | xz -9e | gmz | Mode found |
 |---|---|---|---|---|---|---|
-| alice29.txt | 152,089 | 54,194 | 43,202 | 48,536 | **35,562** | text + capitals |
-| asyoulik.txt | 125,179 | 48,803 | 39,569 | 44,600 | **33,541** | text + capitals |
-| lcet10.txt | 426,754 | 144,462 | 107,706 | 119,496 | **86,148** | text + capitals |
-| plrabn12.txt | 481,861 | 194,357 | 145,577 | 165,464 | **123,383** | text + capitals |
-| ptt5 (fax image) | 513,216 | 52,238 | 49,759 | 39,868 | **21,859** | fold of 1728 bits |
-| kennedy.xls | 1,029,744 | 207,053 | 130,280 | 51,876 | **12,965** | fold of 104 bits, layers of 4 |
-| cp.html | 24,603 | 7,960 | 7,624 | 7,660 | **6,173** | text + capitals |
-| fields.c | 11,150 | 3,136 | 3,039 | 3,040 | **2,319** | text + capitals |
-| grammar.lsp | 3,721 | 1,246 | 1,283 | 1,300 | **989** | text |
-| sum | 38,240 | 12,854 | 12,909 | 9,508 | **9,409** | text |
-| xargs.1 | 4,227 | 1,756 | 1,762 | 1,820 | **1,440** | text + capitals |
+| alice29.txt | 152,089 | 54,194 | 43,202 | 48,536 | **35,566** | text + capitals |
+| asyoulik.txt | 125,179 | 48,803 | 39,569 | 44,600 | **33,545** | text + capitals |
+| lcet10.txt | 426,754 | 144,462 | 107,706 | 119,496 | **86,152** | text + capitals |
+| plrabn12.txt | 481,861 | 194,357 | 145,577 | 165,464 | **123,387** | text + capitals |
+| ptt5 (fax image) | 513,216 | 52,238 | 49,759 | 39,868 | **21,863** | fold of 1728 bits |
+| kennedy.xls | 1,029,744 | 207,053 | 130,280 | 51,876 | **12,969** | fold of 104 bits, layers of 4 |
+| cp.html | 24,603 | 7,960 | 7,624 | 7,660 | **6,177** | text + capitals |
+| fields.c | 11,150 | 3,136 | 3,039 | 3,040 | **2,323** | text + capitals |
+| grammar.lsp | 3,721 | 1,246 | 1,283 | 1,300 | **993** | text |
+| sum | 38,240 | 12,854 | 12,909 | 9,508 | **9,412** | text |
+| xargs.1 | 4,227 | 1,756 | 1,762 | 1,820 | **1,444** | text + capitals |
 
 The price is speed, as for every context-mixing compressor. On Apple Silicon:
 

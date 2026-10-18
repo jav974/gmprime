@@ -506,6 +506,27 @@ inline int table_bits(const size_t data_bytes, const int max_bits = 22, const in
     return std::max(bits, min_bits);
 }
 
+// CRC-32 of bytes (the one of zip and png), to check that a message decoded to the original data. crc continues
+// a previous checksum: crc32(b, crc32(a)) is the checksum of a followed by b
+inline uint32_t crc32(const std::vector<uint8_t>& bytes, uint32_t crc = 0) {
+    static const auto table = [] {
+        std::vector<uint32_t> values(256);
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; ++k) {
+                c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            }
+            values[i] = c;
+        }
+        return values;
+    }();
+    crc = ~crc;
+    for (const auto byte : bytes) {
+        crc = table[(crc ^ byte) & 0xFF] ^ (crc >> 8);
+    }
+    return ~crc;
+}
+
 // Cost of each byte coded with a model, -log2 of the probabilities given to its actual bits: where the bits
 // go, to compare models or study the data
 class cost_profile {

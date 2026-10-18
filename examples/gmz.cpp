@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cstdio>
 #include <memory>
+#include <optional>
 #include <string>
 #include <gmprime_coding.hpp>
 
@@ -319,8 +320,10 @@ size_t decode_number(arithmetic_decoder& decoder, const int bits) {
     return value;
 }
 
-// Header, at p = 1/2: payload size (32 bits), fold (1), bitmap (1), capitals (1), fold width (16), layer (8)
-gmprime compress(const std::vector<uint8_t>& payload, config cfg, const bool capitals, const int forced_table_bits) {
+// Header, at p = 1/2: payload size (32 bits), fold (1), bitmap (1), capitals (1), fold width (16), layer (8). Then
+// the payload, and the CRC-32 of the original data (32 bits), so that decoding to anything else is detected
+gmprime compress(const std::vector<uint8_t>& payload, config cfg, const bool capitals, const int forced_table_bits,
+                 const uint32_t check) {
     arithmetic_encoder encoder;
     encode_number(encoder, payload.size(), 32);
     encode_number(encoder, cfg.fold ? 1 : 0, 1);
@@ -338,10 +341,13 @@ gmprime compress(const std::vector<uint8_t>& payload, config cfg, const bool cap
             m.update(bit);
         }
     }
+    encode_number(encoder, check, 32);
     return encoder.finish();
 }
 
-std::vector<uint8_t> decompress(const gmprime& code, const int forced_table_bits) {
+// The original data, or nothing if it does not match its checksum: a corrupted message, or decompressed with
+// another table size than it was compressed with
+std::optional<std::vector<uint8_t>> decompress(const gmprime& code, const int forced_table_bits) {
     arithmetic_decoder decoder(code);
     config cfg;
     const size_t size = decode_number(decoder, 32);
@@ -364,7 +370,12 @@ std::vector<uint8_t> decompress(const gmprime& code, const int forced_table_bits
         }
         payload.push_back(static_cast<uint8_t>(byte));
     }
-    return capitals ? capitals_decode(payload) : payload;
+    const auto check = static_cast<uint32_t>(decode_number(decoder, 32));
+    auto data = capitals ? capitals_decode(payload) : std::move(payload);
+    if (crc32(data) != check) {
+        return std::nullopt;
+    }
+    return data;
 }
 
 struct choice {
@@ -380,6 +391,7 @@ struct choice {
 choice compress_best(const gmprime& file, const std::string& mode, const std::string& capitals_mode, const int forced_table_bits,
                      const size_t sample) {
     const auto data = file.bytes();
+    const uint32_t check = crc32(data);
     choice best;
 
     // The first 128 KB find the same folds as the whole data, much sooner
@@ -403,9 +415,9 @@ choice compress_best(const gmprime& file, const std::string& mode, const std::st
         };
         config variant = best.cfg;
         variant.bitmap = compare_bitmap;
-        auto plain = compress(first(data), best.cfg, false, forced_table_bits);
-        auto other = compare_capitals ? compress(first(*lowered), best.cfg, true, forced_table_bits)
-                                      : compress(first(data), variant, false, forced_table_bits);
+        auto plain = compress(first(data), best.cfg, false, forced_table_bits, check);
+        auto other = compare_capitals ? compress(first(*lowered), best.cfg, true, forced_table_bits, check)
+                                      : compress(first(data), variant, false, forced_table_bits, check);
 
         if (other.bytes().size() < plain.bytes().size()) {
             best.capitals = compare_capitals;
@@ -418,7 +430,7 @@ choice compress_best(const gmprime& file, const std::string& mode, const std::st
         }
     }
 
-    best.code = compress(best.capitals ? *lowered : data, best.cfg, best.capitals, forced_table_bits);
+    best.code = compress(best.capitals ? *lowered : data, best.cfg, best.capitals, forced_table_bits, check);
     return best;
 }
 
@@ -456,7 +468,12 @@ int main(int argc, char** argv) {
     input.load_from_file(argv[arg + 1]);
 
     if (command == "d") {
-        gmprime::from_bytes(decompress(input, forced_table_bits)).save_to_file(argv[arg + 2]);
+        const auto data = decompress(input, forced_table_bits);
+        if (!data) {
+            std::fprintf(stderr, "gmz: the decoded data does not match its checksum\n");
+            return 1;
+        }
+        gmprime::from_bytes(*data).save_to_file(argv[arg + 2]);
         return 0;
     }
 
@@ -470,7 +487,7 @@ int main(int argc, char** argv) {
     // Test: decode what was coded and report
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     const auto data = input.bytes();
-    const bool same = decompress(best.code, forced_table_bits) == data;
+    const bool same = decompress(best.code, forced_table_bits) == std::optional(data);
     const size_t size = best.code.bytes().size();
     std::printf("%zu -> %zu bytes, %.3f bits/byte, %s, %.1f s, %s%s", data.size(), size, data.empty() ? 0.0 : 8.0 * size / data.size(),
                 same ? "round trip ok" : "ROUND TRIP FAILED", seconds, best.cfg.fold ? "fold" : "text", best.capitals ? " + capitals" : "");

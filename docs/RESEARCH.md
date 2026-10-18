@@ -151,8 +151,12 @@ The toolkit now computes on integers only, as lpaq does:
 - mixer weights in 8.24 fixed point, rates scaled by 65536, dot products on 64 bits;
 - right shifts of negative numbers checked to be arithmetic at compile time.
 
-Messages are now the same bytes on every build, and each decodes the others. Sizes moved by at most 5 bytes
-(kennedy.xls 12,970 to 12,965, alice29.txt 35,563 to 35,562), and speed is the same or up to 16% better.
+Messages are now the same bytes on every build, and each decodes the others: on 6 Canterbury files, macOS (Apple
+Clang) and Linux (GCC and Clang, x86_64 and ARM64) give one message per file. gmz also ends each message with a
+CRC-32 of the original (4 bytes), so that a decoding gone astray fails instead of writing wrong data.
+
+Without the checksum, sizes moved by at most 5 bytes (kennedy.xls 12,970 to 12,965, alice29.txt 35,563 to
+35,562), and speed is the same or up to 16% better.
 
 ## Open ideas
 

@@ -22,6 +22,11 @@ if (BUILD_TESTING AND (PROJECT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR))
     add_test(NAME gmz_files COMMAND ${CMAKE_COMMAND} -DGMZ=$<TARGET_FILE:gmz> -DINPUT=${GMZ_SAMPLE}
              -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/sample -DOPTIONS=-T\;18 -P ${CMAKE_CURRENT_SOURCE_DIR}/round_trip.cmake)
 
+    # Decompressing with another table size than the compression decodes other data: the checksum rejects it
+    add_test(NAME gmz_checksum COMMAND ${CMAKE_COMMAND} -DGMZ=$<TARGET_FILE:gmz> -DINPUT=${GMZ_SAMPLE}
+             -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mismatch -DOPTIONS=-T\;18 -DDECOMPRESS_OPTIONS=-T\;17
+             -P ${CMAKE_CURRENT_SOURCE_DIR}/round_trip.cmake)
+
     # Invalid command lines
     add_test(NAME gmz_unknown_option COMMAND gmz -q t ${GMZ_SAMPLE})
     add_test(NAME gmz_missing_command COMMAND gmz -m text)
