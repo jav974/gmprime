@@ -224,6 +224,27 @@ Integrating it found two bugs that macOS release builds hid:
 
 AddressSanitizer on Linux caught the first; the unit tests the second.
 
+### A million random digits
+
+The file of Mark Nelson's challenge (AMillionRandomDigits.bin, 415,241 bytes, unbeaten since 2002) is the digits
+of RAND's 1955 table read as one decimal number and written in binary: parsing the table's million digits into a
+gmprime gives the same bytes, highest first. 10^6 log2(10) / 8 = 415,241.01 bytes, so the file holds exactly the
+information of a million decimal digits, and any saving has to come from a flaw of the generator. Measured on the
+digits, as 4-bit symbols in a gmprime:
+
+| Test | Result | Random digits give |
+|---|---|---|
+| digit counts | chi-square 13.3 for 9 degrees of freedom | 9 (21.7 at 99%) |
+| conditional entropy, orders 1 to 3 (Miller-Madow corrected) | 3.32192, 3.32191, 3.32179 bits | 3.32193 |
+| adaptive code length, orders 1 to 3 | +127, +963, +6,523 bytes over the file | the cost of learning nothing |
+| position in the 5-digit group, in the 50-digit line | chi-square 41.6 for 45, 454 for 450 | the degrees of freedom |
+| longest repeated string | 11 digits | about 12 |
+
+The exact enumerative bound: with the counts known, the digits are one of 2^3,321,834 arrangements, 95 bits fewer
+than 10^6 digits take, but the counts cost 179 bits: +84 bits overall. `multiset_rank` computes that rank of a
+million digits in 105 s. gmz gives 416,531 bytes (+1,290) and xz 415,328 (+87). No structure is visible with
+these tools: a calibration, they find none where there is none.
+
 ## Speed
 
 Starting point: about 150 KB/s per pass, and gmz compresses twice (with and without capitals, or full and bitmap
