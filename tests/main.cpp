@@ -6,9 +6,11 @@
 #include <sys/stat.h>
 #include <unordered_map>
 #include <unordered_set>
+#include <cstring>
 #include <boost/ut.hpp>
 #include <gmprime.hpp>
 #include <gmprime_coding.hpp>
+#include <gmprime_records.hpp>
 
 using namespace boost::ut;
 using namespace GMPrime;
@@ -1849,6 +1851,277 @@ suite<"gmprime::coding"> coding_suite = [] {
 
         expect(cost.per_byte().size() == 1 && std::fabs(cost.per_byte()[0] - 8) < 1e-12) << "1 bit at p = 1/2";
         expect(std::fabs(cost.total() - 10) < 1e-12) << "and the started byte: 2 bits at p = 1/4";
+    };
+};
+
+namespace {
+
+uint64_t double_bits(const double v) {
+    uint64_t b;
+    std::memcpy(&b, &v, 8);
+    return b;
+}
+
+uint64_t float_bits(const float v) {
+    uint32_t b;
+    std::memcpy(&b, &v, 4);
+    return b;
+}
+
+// Never throws in practice (small tests): noexcept spares its callers a cleanup path
+void put_field(std::vector<uint8_t>& out, const uint64_t bits, const int size, const bool big_endian) noexcept {
+    for (int i = 0; i < size; ++i) {
+        out.push_back(static_cast<uint8_t>(bits >> (8 * (big_endian ? size - 1 - i : i))));
+    }
+}
+
+// Records of 24 bytes: an identifier, a decimal double in little-endian (one in 50 off its lattice), one in
+// big-endian, an IBM single precision value (k / 64) and a float on a lattice of 0.25
+std::vector<uint8_t> lattice_records(const size_t count) {
+    std::vector<uint8_t> out;
+    uint32_t seed = 7;
+    int64_t a = 100000, b = -3000;
+    for (uint32_t r = 0; r < count; ++r) {
+        seed = seed * 1664525u + 1013904223u;
+        a += (seed >> 8) % 40;
+        b += static_cast<int64_t>((seed >> 16) % 9) - 4;
+        put_field(out, r, 4, false);
+        put_field(out, double_bits(r % 50 == 3 ? 1.0 / 3 : static_cast<double>(a) * 0.001), 8, false);
+        put_field(out, double_bits(static_cast<double>(b) * 0.01), 8, true);
+        put_field(out, *GMPrime::coding::ibm_lattice_bits(1 + (seed >> 4) % 3000, -6), 4, true);
+        put_field(out, float_bits(static_cast<float>((seed >> 12) % 200) * 0.25f), 4, false);
+    }
+    return out;
+}
+
+// 16-bit pixels of a smooth image, rows of width pixels
+std::vector<uint8_t> image16(const size_t width, const size_t height, const bool big_endian) {
+    std::vector<uint8_t> out;
+    uint32_t seed = 3;
+    for (size_t y = 0; y < height; ++y) {
+        for (size_t x = 0; x < width; ++x) {
+            seed = seed * 1664525u + 1013904223u;
+            put_field(out, 1000 + 3 * x + 5 * y + (x * y) % 7 + (seed >> 20) % 4, 2, big_endian);
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+suite<"gmprime::records"> records_suite = [] {
+    using namespace GMPrime::coding;
+
+    "record_width"_test = [] {
+        std::vector<uint8_t> data;
+        for (int i = 0; i < 700; ++i) {
+            for (const uint8_t b : {uint8_t(i), uint8_t(i >> 8), uint8_t{7}, uint8_t{0}, uint8_t{9}, uint8_t{1}, uint8_t{2}}) {
+                data.push_back(b);
+            }
+        }
+        const auto eq = byte_autocorrelation(data, 20);
+        expect(eq.size() == 21 && eq[7] > 0.7 && eq[14] > 0.7 && eq[1] < 0.3);
+        expect(byte_autocorrelation(data, 20, 1 << 20, 3)[7] == eq[7] || byte_autocorrelation(data, 20, 1 << 20, 3)[7] > 0.7) << "every third byte";
+        expect(byte_autocorrelation({1, 2, 3}, 10)[5] == 0) << "beyond the data";
+
+        const auto records = find_record_width(data, 64);
+        expect(records.width == 7 && records.score > records.median);
+        expect(find_record_width(data, 1).width == 0) << "too few distances";
+    };
+
+    "image16"_test = [] {
+        const auto little = find_image16(image16(300, 200, false));
+        expect(little.found && little.little_endian && little.start == 0 && little.row_bytes == 600 && little.row_score < 0.85);
+        const auto big = find_image16(image16(160, 300, true));
+        expect(big.found && !big.little_endian && big.start == 0 && big.row_bytes == 320);
+
+        // A slow ramp: samples, but no rows
+        std::vector<uint8_t> ramp;
+        for (size_t i = 0; i < 40000; ++i) {
+            put_field(ramp, 20000 + i / 16, 2, false);
+        }
+        const auto line = find_image16(ramp);
+        expect(line.found && line.row_bytes == 0);
+
+        std::string text;
+        random_text(40000, 26, 5, text);
+        expect(!find_image16(std::vector<uint8_t>(text.begin(), text.end())).found) << "no 16-bit samples";
+        expect(!find_image16(image16(10, 10, false)).found) << "too short";
+    };
+
+    "numeric_prediction"_test = [] {
+        // Learns that the value is twice the feature
+        lms_predictor lms(2, 3);
+        expect(lms.size() == 2);
+        int64_t last_error = 0;
+        for (int i = 0; i < 400; ++i) {
+            const int64_t x = 100 + (i * 37) % 900;
+            const int64_t features[] = {x, 1};
+            last_error = std::abs(lms.predict(features) - 2 * x);
+            lms.update(2 * x);
+        }
+        expect(last_error < 40) << last_error;
+
+        expect(quantize_difference(0) == 0 && quantize_difference(1) == 1 && quantize_difference(-1) == -1);
+        expect(quantize_difference(2) == 2 && quantize_difference(3) == 3 && quantize_difference(5) == 4 && quantize_difference(6) == 5);
+        expect(quantize_difference(8) == 6 && quantize_difference(-11) == -6);
+        expect(quantize_difference(std::numeric_limits<int64_t>::min()) == -126 && quantize_difference(std::numeric_limits<int64_t>::max()) == 125);
+
+        std::vector<uint8_t> pairs{1, 2, 3, 4, 5};
+        swap_pairs(pairs, 0);
+        expect(pairs == std::vector<uint8_t>{2, 1, 4, 3, 5});
+        swap_pairs(pairs, 1);
+        expect(pairs == std::vector<uint8_t>{2, 4, 1, 5, 3});
+
+        expect(bit_middle(0b1, 1, 4) == 12 && bit_middle(0, 0, 8) == 128);
+    };
+
+    "float_fields"_test = [] {
+        uint8_t bytes[] = {1, 2, 3, 4};
+        expect(read_field(bytes, {4, false, false}) == 0x04030201u && read_field(bytes, {4, true, false}) == 0x01020304u);
+        write_field(bytes, {4, true, false}, 0xA1B2C3D4u);
+        expect(bytes[0] == 0xA1 && bytes[3] == 0xD4);
+        write_field(bytes, {4, false, false}, 0xA1B2C3D4u);
+        expect(bytes[0] == 0xD4 && bytes[3] == 0xA1);
+
+        const float_format ibm{4, true, true}, single{4, false, false}, binary64{8, false, false};
+        expect(field_value(0x41100000, ibm) == 1.0 && field_value(0xC1100000, ibm) == -1.0);
+        expect(field_value(double_bits(2.5), binary64) == 2.5 && field_value(float_bits(0.75f), single) == 0.75);
+        expect(value_bits(2.5, binary64) == double_bits(2.5) && value_bits(0.75, single) == float_bits(0.75f));
+        expect(value_bits(1.0 / 64, ibm) == 0x3F400000) << "IBM steps: powers of 2";
+
+        expect(zigzag(0) == 0 && zigzag(-1) == 1 && zigzag(1) == 2 && unzigzag(zigzag(-12345)) == -12345);
+        expect(unzigzag(zigzag(std::numeric_limits<int64_t>::min())) == std::numeric_limits<int64_t>::min());
+    };
+
+    "ibm_lattice"_test = [] {
+        // 1 = 1/16 * 16^1, 1/64 = 1/4 * 16^-1: normalized, first hexadecimal digit not 0
+        expect(*ibm_lattice_bits(64, -6) == 0x41100000 && *ibm_lattice_bits(-64, -6) == 0xC1100000);
+        expect(*ibm_lattice_bits(1, -6) == 0x3F400000 && *ibm_lattice_bits(0, -6) == 0);
+        expect(!ibm_lattice_bits((1 << 25) + 1, 0)) << "more bits than the fraction holds";
+        expect(!ibm_lattice_bits(1, 300) && !ibm_lattice_bits(1, -300)) << "exponent out of range";
+
+        expect(*ibm_step_power(0x3F400000) == -6 && *ibm_step_power(0x41100000) == 0);
+        expect(!ibm_step_power(0x3F300000) && !ibm_step_power(0xBF400000) && !ibm_step_power(0x3F000000));
+    };
+
+    "lattice_bits"_test = [] {
+        const auto product = multiply_wide(~uint64_t{0}, ~uint64_t{0});
+        expect(product.high == ~uint64_t{1} && product.low == 1);
+
+        // k * step as the processor multiplies it, k exact in the format
+        const float_format binary64{8, false, false}, single{4, false, false};
+        uint32_t seed = 11;
+        bool same = true;
+        for (int i = 0; i < 20000; ++i) {
+            seed = seed * 1664525u + 1013904223u;
+            const int64_t k = static_cast<int64_t>(seed >> 4) * (i % 2 ? 1 : -1) * (i % 3 == 0 ? 1001 : 1);
+            const double step = std::ldexp(1.0 + (seed % 9973) / 9973.0, static_cast<int>(seed % 50) - 30);
+            same = same && *lattice_bits(k, double_bits(step), binary64) == double_bits(static_cast<double>(k) * step);
+            const auto small = static_cast<int64_t>(seed >> 12);
+            const float fstep = static_cast<float>(step);
+            same = same && *lattice_bits(small, float_bits(fstep), single) == float_bits(static_cast<float>(small) * fstep);
+        }
+        expect(same);
+
+        expect(*lattice_bits(0, double_bits(0.01), binary64) == 0);
+        expect(*lattice_bits(1, double_bits(1.0), binary64) == double_bits(1.0)) << "no rounding";
+        // (2^53 + 1) (2 - 2^-52) = 2^54 - 2^-52: the significand rounds up to 2^53, the exponent grows
+        expect(*lattice_bits((int64_t{1} << 53) + 1, double_bits(std::nextafter(2.0, 0.0)), binary64) == double_bits(std::ldexp(1.0, 54)));
+        expect(*lattice_bits(int64_t{1} << 60, 1, binary64) == double_bits(std::ldexp(1.0, -1014))) << "subnormal step";
+        expect(!lattice_bits(3, 1, binary64)) << "subnormal result";
+        expect(!lattice_bits(int64_t{1} << 40, double_bits(1e300), binary64)) << "overflow";
+        expect(!lattice_bits(1, double_bits(std::numeric_limits<double>::infinity()), binary64) && !lattice_bits(1, 0, binary64));
+        expect(*lattice_bits(64, 0x3F400000, {4, true, true}) == 0x41100000 && !lattice_bits(1, 0x3F300000, {4, true, true})) << "IBM";
+    };
+
+    "lattice_points"_test = [] {
+        lattice_field field;
+        field.step_bits = double_bits(0.01);
+        field.residual_bits = 3;
+        const auto exact = to_lattice(double_bits(1234 * 0.01), field, 0.01);
+        expect(exact && exact->k == 1234 && exact->residual == 0);
+        const auto near = to_lattice(double_bits(1234 * 0.01) + 2, field, 0.01);
+        expect(near && near->k == 1234 && near->residual == 2);
+        expect(!to_lattice(double_bits(1234 * 0.01) + 9, field, 0.01)) << "residual beyond 3 bits";
+        expect(!to_lattice(double_bits(std::nan("")), field, 0.01) && !to_lattice(double_bits(1e300), field, 0.01));
+        expect(!to_lattice(double_bits(-0.0), field, 0.01)) << "-0 is not k = 0";
+        lattice_field broken = field;
+        broken.step_bits = 0;
+        expect(!to_lattice(double_bits(0.5), broken, 0.01));
+        field.residual_bits = 0;
+        expect(!to_lattice(double_bits(1234 * 0.01) + 1, field, 0.01) && to_lattice(double_bits(1234 * 0.01), field, 0.01));
+
+        field.residual_bits = 4;
+        for (const bool offset_binary : {false, true}) {
+            field.offset_binary = offset_binary;
+            for (const int64_t k : {int64_t{0}, int64_t{-5}, int64_t{123456}}) {
+                const auto packed = pack_point(field, k, -3);
+                expect(packed && unpack_point(field, *packed).k == k && unpack_point(field, *packed).residual == -3);
+            }
+            expect(!pack_point(field, int64_t{1} << 62, 0)) << "k beyond the field";
+            expect(!pack_point(field, -(int64_t{1} << 62), 0));
+        }
+        field.residual_bits = 0;
+        const int64_t extremes[] = {77, std::numeric_limits<int64_t>::min(), std::numeric_limits<int64_t>::max()};
+        bool whole = true;
+        for (const auto k : extremes) {
+            whole = whole && unpack_point(field, *pack_point(field, k, 0)).k == k;
+        }
+        expect(whole) << "64 bits for k, offset binary";
+    };
+
+    "lattice_step"_test = [] {
+        std::vector<double> values;
+        for (int i = 1; i <= 300; ++i) {
+            values.push_back(((i * 7919) % 1000) * 0.25 + 1);
+        }
+        const auto step = find_lattice_step(values);
+        expect(step && std::fabs(*step - 0.25) < 1e-9);
+        expect(!find_lattice_step(std::vector<double>(10, 1.5))) << "too few values";
+        expect(!find_lattice_step(std::vector<double>(100, 1.5))) << "a single value";
+        std::vector<double> scattered;
+        for (int i = 1; i <= 300; ++i) {
+            scattered.push_back(std::sqrt(static_cast<double>(i * 7919 % 10007)) * 1.234567);
+        }
+        expect(!find_lattice_step(scattered)) << "no lattice";
+    };
+
+    "lattice_transform"_test = [] {
+        auto data = lattice_records(600);
+        data.push_back(42);                     // a byte after the last record
+        const auto fields = find_lattice_fields(data, 28);
+        expect(fields.size() == 4) << fields.size();
+        bool formats = fields.size() == 4;
+        if (formats) {
+            formats = fields[0].offset == 4 && fields[0].format.size == 8 && !fields[0].format.big_endian
+                      && fields[1].offset == 12 && fields[1].format.big_endian && fields[2].offset == 20 && fields[2].format.ibm
+                      && fields[3].offset == 24 && fields[3].format.size == 4 && !fields[3].format.ibm;
+        }
+        expect(formats);
+
+        size_t escapes = 0;
+        expect(lattice_cost(data, 28, fields[0], 600, &escapes) < 600 * 64 && escapes == 12) << "1 in 50 off the lattice";
+
+        const auto encoded = lattice_encode(data, 28, fields);
+        expect(encoded.size() == data.size() + 600);
+        const auto decoded = lattice_decode(encoded, 28, fields);
+        expect(decoded && *decoded == data);
+
+        auto broken = fields;
+        broken[1].step_bits = 0;
+        expect(!lattice_decode(encoded, 28, broken)) << "no value for these fields";
+
+        expect(find_lattice_fields(data, 3).empty() && find_lattice_fields(lattice_records(100), 28).empty());
+
+        // Nine float fields: at most eight, one flag bit each
+        std::vector<uint8_t> wide;
+        for (int r = 0; r < 400; ++r) {
+            for (int j = 0; j < 9; ++j) {
+                put_field(wide, float_bits(static_cast<float>((r * (j + 3) * 31) % 500) * 0.5f), 4, false);
+            }
+        }
+        expect(find_lattice_fields(wide, 36).size() == 8);
     };
 };
 

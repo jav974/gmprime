@@ -169,6 +169,61 @@ Detection, never wrong on text:
 Forcing a wrong guess costs alice29.txt +6.2% as x86 and +0.5% as binary. A threshold still splits poorly
 (trans at 9% gains 1%, a samba slice at 14.5% gains 0.3%): comparing on the sample, as for capitals, would.
 
+### Records, lattices and images
+
+The broad evaluation showed fold detection missing records and images. Measured first:
+- `analyze_folds` finds 224 bits on sao (the 28-byte records), 32 bits on geo and 8192 bits (its limit) on mr,
+  but none passes the strength threshold; x-ray's rows (30,400 bits) are beyond the limit.
+- Byte autocorrelation shows sharp peaks: sao 28, geo 4, kennedy.xls 13, x-ray 2 and 3,800, mr 2 and 1,024.
+- The entropy of each byte column of sao, given the byte a record above: 11 columns stay at 8 bits, the
+  mantissas of its doubles.
+
+**Choosing by comparison.** The analysis suggests ways (text, capitals, fold, bitmap, records, lattice, signal,
+16-bit image), each compresses the first 64 KB, and the smallest message decides. A folded way must beat text by
+1%, since it costs about twice the time. Only binary data or a strong fold goes this way: on text, trying the
+structure plans tripled the time of cp.html for nothing.
+
+**Record contexts.** The column of the byte in its record, with the byte above, two above, the previous byte, the
+northeast and northwest ones, and the extrapolation 2N - NN; a mixer selected by the column and bit position.
+sao -5.2% and geo -4.4% alone.
+
+**The decimal lattice.** sao's doubles are integers in disguise: right ascension in milliseconds of time,
+declination in hundredths of an arcsecond, proper motions in 0.0001 s and 0.001". Each field becomes k and a
+residual of a few units in the last place (no exact formula for the residual was found: at best 14,000 of
+71,000 values). k is written high byte first in the field's own bytes, so that its constant high bytes cost
+nothing, with a byte of flags per record for values off the lattice. Decoding computes `k * step` with integers
+only, exactly as IEEE multiplication rounds; 2 million random products checked against the processor. The same
+tool covers geo's IBM floats (k / 64).
+
+**16-bit images.** Byte order and row width are detected, pixels are coded high byte first, predicted from W, N,
+their median, the gradient, 2N - NN and two integer LMS predictors; each bit's contexts hold where each
+prediction stands against the middle of the values the known bits still allow, on a logarithmic scale, so that
+statistics are shared across intensities.
+
+Full Silesia files:
+
+| File | gmz before | gmz | zpaq -m5 | paq8px -8 |
+|---|---|---|---|---|
+| sao | 4,399,334 | **2,047,265** | 3,899,367 | (over 20 minutes) |
+| mr | 2,192,035 | **1,708,413** | 2,181,419 | |
+| x-ray | 3,651,981 | **3,472,470** | 3,669,812 | 3,530,564 |
+
+geo goes from 45,525 to 41,082 bytes (paq8px 41,988), sum -5.9%, obj2 -2.1%; Calgary and Canterbury together
+-0.64%, no file worse by more than a byte. osdb, nci and kennedy.xls do not move. Compressing a structured file
+takes 1.5 to 2 times longer, and small binary files more: every way compresses the whole file when it is under
+64 KB.
+
+Also tried: geo as a 2D image of traces (worse), more LMS weights (no change), and the per-byte period context,
+which predicts each byte value back at its own last distance: -3.7% on sao and -1.9% on geo before the lattice,
+nothing once it is in.
+
+Integrating it found two bugs that macOS release builds hid:
+- the image model wrote 12 contexts into a table of 11; the twelfth was never read, but the write landed
+  outside the table;
+- an 8-byte field without residual bits, in offset binary, shifted a signed 1 into the sign bit.
+
+AddressSanitizer on Linux caught the first; the unit tests the second.
+
 ## Speed
 
 Starting point: about 150 KB/s per pass, and gmz compresses twice (with and without capitals, or full and bitmap
@@ -278,10 +333,9 @@ Without the checksum, sizes moved by at most 5 bytes (kennedy.xls 12,970 to 12,9
 
 ## Open ideas
 
-- Folds below 64 bits (short records, 16-bit samples), and several folds at once for data with nested periods.
-- Numbers across the fold: predict a field from the same field one record above (difference, linear
-  prediction) rather than its bits.
-- Fields within a fold: autocorrelation inside the row splits a record into fields, each with its own contexts.
+- Several folds at once, for data with nested periods.
+- Records of variable length (osdb, where zpaq stays 0.4% ahead): resynchronizing on separators.
+- An exact formula for sao's residuals: about 2.5 bits per double are left on the table.
 - Elastic folds: rows of varying length (text lines, variable records), aligned on a separator.
 - Linear complexity (Berlekamp-Massey) of bit planes and columns: the bits a linear recurrence would generate.
 - Grammars (Re-Pair): the data as the output of a small program, the other way to treat a number as the result

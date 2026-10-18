@@ -41,6 +41,26 @@ if (BUILD_TESTING AND (PROJECT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR))
              -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mismatch -DOPTIONS=-T\;18 -DDECOMPRESS_OPTIONS=-T\;17
              -P ${CMAKE_CURRENT_SOURCE_DIR}/round_trip.cmake)
 
+    # Records with floating point fields on lattices, and 16-bit images of either byte order, written by gmz_samples
+    add_executable(gmz_samples gmz_samples.cpp)
+    set(GMZ_SAMPLES ${CMAKE_CURRENT_BINARY_DIR}/samples)
+    add_test(NAME gmz_samples_written COMMAND ${CMAKE_COMMAND} -E make_directory ${GMZ_SAMPLES})
+    add_test(NAME gmz_samples_made COMMAND gmz_samples ${GMZ_SAMPLES})
+    set_tests_properties(gmz_samples_written PROPERTIES FIXTURES_SETUP gmz_samples_directory)
+    set_tests_properties(gmz_samples_made PROPERTIES FIXTURES_REQUIRED gmz_samples_directory FIXTURES_SETUP gmz_samples)
+    add_test(NAME gmz_records COMMAND gmz t ${GMZ_SAMPLES}/records.bin)
+    add_test(NAME gmz_records_level1 COMMAND gmz -1 t ${GMZ_SAMPLES}/records.bin)
+    add_test(NAME gmz_image_little_endian COMMAND gmz -S 4096 t ${GMZ_SAMPLES}/image_le.bin)
+    add_test(NAME gmz_image_big_endian COMMAND gmz -S 0 t ${GMZ_SAMPLES}/image_be.bin)
+    add_test(NAME gmz_records_files COMMAND ${CMAKE_COMMAND} -DGMZ=$<TARGET_FILE:gmz> -DINPUT=${GMZ_SAMPLES}/records.bin
+             -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/records -DOPTIONS=-T\;18 -P ${CMAKE_CURRENT_SOURCE_DIR}/round_trip.cmake)
+    # Decoded with another table size: garbage, which the lattice of IBM values or the checksum rejects
+    add_test(NAME gmz_records_checksum COMMAND ${CMAKE_COMMAND} -DGMZ=$<TARGET_FILE:gmz> -DINPUT=${GMZ_SAMPLES}/records.bin
+             -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/records_mismatch -DOPTIONS=-T\;18 -DDECOMPRESS_OPTIONS=-T\;17
+             -P ${CMAKE_CURRENT_SOURCE_DIR}/round_trip.cmake)
+    set_tests_properties(gmz_records gmz_records_level1 gmz_image_little_endian gmz_image_big_endian gmz_records_files
+                         gmz_records_checksum PROPERTIES FIXTURES_REQUIRED gmz_samples)
+
     # Invalid command lines
     add_test(NAME gmz_unknown_option COMMAND gmz -q t ${GMZ_SAMPLE})
     add_test(NAME gmz_missing_command COMMAND gmz -m text)
