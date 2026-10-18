@@ -121,6 +121,13 @@ suite<"gmprime::ctor"> ctor = [] {
         expect(throws<std::invalid_argument>([] { [[maybe_unused]] const gmprime v("2", 2); }));
     };
 
+    "ctor_string_invalid_base"_test = [] {
+        expect(throws<std::invalid_argument>([] { [[maybe_unused]] const gmprime v("1", 1); }));
+        expect(throws<std::invalid_argument>([] { [[maybe_unused]] const gmprime v("1", 63); }));
+        expect(throws<std::invalid_argument>([] { [[maybe_unused]] const gmprime v("1", -2); }));
+        expect(gmprime("0x2a", 0) == 42) << "base 0 detects the base from the prefix";
+    };
+
     "ctor_floating_point_non_finite"_test = [] {
         expect(throws<std::domain_error>([] { [[maybe_unused]] const gmprime v(std::numeric_limits<double>::infinity()); }));
         expect(throws<std::domain_error>([] { [[maybe_unused]] const gmprime v(std::numeric_limits<double>::quiet_NaN()); }));
@@ -370,10 +377,10 @@ suite<"gmprime::logical"> logical = [] {
         expect(positive && !zero);
 
         bool taken = false;
-        if (zero) {
+        if (positive) {
             taken = true;
         }
-        expect(!taken);
+        expect(taken);
 
         expect(!std::is_convertible_v<gmprime, bool>) << "conversion to bool must be explicit";
     };
@@ -588,6 +595,11 @@ suite<"gmprime::bit_window"> bit_windows = [] {
         gmprime a = -n;
         a.bits(4, 8) = 0xABu;
         expect(a == gmprime("-0x123456789abcdeffedcba98765432100011223344556ab7", 0));
+
+        // Wider than any integer: goes through GMP operations instead of limb masks
+        gmprime b = -n;
+        b.bits(40, 100) = gmprime("0x0f0f0f0f0f0f0f0f0f0f0f0f0f", 0);
+        expect(b == gmprime("-0x123456789abcf0f0f0f0f0f0f0f0f0f0f0f0f3344556677", 0));
     };
     "write_gmprime"_test = [&] {
         gmprime a(n);
@@ -969,13 +981,31 @@ suite<"gmprime::string"> string = [] {
         mp_get_memory_functions(&gmp_default_alloc, &gmp_default_realloc, &gmp_default_free);
         mp_set_memory_functions(counting_alloc, counting_realloc, counting_free);
         gmp_live_allocations = 0;
+
+        // Sanity check of the counting itself, so that the test cannot pass for lack of counting
+        {
+            gmprime grown(v);
+            grown <<= 1000;
+            expect(gmp_live_allocations > 0) << "GMP allocations are not counted";
+        }
+        const auto balance_before_save = gmp_live_allocations;
+
         v.save_to_file(out_path);
         mp_set_memory_functions(gmp_default_alloc, gmp_default_realloc, gmp_default_free);
 
+        expect(balance_before_save == 0) << "GMP releases are not counted";
         expect(gmp_live_allocations == 0) << "memory allocated through GMP must be released through GMP";
 
         std::remove(out_path);
     };
+
+#ifdef __linux__
+    "file_write_error"_test = [] {
+        // /dev/full opens fine, then every write fails with ENOSPC
+        const gmprime v(0x636261);
+        expect(throws<std::runtime_error>([&] { v.save_to_file("/dev/full"); }));
+    };
+#endif
 
     "file_read"_test = [] {
         gmprime v;
