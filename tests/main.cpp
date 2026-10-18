@@ -69,6 +69,36 @@ void naive_set_bits(const gmprime& value, std::vector<size_t>& positions) {
     }
 }
 
+// The bytes of text, the first one lowest, like a loaded file without high zero bytes
+void from_bytes(const std::string& text, gmprime& value) {
+    for (size_t i = 0; i < text.size(); ++i) {
+        value.bits(8 * i, 8) = static_cast<unsigned char>(text[i]);
+    }
+}
+
+// Longest previous factor of each byte, by comparing with every earlier position
+void naive_longest_previous_factors(const std::string& text, std::vector<uint32_t>& lpf) {
+    for (size_t i = 0; i < text.size(); ++i) {
+        uint32_t best = 0;
+        for (size_t j = 0; j < i; ++j) {
+            uint32_t length = 0;
+            while (i + length < text.size() && text[i + length] == text[j + length]) {
+                ++length;
+            }
+            best = std::max(best, length);
+        }
+        lpf.push_back(best);
+    }
+}
+
+// Deterministic pseudo-random text over the first alphabet letters
+void random_text(const size_t length, const unsigned alphabet, uint32_t seed, std::string& text) {
+    for (size_t i = 0; i < length; ++i) {
+        seed = seed * 1664525u + 1013904223u;
+        text += static_cast<char>('a' + (seed >> 16) % alphabet);
+    }
+}
+
 template<typename L>
 void check_primitive_lhs(const L lhs) {
     if constexpr (has_non_member_operators<L, gmprime>::value) {
@@ -859,13 +889,15 @@ suite<"gmprime::bit_analysis"> bit_analysis = [] {
     "histogram_small"_test = [] {
         // 0b1101 over 4 bits, sliding windows of 2 bits: bits 0-1 hold 01 (value 1), bits 1-2 hold 10
         // (value 2, bit 1 being its low bit), bits 2-3 hold 11 (value 3)
-        expect(gmprime(0b1101).histogram(2, 1) == std::vector<size_t>{0, 1, 1, 1});
-        expect(gmprime(0b1101).histogram(2) == std::vector<size_t>{0, 1, 0, 1}) << "aligned: bits 0-1, then 2-3";
+        expect(gmprime(0b1101).histogram(2, 1, 4) == std::vector<size_t>{0, 1, 1, 1});
+        expect(gmprime(0b1101).histogram(2, 0, 4) == std::vector<size_t>{0, 1, 0, 1}) << "aligned: bits 0-1, then 2-3";
         expect(gmprime(0x0F0F).histogram(4, 8) == std::vector<size_t>{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2})
             << "step wider than width: the low nibble of each byte";
         expect(gmprime(1).histogram(8, 0, 24)[0] == 2) << "explicit length: the zero bytes above count";
         expect(gmprime(-0b1101).histogram(2) == gmprime(0b1101).histogram(2)) << "on the magnitude";
-        expect(gmprime(0b1101).histogram(8) == std::vector<size_t>(256, 0)) << "no complete window";
+        expect(gmprime(0b1101).histogram(8, 0, 4) == std::vector<size_t>(256, 0)) << "no complete window";
+        expect(gmprime(0b1101).histogram(8)[0b1101] == 1) << "by default, the number in whole bytes, like a file";
+        expect(gmprime(0b1101).histogram(2)[0] == 2) << "so the high bits of its partial byte count";
     };
     "histogram_invalid_width"_test = [] {
         expect(throws<std::invalid_argument>([] { static_cast<void>(gmprime(1).histogram(0)); }));
@@ -874,10 +906,11 @@ suite<"gmprime::bit_analysis"> bit_analysis = [] {
     };
     "histogram_matches_windows"_test = [&] {
         for (const auto& value : irregular) {
+            const size_t length = (value.used_bits() + 7) / 8 * 8;
             for (const size_t width : {1, 3, 8, 13}) {
                 for (const size_t step : {size_t{1}, width, size_t{5}}) {
                     std::vector<size_t> expected(size_t{1} << width, 0);
-                    for (size_t pos = 0; pos + width <= value.used_bits(); pos += step) {
+                    for (size_t pos = 0; pos + width <= length; pos += step) {
                         const uint32_t symbol = value.bits(pos, width);
                         ++expected[symbol];
                     }
@@ -928,6 +961,136 @@ suite<"gmprime::bit_analysis"> bit_analysis = [] {
             all.bits(8 * value, 8) = value;
         }
         expect(std::fabs(gmprime::entropy(all.histogram(8)) - 8) < 1e-12);
+    };
+};
+
+// Expected values computed independently (Python), or checked against histogram() and naive versions
+suite<"gmprime::context_analysis"> context_analysis = [] {
+    const auto close = [](const double a, const double b) { return std::fabs(a - b) < 1e-9; };
+
+    "conditional_entropy_order_0"_test = [&] {
+        std::string text;
+        random_text(500, 7, 42, text);
+        gmprime value;
+        from_bytes(text, value);
+
+        for (const size_t width : {1, 3, 8, 13}) {
+            expect(close(value.conditional_entropy(0, width).naive, gmprime::entropy(value.histogram(width))));
+        }
+    };
+    "conditional_entropy_matches_histograms"_test = [&] {
+        std::string text;
+        random_text(2000, 5, 7, text);
+        gmprime value;
+        from_bytes(text, value);
+        const size_t n = text.size();
+
+        // H(X | previous symbols) = H(windows of order + 1 symbols) - H(windows of order symbols), over the
+        // same starts
+        expect(close(value.conditional_entropy(1).naive,
+                     gmprime::entropy(value.histogram(16, 8)) - gmprime::entropy(value.histogram(8, 8, 8 * (n - 1)))));
+        expect(close(value.conditional_entropy(2).naive,
+                     gmprime::entropy(value.histogram(24, 8)) - gmprime::entropy(value.histogram(16, 8, 8 * (n - 1)))));
+    };
+    "conditional_entropy_values"_test = [&] {
+        gmprime value;
+        from_bytes("abababab", value);
+        const auto alternating = value.conditional_entropy(1);
+        expect(alternating.naive == 0 && alternating.corrected == 0) << "each symbol determined by the previous one";
+        expect(alternating.contexts == 2 && alternating.samples == 7);
+
+        gmprime small;
+        from_bytes("aab", small);
+        const auto skewed = small.conditional_entropy(0);
+        expect(close(skewed.naive, 0.9182958340544896));
+        expect(close(skewed.corrected, 1.1587450075359835)) << "Miller-Madow: + (2 - 1) / (2 * 3 * ln 2)";
+
+        expect(gmprime().conditional_entropy(2).samples == 0) << "fewer symbols than the order";
+        expect(throws<std::invalid_argument>([&] { static_cast<void>(value.conditional_entropy(1, 0)); }));
+        expect(throws<std::invalid_argument>([&] { static_cast<void>(value.conditional_entropy(1, 33)); }));
+    };
+
+    "adaptive_code_length_values"_test = [&] {
+        gmprime ab, aaaa;
+        from_bytes("ab", ab);
+        from_bytes("aaaa", aaaa);
+
+        expect(close(ab.adaptive_code_length(0), 16.011227255423254));
+        expect(close(aaaa.adaptive_code_length(1), 28.126704472843187));
+        expect(gmprime().adaptive_code_length(0) == 0);
+        expect(ab.adaptive_code_length(5) == 16) << "every symbol in the uncoded prefix: width bits each";
+    };
+    "adaptive_code_length_above_entropy"_test = [&] {
+        std::string text;
+        random_text(3000, 6, 3, text);
+        gmprime value;
+        from_bytes(text, value);
+
+        // The empirical entropy is the shortest code length knowing the frequencies in advance
+        for (const size_t order : {0, 1, 2}) {
+            const auto entropy = value.conditional_entropy(order);
+            const auto bits = value.adaptive_code_length(order);
+            expect(bits > entropy.naive * static_cast<double>(entropy.samples));
+        }
+    };
+
+    "longest_previous_factors_values"_test = [] {
+        const auto lpf = [](const std::string& text) {
+            gmprime value;
+            from_bytes(text, value);
+            return value.longest_previous_factors();
+        };
+
+        expect(lpf("abcabc") == std::vector<uint32_t>{0, 0, 0, 3, 2, 1});
+        expect(lpf("aaaa") == std::vector<uint32_t>{0, 3, 2, 1}) << "a factor may overlap its occurrence";
+        expect(lpf("abab") == std::vector<uint32_t>{0, 0, 2, 1});
+        expect(lpf("a") == std::vector<uint32_t>{0});
+        expect(gmprime().longest_previous_factors().empty());
+    };
+    "longest_previous_factors_file"_test = [] {
+        const auto path = TEST_OUTPUT_DIR "repetitions.bin";
+        {
+            std::ofstream out(path, std::ios::binary);
+            out.write("ab\0\0ab\0\0", 8);
+        }
+        gmprime value;
+        value.load_from_file(path);
+
+        expect(value.longest_previous_factors() == std::vector<uint32_t>{0, 0, 0, 1, 4, 3, 2, 1})
+            << "the file's high zero bytes count";
+
+        std::remove(path);
+    };
+    "longest_previous_factors_matches_naive"_test = [] {
+        for (const unsigned alphabet : {2u, 3u, 26u}) {
+            for (const size_t length : {2, 3, 5, 8, 13, 40, 100}) {
+                for (uint32_t seed = 1; seed <= 20; ++seed) {
+                    std::string text;
+                    random_text(length, alphabet, seed, text);
+                    gmprime value;
+                    from_bytes(text, value);
+                    std::vector<uint32_t> expected;
+                    naive_longest_previous_factors(text, expected);
+
+                    expect(value.longest_previous_factors() == expected) << text;
+                }
+            }
+        }
+    };
+
+    "repetitions"_test = [] {
+        gmprime abc, aaaa;
+        from_bytes("abcabcabc", abc);
+        from_bytes("aaaa", aaaa);
+
+        const auto three = abc.repetitions(3);
+        expect(three.bytes == 9 && three.matches == 1 && three.matched_bytes == 6 && three.literals == 3);
+
+        const auto none = abc.repetitions(7);
+        expect(none.matches == 0 && none.literals == 9) << "no repeat that long";
+
+        const auto any = aaaa.repetitions(0);
+        expect(any.matches == 1 && any.matched_bytes == 3 && any.literals == 1) << "min_length 0 counts as 1";
     };
 };
 

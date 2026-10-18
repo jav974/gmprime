@@ -421,7 +421,7 @@ std::vector<size_t> gmprime::histogram(const size_t width, size_t step, size_t l
     }
 
     if (length == 0) {
-        length = std::max(used_bits(), _byte_size * CHAR_BIT);
+        length = analyzed_bits();
     }
 
     std::vector<size_t> counts(size_t{1} << width, 0);

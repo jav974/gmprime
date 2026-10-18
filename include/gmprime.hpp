@@ -169,14 +169,46 @@ public:
     // Occurrences of each symbol of width bits (1 to max_histogram_width): result[s] counts the windows
     // holding the value s, bit i of a symbol starting at bit start being bit start + i of the number (so a
     // file's bytes read as little-endian). Windows start every step bits from bit 0: step = width (default)
-    // for aligned symbols, e.g. bytes with width = 8, or step = 1 for a sliding window. Only complete windows within length bits count. length defaults to
-    // the whole number, including the size of the last loaded file: its high zero bytes are part of it.
+    // for aligned symbols, e.g. bytes with width = 8, or step = 1 for a sliding window. Only complete windows
+    // within length bits count. length defaults to the whole number in whole bytes, like a file (the high byte
+    // of a text is partial, ASCII leaving its top bit clear), and to the size of the last loaded file if larger:
+    // its high zero bytes are part of it.
     // Throws std::invalid_argument for an invalid width.
     static constexpr size_t max_histogram_width = 24;
     [[nodiscard]] std::vector<size_t> histogram(size_t width, size_t step = 0, size_t length = 0) const;
     // Shannon entropy of a histogram, in bits per symbol: a lower bound on the average size of a symbol
     // for any code that encodes symbols independently. 0 for an empty histogram.
     [[nodiscard]] static double entropy(const std::vector<size_t>& histogram);
+
+    // CONTEXT ANALYSIS, on aligned symbols of width bits (1 to 32), over the same bits as histogram():
+    // bytes of a text with width = 8. Throws std::invalid_argument for an invalid width.
+    struct context_entropy {
+        double naive;      // bits per symbol, from the observed frequencies: optimistic when contexts are rare
+        double corrected;  // bits per symbol, with the Miller-Madow correction of part of that bias
+        size_t contexts;   // distinct contexts seen
+        size_t samples;    // symbols measured: those with order symbols before them
+    };
+    // Entropy of a symbol given the order symbols before it; order 0 gives the entropy of histogram(width)
+    [[nodiscard]] context_entropy conditional_entropy(size_t order, size_t width = 8) const;
+    // Bits an adaptive order-k context model takes to code every symbol, learning the frequencies of each
+    // context as it goes (Krichevsky-Trofimov estimator; the first order symbols cost width bits each).
+    // Unlike an entropy estimate, an achievable size, learning included: comparable to real compressors.
+    [[nodiscard]] double adaptive_code_length(size_t order, size_t width = 8) const;
+
+    // REPETITIONS, on the bytes of the number from the lowest (a loaded file's bytes, in order)
+    // Longest previous factor: result[i] is the length of the longest string starting at byte i that also
+    // starts at an earlier byte (they may overlap), i.e. what an LZ77 compressor with an unbounded window
+    // can reference. Linear time from a suffix array; about 20 bytes of memory per byte.
+    [[nodiscard]] std::vector<uint32_t> longest_previous_factors() const;
+    struct repetition_stats {
+        size_t bytes;          // bytes analyzed
+        size_t matches;        // repeats referenced
+        size_t matched_bytes;  // bytes covered by them
+        size_t literals;       // bytes left: bytes - matched_bytes
+    };
+    // Greedy LZ77 parse: at each byte, a match if a repeat of at least min_length bytes starts there
+    // (the longest one), else a literal
+    [[nodiscard]] repetition_stats repetitions(size_t min_length = 4) const;
 
     template<typename word_t, std::enable_if_t<std::is_integral_v<word_t> && !std::is_same_v<word_t, bool>, bool> = true>
     void set_partial_limb(uint64_t index, word_t value);
@@ -223,6 +255,14 @@ private:
     static uintmax_t shift_count(shift_t shift);
     void shift_left(uintmax_t count);
     void shift_right(uintmax_t count);
+
+    // Number of bits the analysis functions cover: the used bits rounded up to whole bytes, or a loaded
+    // file's size if larger
+    [[nodiscard]] size_t analyzed_bits() const;
+    // Aligned symbols of width bits (1 to 32) over analyzed_bits(), complete ones only
+    [[nodiscard]] std::vector<uint32_t> symbols(size_t width) const;
+    // Bytes over analyzed_bits(), from the lowest
+    [[nodiscard]] std::vector<unsigned char> bytes() const;
 
     template<bool is_const>
     friend class bit_window;
