@@ -224,6 +224,50 @@ gmprime & gmprime::set_bit(const size_t pos, const bool value) {
     return *this;
 }
 
+bit_window<false> gmprime::bits(const size_t pos, const size_t width) {
+    return {*this, pos, width};
+}
+
+bit_window<true> gmprime::bits(const size_t pos, const size_t width) const {
+    return {*this, pos, width};
+}
+
+gmprime gmprime::read_window(const size_t pos, const size_t width) const {
+    gmprime result;
+    const auto r = result._value.get_mpz_t();
+
+    // Truncating division shifts the magnitude, whatever the sign, which is then dropped
+    mpz_tdiv_q_2exp(r, _value.get_mpz_t(), pos);
+    mpz_abs(r, r);
+    mpz_fdiv_r_2exp(r, r, width);
+
+    return result;
+}
+
+void gmprime::write_window(const size_t pos, const size_t width, const gmprime &value) {
+    // Rebuilds the magnitude from its bits below and above the window and the low width bits of value
+    // in between, then restores the sign. value is read first: it may be this number itself.
+    const auto z = _value.get_mpz_t();
+    const bool negative = mpz_sgn(z) < 0;
+    mpz_class middle, low, high;
+
+    mpz_abs(middle.get_mpz_t(), value._value.get_mpz_t());
+    mpz_fdiv_r_2exp(middle.get_mpz_t(), middle.get_mpz_t(), width);
+
+    mpz_abs(z, z);
+    mpz_fdiv_r_2exp(low.get_mpz_t(), z, pos);
+    mpz_fdiv_q_2exp(high.get_mpz_t(), z, pos + width);
+
+    mpz_mul_2exp(high.get_mpz_t(), high.get_mpz_t(), width);
+    mpz_ior(high.get_mpz_t(), high.get_mpz_t(), middle.get_mpz_t());
+    mpz_mul_2exp(high.get_mpz_t(), high.get_mpz_t(), pos);
+    mpz_ior(z, high.get_mpz_t(), low.get_mpz_t());
+
+    if (negative) {
+        mpz_neg(z, z);
+    }
+}
+
 std::string gmprime::to_string(const int base) const {
     return _value.get_str(base);
 }

@@ -506,6 +506,139 @@ suite<"gmprime::accessor"> accessor = [] {
     };
 };
 
+// Expected values computed independently (Python integers)
+suite<"gmprime::bit_window"> bit_windows = [] {
+    // 192 bits: three 64-bit limbs
+    const gmprime n("0x0123456789abcdeffedcba98765432100011223344556677", 0);
+
+    "read_unsigned"_test = [&] {
+        const uint8_t byte = n.bits(4, 8);
+        const uint32_t across_limbs = n.bits(48, 32);
+        const uint64_t limb_sized = n.bits(32, 64);
+        const uint16_t beyond_size = n.bits(1000, 13);
+
+        expect(byte == 0x67);
+        expect(across_limbs == 0x32100011u);
+        expect(limb_sized == 0x7654321000112233ull);
+        expect(beyond_size == 0);
+    };
+    "read_gmprime"_test = [&] {
+        const gmprime wide = n.bits(40, 100);
+        expect(wide == gmprime("0xdeffedcba9876543210001122", 0));
+    };
+    "read_negative_magnitude"_test = [&] {
+        const gmprime m = -n;
+        const uint8_t byte = m.bits(4, 8);
+        const gmprime wide = m.bits(40, 100);
+
+        expect(byte == 0x67);
+        expect(wide == gmprime("0xdeffedcba9876543210001122", 0));
+    };
+    "read_wider_than_type"_test = [&] {
+        expect(throws<std::overflow_error>([&] { [[maybe_unused]] const uint8_t x = n.bits(0, 9); }));
+        expect(throws<std::overflow_error>([&] { [[maybe_unused]] const uint64_t x = n.bits(0, 65); }));
+    };
+    "read_empty"_test = [&] {
+        const uint8_t x = n.bits(10, 0);
+        const gmprime g = n.bits(10, 0);
+        expect(x == 0);
+        expect(g == 0);
+    };
+    "word_access_is_a_window"_test = [&] {
+        const uint16_t window = n.bits(5 * 16, 16);
+        expect(n.operator[]<uint16_t>(5) == window);
+        expect(window == 0x7654);
+    };
+    "ostream"_test = [&] {
+        std::stringstream t;
+        t << n.bits(4, 8) << ' ' << gmprime::hex << n.bits(40, 100) << ' ' << gmprime::bin << n.bits(4, 8);
+        expect(t.str() == "103 deffedcba9876543210001122 1100111");
+    };
+    "position_width"_test = [&] {
+        const auto w = n.bits(1000, 13);
+        expect(w.position() == 1000);
+        expect(w.width() == 13);
+    };
+
+    "write_unsigned"_test = [&] {
+        gmprime a(n);
+        a.bits(4, 8) = 0xABu;
+        expect(a == gmprime("0x123456789abcdeffedcba98765432100011223344556ab7", 0));
+    };
+    "write_across_limbs"_test = [&] {
+        gmprime a(n);
+        a.bits(60, 8) = 0xFFu;
+        expect(a == gmprime("0x123456789abcdeffedcba987654321ff011223344556677", 0));
+    };
+    "write_truncates"_test = [] {
+        gmprime a;
+        a.bits(0, 4) = 0xFFu;
+        expect(a == 0xF);
+
+        gmprime b;
+        b.bits(8, 4) = gmprime(0x1FF);
+        expect(b == 0xF00);
+    };
+    "write_beyond_size"_test = [] {
+        gmprime a(1);
+        a.bits(100, 8) = 0x5Au;
+        expect(a == (gmprime(0x5A) << 100) + 1);
+    };
+    "write_keeps_sign"_test = [&] {
+        gmprime a = -n;
+        a.bits(4, 8) = 0xABu;
+        expect(a == gmprime("-0x123456789abcdeffedcba98765432100011223344556ab7", 0));
+    };
+    "write_gmprime"_test = [&] {
+        gmprime a(n);
+        a.bits(40, 100) = gmprime("0x0f0f0f0f0f0f0f0f0f0f0f0f0f", 0);
+        expect(a == gmprime("0x123456789abcf0f0f0f0f0f0f0f0f0f0f0f0f3344556677", 0));
+
+        gmprime b;
+        b.bits(0, 8) = gmprime(-5);
+        expect(b == 5) << "the magnitude of the value is written";
+    };
+    "write_zero_extends"_test = [] {
+        gmprime a = (gmprime(1) << 200) - 1;
+        a.bits(0, 100) = static_cast<uint8_t>(5);
+        expect(a == gmprime("0xfffffffffffffffffffffffff0000000000000000000000005", 0));
+    };
+    "write_empty"_test = [&] {
+        gmprime a(n);
+        a.bits(10, 0) = 0xFFu;
+        expect(a == n);
+    };
+    "write_window_copies_bits"_test = [] {
+        gmprime a(0x1234);
+        a.bits(0, 8) = a.bits(8, 8);
+        expect(a == 0x1212) << "assigning a window copies its bits, it does not rebind";
+
+        const gmprime c(0xAB);
+        a.bits(8, 8) = c.bits(0, 8);
+        expect(a == 0xAB12);
+    };
+
+    "unsigned_only"_test = [] {
+        expect(std::is_assignable_v<bit_window<false>, unsigned>);
+        expect(std::is_assignable_v<bit_window<false>, const gmprime&>);
+        expect(!std::is_assignable_v<bit_window<false>, int>) << "signed integers are refused";
+        expect(!std::is_assignable_v<bit_window<false>, bool>);
+        expect(!std::is_assignable_v<bit_window<false>, char>);
+        expect(!std::is_assignable_v<bit_window<false>, double>) << "would silently drop the sign through gmprime";
+
+        expect(std::is_convertible_v<bit_window<false>, unsigned>);
+        expect(std::is_convertible_v<bit_window<false>, gmprime>);
+        expect(!std::is_convertible_v<bit_window<false>, int>) << "signed integers are refused";
+        expect(!std::is_convertible_v<bit_window<false>, char>);
+    };
+    "const_is_read_only"_test = [] {
+        expect(std::is_convertible_v<bit_window<true>, unsigned>);
+        expect(std::is_convertible_v<bit_window<true>, gmprime>);
+        expect(!std::is_assignable_v<bit_window<true>, unsigned>);
+        expect(!std::is_assignable_v<bit_window<true>, const gmprime&>);
+    };
+};
+
 suite<"gmprime::iterator"> iterator = [] {
     "range_based_for_loop_read"_test = [] {
         gmprime r(4242);

@@ -6,7 +6,9 @@
 #include <cmath>
 #include <functional>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 #include <gmpxx.h>
 #include "../src/gmprime_ios.hpp"
@@ -19,6 +21,9 @@ class reference;
 
 template<typename T = mp_limb_t, std::enable_if_t<std::is_integral_v<T>, bool> = true>
 class word_adapter;
+
+template<bool is_const>
+class bit_window;
 
 class gmprime {
 public:
@@ -116,6 +121,17 @@ public:
     [[nodiscard]] bool get_bit(size_t pos) const;
     gmprime& set_bit(size_t pos, bool value);
 
+    // Window of width bits starting at bit pos, on the magnitude: a sign has no meaning within a window,
+    // so only unsigned integers and gmprime convert to and from it (signed integers, floating point,
+    // bool and characters are refused at compile time).
+    //   uint16_t x = a.bits(1000, 13);  // std::overflow_error if width exceeds the type, whatever the value
+    //   gmprime  g = a.bits(1000, 13);  // any width, always >= 0
+    //   a.bits(1000, 13) = 0x1ABCu;     // keeps the low width bits of the value, like a C bit field
+    //   a.bits(1000, 13) = g;           // same with the magnitude of a gmprime, any width
+    // Writing keeps the sign of the number. Aligned word access is the special case bits(i * w, w).
+    bit_window<false> bits(size_t pos, size_t width);
+    [[nodiscard]] bit_window<true> bits(size_t pos, size_t width) const;
+
     template<typename word_t, std::enable_if_t<std::is_integral_v<word_t> && !std::is_same_v<word_t, bool>, bool> = true>
     void set_partial_limb(uint64_t index, word_t value);
 
@@ -152,12 +168,20 @@ private:
     template<typename unsigned_t>
     void write_bits(size_t pos, size_t width, unsigned_t value);
 
+    // Same on windows of any width, through GMP operations
+    [[nodiscard]] gmprime read_window(size_t pos, size_t width) const;
+    void write_window(size_t pos, size_t width, const gmprime& value);
+
+    template<bool is_const>
+    friend class bit_window;
+
     mpz_class _value;
     size_t _byte_size = 0;
 };
 
 #include "../src/gmprime_reference.tpp"
 #include "../src/gmprime_adapter.tpp"
+#include "../src/gmprime_bit_window.tpp"
 #include "../src/gmprime.tpp"
 
 } // GMPrime

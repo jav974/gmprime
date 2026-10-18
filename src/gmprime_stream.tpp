@@ -35,3 +35,9 @@ std::basic_ostream<Ch, Tr> &operator <<(std::basic_ostream<Ch, Tr> &s, const GMP
 
     return s << obj.to_string(base);
 }
+
+// Printed as a gmprime, so that any width works and gmprime::bin applies
+template<class Ch, class Tr, bool is_const>
+std::basic_ostream<Ch, Tr> &operator <<(std::basic_ostream<Ch, Tr> &s, const GMPrime::bit_window<is_const> &window) {
+    return s << static_cast<GMPrime::gmprime>(window);
+}

@@ -90,3 +90,17 @@ int main() {
     return 0;
 }
 ```
+
+### Bit windows
+
+`bits(pos, width)` accesses `width` bits starting at bit `pos`, at any position and of any width. A window holds bits of the magnitude: a sign has no meaning in it, so only unsigned integers and `gmprime` convert to and from it.
+
+```cpp
+gmprime n("0x0123456789abcdef", 0);
+
+uint8_t byte = n.bits(4, 8);     // 0xde; std::overflow_error if the window is wider than the type
+gmprime wide = n.bits(8, 40);    // 0x456789abcd, any width
+n.bits(0, 4) = 0u;               // keeps the low 4 bits of the value, like a C bit field
+
+std::cout << gmprime::hex << n;  // 123456789abcde0
+```
