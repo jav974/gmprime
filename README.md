@@ -123,6 +123,16 @@ for (const size_t pos : (text & mask).set_bits()) {
 }
 ```
 
+Symbol statistics count the values of `width`-bit windows, aligned or sliding, over the whole number (a loaded file's high zero bytes included):
+
+```cpp
+std::vector<size_t> bytes = text.histogram(8);       // bytes[c]: occurrences of the byte c
+std::vector<size_t> sliding = text.histogram(8, 1);  // 8-bit windows starting at every bit
+double bits_per_byte = gmprime::entropy(bytes);      // Shannon entropy, in bits per symbol
+```
+
+The entropy of a histogram is a lower bound for any code encoding its symbols independently of each other. Compressors that model context or repetitions can go below it.
+
 ### Integer behavior
 
 A `gmprime` is used like an `int`: arithmetic, bitwise and comparison operators (with a primitive on either side), `if (a)`, streams with every formatting flag (`std::showbase`, `std::setw`...) and `>>`, `abs`, `gcd`, `lcm`, `to_string`, `std::hash` and `std::numeric_limits`. Comparisons with a floating point value are exact: `gmprime(5) < 5.5`.
