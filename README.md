@@ -152,6 +152,59 @@ size_t covered = parse.matched_bytes;              // also parse.matches, parse.
 
 Entropy estimates keep decreasing with the order, as contexts get too rare to be measured reliably: `adaptive_code_length` is the honest figure, the bits a context model actually takes to code the data while learning it, comparable to the output of a real compressor. Repetitions are what dictionary compressors (LZ77, xz) reference, and no context model sees them.
 
+### Folds
+
+Fold a bit field at width L, like fabric, and bits L apart stack up. `autocorrelation` measures, for every distance, how many bits equal the one that far ahead, with one shift, XOR and popcount of the whole number per distance:
+
+```cpp
+auto self = data.autocorrelation(4096);
+// Peaks of self[d] / (self[0] - d) are fold widths: 1728 bits for the rows of a fax image,
+// 104 bits for 13-byte records, about a line length for formatted text
+```
+
+### Coding toolkit
+
+`#include <gmprime_coding.hpp>` adds the tools to build a compressor on gmprime: models that predict each bit from what precedes it, and an arithmetic coder whose output, the compressed message, is a `gmprime`.
+
+| Tool | Role |
+|---|---|
+| `bit_counter`, `bit_history`, `history_map` | adaptive probability of a bit; a context's bit history and the probability learned for it across contexts |
+| `hashed_table`, `checked_table`, `context_slot`, `last_byte_slot` | statistics per context hash, with an 8-bit checksum against collisions for `checked_table` |
+| `logistic_mixer`, `probability_map` | online mixing of the predictions, then refinement of the result |
+| `match_model` | predicts that a repeat of the last bytes continues |
+| `line_tracker`, `classify`, `capitals_encode` / `capitals_decode` | text: column and byte above, character classes, reversible lowercasing |
+| `stream_bit`, `bit_template` | bit geometry: neighbourhoods across folds, in 2D or 3D |
+| `cost_profile` | bits spent on each byte, to see where a model pays |
+| `arithmetic_encoder`, `arithmetic_decoder` | 32-bit binary arithmetic coder on 12-bit probabilities |
+
+A minimal order-2 compressor:
+
+```cpp
+using namespace GMPrime::coding;
+
+gmprime file;
+file.load_from_file("data.txt");
+const auto data = file.bytes();
+
+arithmetic_encoder encoder;
+hashed_counters counters(22);
+std::vector<uint8_t> history;
+for (const uint8_t byte : data) {
+    const uint64_t context = context_hash(history, history.size(), 2);
+    for (uint32_t c0 = 1, i = 0; i < 8; ++i) {
+        auto& counter = counters.at(context * 256 + c0);
+        const int bit = (byte >> (7 - i)) & 1;
+        encoder.encode(bit, clamp_probability(counter.p));
+        counter.update(bit, 255);
+        c0 = (c0 << 1) | bit;
+    }
+    history.push_back(byte);
+}
+encoder.finish().save_to_file("data.gmc");  // the decoder mirrors the loop with arithmetic_decoder
+```
+
+Every model is causal, so a decoder rebuilds the same predictions from the bits it has already decoded. Mixing several orders, a match model and text contexts with these tools, a research compressor reaches 1.95 bits per character on `alice29.txt` (bzip2: 2.27), and folding at the detected width halves the size of a fax image compared to xz.
+
 ### Integer behavior
 
 A `gmprime` is used like an `int`: arithmetic, bitwise and comparison operators (with a primitive on either side), `if (a)`, streams with every formatting flag (`std::showbase`, `std::setw`...) and `>>`, `abs`, `gcd`, `lcm`, `to_string`, `std::hash` and `std::numeric_limits`. Comparisons with a floating point value are exact: `gmprime(5) < 5.5`.
