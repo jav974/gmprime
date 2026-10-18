@@ -72,6 +72,8 @@ docker compose run --rm gcc-amd64   # a single one (see compose.yaml for the lis
 
 Sources are mounted read-only and build trees are kept in Docker volumes, so later runs only rebuild what changed. The non-native architecture runs emulated. `docker compose down -v` removes the build volumes.
 
+Before pushing, `docker/coverage.sh` measures coverage like the CI and lists the lines added since `main` (or the revision given as argument), committed or not, that no test executes: what Codecov reports as patch coverage.
+
 ## Basic usage
 
 ```cpp
@@ -123,7 +125,7 @@ for (const size_t pos : (text & mask).set_bits()) {
 }
 ```
 
-Symbol statistics count the values of `width`-bit windows, aligned or sliding, over the whole number (a loaded file's high zero bytes included):
+Symbol statistics count the values of `width`-bit windows, aligned or sliding, over the whole number in whole bytes, like a file (a loaded file's high zero bytes included):
 
 ```cpp
 std::vector<size_t> bytes = text.histogram(8);       // bytes[c]: occurrences of the byte c
@@ -132,6 +134,23 @@ double bits_per_byte = gmprime::entropy(bytes);      // Shannon entropy, in bits
 ```
 
 The entropy of a histogram is a lower bound for any code encoding its symbols independently of each other. Compressors that model context or repetitions can go below it.
+
+### Context and repetitions
+
+The two kinds of structure compressors exploit can be measured on their own: the context of each symbol (which byte tends to follow which), and repeats of whole strings.
+
+```cpp
+auto order2 = text.conditional_entropy(2);         // entropy of a byte given the 2 before it
+double naive = order2.naive;                       // bits per byte, optimistic when contexts are rare
+double corrected = order2.corrected;               // with the Miller-Madow correction
+double bits = text.adaptive_code_length(2);        // achievable size of an adaptive order-2 model
+
+auto lpf = text.longest_previous_factors();        // lpf[i]: longest string at byte i seen before
+auto parse = text.repetitions(4);                  // greedy LZ77 parse with repeats of 4 bytes or more
+size_t covered = parse.matched_bytes;              // also parse.matches, parse.literals
+```
+
+Entropy estimates keep decreasing with the order, as contexts get too rare to be measured reliably: `adaptive_code_length` is the honest figure, the bits a context model actually takes to code the data while learning it, comparable to the output of a real compressor. Repetitions are what dictionary compressors (LZ77, xz) reference, and no context model sees them.
 
 ### Integer behavior
 
