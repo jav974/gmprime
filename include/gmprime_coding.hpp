@@ -13,6 +13,7 @@
 #include <memory>
 #include <new>
 #include <optional>
+#include <stdexcept>
 #include <type_traits>
 #include <vector>
 #include "gmprime.hpp"
@@ -75,9 +76,7 @@ inline int stretch(const int p16) {
             }
             next = std::max(next, v + 1);
         }
-        for (int i = next; i < 65536; ++i) {
-            t[static_cast<size_t>(i)] = 3071;
-        }
+        // squash(3071) is 65535: every probability has its value
         return t;
     }();
     return table[static_cast<size_t>(std::min(65535, std::max(0, p16)))];
@@ -615,6 +614,180 @@ inline int table_bits(const size_t data_bytes, const int max_bits = 22, const in
         ++bits;
     }
     return std::max(bits, min_bits);
+}
+
+// ENUMERATIVE CODING
+
+// Mixed radix: digits d_i, each below its radix r_i, as one number ((d_0 r_1 + d_1) r_2 + d_2)..., below the
+// product of the radices: numbers in different bases (the ranks of blocks, each below its own binomial) packed
+// without losing a fraction of a bit each. Combined over a product tree, so that m digits cost about log m
+// multiplications of the result's size rather than m
+struct radix_number {
+    gmprime value;
+    gmprime radix;
+};
+
+inline radix_number mixed_radix_pack(const std::vector<gmprime>& digits, const std::vector<gmprime>& radices) {
+    const auto pack = [&](const auto& self, const size_t first, const size_t last) -> radix_number {
+        if (last - first == 1) {
+            return {digits[first], radices[first]};
+        }
+        const size_t middle = first + (last - first) / 2;
+        const auto high = self(self, first, middle);
+        const auto low = self(self, middle, last);
+        return {high.value * low.radix + low.value, high.radix * low.radix};
+    };
+    return digits.empty() ? radix_number{0, 1} : pack(pack, 0, digits.size());
+}
+
+// The digits of value, given the radices
+inline std::vector<gmprime> mixed_radix_unpack(const gmprime& value, const std::vector<gmprime>& radices) {
+    std::vector<gmprime> digits(radices.size());
+    const auto product = [&](const auto& self, const size_t first, const size_t last) -> gmprime {
+        if (last - first == 1) {
+            return radices[first];
+        }
+        const size_t middle = first + (last - first) / 2;
+        return self(self, first, middle) * self(self, middle, last);
+    };
+    // Splits the digits [first, last) by the product of the radices of their lower half. Only GMP arithmetic,
+    // which never throws (it aborts on allocation failure)
+    const auto split = [&](const auto& self, const gmprime& number, const size_t first, const size_t last) noexcept -> void {
+        if (last - first == 1) {
+            digits[first] = number;
+            return;
+        }
+        const size_t middle = first + (last - first) / 2;
+        const gmprime low_radix = product(product, middle, last);
+        gmprime high, low;
+        mpz_tdiv_qr(high.get_value().get_mpz_t(), low.get_value().get_mpz_t(), number.get_value().get_mpz_t(), low_radix.get_value().get_mpz_t());
+        self(self, high, first, middle);
+        self(self, low, middle, last);
+    };
+    if (!radices.empty()) {
+        split(split, value, 0, radices.size());
+    }
+    return digits;
+}
+
+// A bit field of length bits ranked in blocks of block_bits (the last one shorter): the bits set in each block,
+// what a model codes, and the blocks' combination ranks packed into one number below radix, the product of
+// their C(block length, ones). Linear in the length, where one rank of the whole field is quadratic.
+// Throws std::invalid_argument for blocks of 0 bits, or a bit set at or beyond length
+struct block_ranks {
+    std::vector<size_t> ones;
+    gmprime rank;
+    gmprime radix;
+};
+
+inline block_ranks rank_blocks(const gmprime& bits, const size_t length, const size_t block_bits) {
+    if (block_bits == 0 || bits.used_bits() > length) {
+        throw std::invalid_argument("Blocks of 0 bits, or bits beyond the length");
+    }
+    block_ranks result;
+    std::vector<gmprime> ranks, radices;
+    for (size_t start = 0; start < length; start += block_bits) {
+        const size_t size = std::min(block_bits, length - start);
+        const gmprime block = bits.bits(start, size);
+        result.ones.push_back(block.popcount());
+        ranks.push_back(block.combination_rank(size));
+        radices.push_back(gmprime::binomial(size, result.ones.back()));
+    }
+    auto packed = mixed_radix_pack(ranks, radices);
+    result.rank = std::move(packed.value);
+    result.radix = std::move(packed.radix);
+    return result;
+}
+
+// The bit field of rank_blocks, from the bits set in each block and the packed rank
+inline gmprime unrank_blocks(const std::vector<size_t>& ones, const gmprime& rank, const size_t length, const size_t block_bits) {
+    std::vector<gmprime> radices;
+    for (size_t b = 0; b < ones.size(); ++b) {
+        radices.push_back(gmprime::binomial(std::min(block_bits, length - b * block_bits), ones[b]));
+    }
+    const auto ranks = mixed_radix_unpack(rank, radices);
+    gmprime bits;
+    for (size_t b = 0; b < ones.size(); ++b) {
+        const size_t size = std::min(block_bits, length - b * block_bits);
+        bits.bits(b * block_bits, size) = gmprime::from_combination_rank(ranks[b], size, ones[b]);
+    }
+    return bits;
+}
+
+// Number of arrangements of counts[b] bytes b: n! / (product of the count!), n their total
+inline gmprime multiset_arrangements(const std::vector<size_t>& counts) {
+    gmprime result = 1;
+    // Built count by count: times C(n + count, count). GMP's C functions never throw
+    [&]() noexcept {
+        mpz_class binomial;
+        unsigned long n = 0;
+        for (const auto count : counts) {
+            n += static_cast<unsigned long>(count);
+            mpz_bin_uiui(binomial.get_mpz_t(), n, static_cast<unsigned long>(count));
+            result.get_value() *= binomial;
+        }
+    }();
+    return result;
+}
+
+// Rank of a byte sequence among the arrangements of its bytes: once the histogram is known, the arrangement
+// is all that is left to code, in about log2 of multiset_arrangements bits. Sequences are ordered as words,
+// first byte first. Quadratic time, as combination_rank
+inline gmprime multiset_rank(const std::vector<uint8_t>& sequence) {
+    std::vector<size_t> counts(256);
+    for (const auto byte : sequence) {
+        ++counts[byte];
+    }
+    // arrangements: of the bytes from i on. Those starting with a byte b number arrangements * counts[b] / (n - i)
+    mpz_class rank = 0, arrangements = multiset_arrangements(counts).get_value();
+    for (size_t i = 0; i < sequence.size(); ++i) {
+        const auto left = static_cast<unsigned long>(sequence.size() - i);
+        unsigned long below = 0;
+        for (size_t b = 0; b < sequence[i]; ++b) {
+            below += static_cast<unsigned long>(counts[b]);
+        }
+        mpz_class skipped = arrangements * below;
+        mpz_divexact_ui(skipped.get_mpz_t(), skipped.get_mpz_t(), left);
+        rank += skipped;
+        mpz_mul_ui(arrangements.get_mpz_t(), arrangements.get_mpz_t(), static_cast<unsigned long>(counts[sequence[i]]));
+        mpz_divexact_ui(arrangements.get_mpz_t(), arrangements.get_mpz_t(), left);
+        --counts[sequence[i]];
+    }
+    gmprime result;
+    result.get_value() = rank;
+    return result;
+}
+
+// The sequence of the given rank among the arrangements of counts[b] bytes b, b from 0 to 255.
+// Throws std::invalid_argument if rank is negative or not below their number
+inline std::vector<uint8_t> from_multiset_rank(const gmprime& rank, std::vector<size_t> counts) {
+    counts.resize(256);
+    mpz_class arrangements = multiset_arrangements(counts).get_value();
+    if (rank < 0 || rank.get_value() >= arrangements) {
+        throw std::invalid_argument("No arrangement of rank " + rank.to_string());
+    }
+    size_t n = 0;
+    for (const auto count : counts) {
+        n += count;
+    }
+    std::vector<uint8_t> sequence;
+    sequence.reserve(n);
+    mpz_class left = rank.get_value();
+    for (size_t i = 0; i < n; ++i) {
+        // The first byte b whose arrangements, arrangements * counts[b] / (n - i), reach beyond the rank left
+        for (size_t b = 0;; ++b) {
+            mpz_class with_b = arrangements * static_cast<unsigned long>(counts[b]);
+            mpz_divexact_ui(with_b.get_mpz_t(), with_b.get_mpz_t(), static_cast<unsigned long>(n - i));
+            if (left < with_b) {
+                arrangements = with_b;
+                sequence.push_back(static_cast<uint8_t>(b));
+                --counts[b];
+                break;
+            }
+            left -= with_b;
+        }
+    }
+    return sequence;
 }
 
 // CRC-32 of bytes (the one of zip and png), to check that a message decoded to the original data. crc continues

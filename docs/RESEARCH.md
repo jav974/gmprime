@@ -89,6 +89,31 @@ Combining all that was kept, with `analyze_folds` choosing between the text and 
 The biggest contributors on text, measured by removing each: word contexts (6,018 bytes), the adaptive-order
 mixer (2,782), chained maps (2,407), the learning-rate schedule (1,524).
 
+### Enumerative coding
+
+The data as the result of a count rather than of a prediction: knowing the length n and the k bits set, the
+field is one of C(n, k) arrangements, coded by its rank (`combination_rank`). Exact rank in one pass, the current
+binomial updated by a small multiplication and an exact division per bit: quadratic time, 0.2 s for 10^6 bits
+at density 0.01 but 18 s at 0.5. Blocks of 4,096 bits ranked separately and packed in mixed radix
+(`rank_blocks`) take 0.03 to 0.08 s, 0.03% to 0.85% above log2 C(n, k).
+
+Masks of 10^6 bits, sizes in bits (k included):
+
+| Mask | k | log2 C(n, k) | Rank | Adaptive order 0 | Adaptive order 12 |
+|---|---|---|---|---|---|
+| random | 100 | 1,488 | 1,487 | 1,640 | 1,672 |
+| random | 10,000 | 80,805 | 80,804 | 81,176 | 81,544 |
+| clustered | 1,000 | 11,421 | 11,412 | 9,264 | **5,632** |
+| clustered | 100,000 | 469,006 | 469,005 | 465,000 | **369,416** |
+
+On real files, in bytes: bit planes ranked in blocks give alice29.txt 110,820, ptt5 158,771; the arrangement of
+the bytes given their counts (`multiset_rank`) alice29.txt 86,823, kennedy.xls 452,542; gmz 35,563 and 12,970.
+
+The rank is optimal for given rules and pays nothing to learn, 0.4% to 10% better than adaptive coding on random
+positions, most on small streams. But it sees only the counts: any structure beyond them goes to context models,
+by far. Uses: small sparse side streams (exception positions, flags), sets and permutations (a dictionary), and
+it is the one tool so far where big-number arithmetic is the algorithm itself.
+
 ## Speed
 
 Starting point: about 150 KB/s per pass, and gmz compresses twice (with and without capitals, or full and bitmap

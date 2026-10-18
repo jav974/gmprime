@@ -175,6 +175,19 @@ if (folds.strong()) {               // the best width stands out: bitmap rows, f
 
 To build a compressor from these measurements, see the [coding toolkit](#coding-toolkit).
 
+### Enumerative coding
+
+A bit field of `n` bits with `k` of them set is one of `C(n, k)` arrangements. Its rank among them is a number below `C(n, k)`: `log2 C(n, k)` bits, exactly the information left once `n` and `k` are known.
+
+```cpp
+gmprime mask = ...;                                       // 10,000 bits, 100 of them set
+gmprime rank = mask.combination_rank(10'000);             // 804 bits, where the positions take 1,400
+gmprime same = gmprime::from_combination_rank(rank, 10'000, 100);
+gmprime count = gmprime::binomial(10'000, 100);           // the number of arrangements
+```
+
+The length is given because leading zeros are part of the field. Ranking takes time quadratic in the length: for long fields, `rank_blocks` in the [coding toolkit](#enumerative-coding-1) ranks blocks and packs their ranks into one number. The rank is the shortest code for bits whose only regularity is their count, such as a random sparse mask. Data with more structure, like text or images, is better served by context models.
+
 ### Integer behavior
 
 A `gmprime` is used like an `int`: arithmetic, bitwise and comparison operators (with a primitive on either side), `if (a)`, streams with every formatting flag (`std::showbase`, `std::setw`...) and `>>`, `abs`, `gcd`, `lcm`, `to_string`, `std::hash` and `std::numeric_limits`. Comparisons with a floating point value are exact: `gmprime(5) < 5.5`.
@@ -242,6 +255,14 @@ A table takes `2^bits` times the slot size: 32 MB for `checked_table<context_slo
 | `stream_bits(bytes, first, count)` | up to 57 consecutive stream bits in one word read, the first one highest; bits before the start (`first` may be negative) and beyond the end are 0 |
 | `compiled_template(distances)` | `bit_template` prepared once: `at(bytes, pos)` gives the same context, reading each run of consecutive distances (`L + 1, L, L - 1`...) as one word. For templates used at every bit |
 | `runs_at(bytes, pos, width)` | pixel runs of a bitmap folded at `width` bits: `left`, the run of equal bits ending before `pos`, and `above`, how far the bit above stays the same to the right |
+
+### Enumerative coding
+
+| Tool | Role |
+|---|---|
+| `rank_blocks(bits, length, block_bits)`, `unrank_blocks(ones, rank, length, block_bits)` | a bit field ranked by blocks: the bits set in each block (`ones`, for a model to code) and the blocks' combination ranks packed into one number below `radix`, the product of their binomials. Linear time, and the counts per block follow the density where it changes |
+| `mixed_radix_pack(digits, radices)`, `mixed_radix_unpack(value, radices)` | numbers in different bases, each below its own radix, as one number: no fraction of a bit lost per number. Over a product tree, so packing many is fast |
+| `multiset_rank(bytes)`, `from_multiset_rank(rank, counts)`, `multiset_arrangements(counts)` | the same for bytes: once the count of each byte value is known, the rank of their order among the `n! / (product of count!)` arrangements |
 
 ### Coding and measuring
 

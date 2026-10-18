@@ -274,6 +274,19 @@ public:
     [[nodiscard]] bool is_divisible_by(const gmprime& other) const;
     [[nodiscard]] gmprime next_prime() const;
     [[nodiscard]] static gmprime factorial(unsigned int n);
+    // C(n, k), the number of ways to choose k items among n (0 if k > n)
+    [[nodiscard]] static gmprime binomial(unsigned long n, unsigned long k);
+
+    // ENUMERATIVE CODING. A bit field of length bits with ones = popcount() bits set is one of C(length, ones)
+    // arrangements. combination_rank is its index among them (combinatorial number system: the i-th bit set
+    // from the lowest, i from 1, at position p, adds C(p, i)), below C(length, ones): about log2 C(length, ones)
+    // bits, the information left in the field once length and ones are known. from_combination_rank rebuilds
+    // the field. Both take O(length) steps on numbers of that size, so quadratic time: rank long fields in
+    // blocks (rank_blocks in gmprime_coding.hpp).
+    // Throws std::invalid_argument if a bit is set at or beyond length
+    [[nodiscard]] gmprime combination_rank(size_t length) const;
+    // Throws std::invalid_argument if ones exceeds length or rank is negative or not below C(length, ones)
+    [[nodiscard]] static gmprime from_combination_rank(const gmprime& rank, size_t length, size_t ones);
 private:
     // Bit field access on the magnitude, limb by limb with masks and shifts: independent of the
     // machine endianness and of the word width relative to the limb width. width must not exceed the bits of unsigned_t

@@ -1631,6 +1631,75 @@ suite<"gmprime::coding"> coding_suite = [] {
         expect(table_bits(10'000'000, 24) == 24 && table_bits(100, 22, 10) == 12);
     };
 
+    "mixed_radix"_test = [] {
+        // (2 * 1 + 0) * 5 + 4
+        const std::vector<gmprime> digits{2, 0, 4}, radices{3, 1, 5};
+        const auto packed = mixed_radix_pack(digits, radices);
+        expect(packed.value == 14 && packed.radix == 15);
+        expect(mixed_radix_unpack(packed.value, radices) == digits);
+
+        const auto none = mixed_radix_pack({}, {});
+        expect(none.value == 0 && none.radix == 1 && mixed_radix_unpack(0, {}).empty());
+
+        std::vector<gmprime> many, bases;
+        for (unsigned i = 0; i < 37; ++i) {
+            bases.emplace_back(gmprime::binomial(40 + i, i % 9));
+            many.emplace_back((bases.back() - 1) * (i % 3) / 2);
+        }
+        expect(mixed_radix_unpack(mixed_radix_pack(many, bases).value, bases) == many);
+    };
+
+    "rank_blocks"_test = [] {
+        std::string text;
+        random_text(150, 5, 11, text);
+        const gmprime field = gmprime::from_bytes(std::vector<uint8_t>(text.begin(), text.end())) & ~gmprime(text.size() % 2);
+        const size_t length = text.size() * 8 + 3;
+
+        const auto blocks = rank_blocks(field, length, 64);
+        expect(blocks.ones.size() == (length + 63) / 64) << "the last block shorter";
+        size_t ones = 0;
+        gmprime radix = 1;
+        for (size_t b = 0; b < blocks.ones.size(); ++b) {
+            ones += blocks.ones[b];
+            radix *= gmprime::binomial(std::min<size_t>(64, length - b * 64), blocks.ones[b]);
+        }
+        expect(ones == field.popcount() && blocks.radix == radix && blocks.rank < radix);
+        expect(unrank_blocks(blocks.ones, blocks.rank, length, 64) == field);
+
+        expect(throws<std::invalid_argument>([&] { [[maybe_unused]] const auto r = rank_blocks(field, length, 0); }));
+        expect(throws<std::invalid_argument>([&] { [[maybe_unused]] const auto r = rank_blocks(field, 8, 4); }));
+    };
+
+    "multiset_rank"_test = [] {
+        const auto rank = [](const std::string& text) { return multiset_rank(std::vector<uint8_t>(text.begin(), text.end())); };
+        expect(rank("aab") == 0 && rank("aba") == 1 && rank("baa") == 2);
+        expect(rank("") == 0 && rank("zzz") == 0);
+
+        std::vector<size_t> counts(256);
+        counts['a'] = 2;
+        counts['b'] = 1;
+        expect(multiset_arrangements(counts) == 3);
+        const auto text = [&](const gmprime& r) {
+            const auto bytes = from_multiset_rank(r, counts);
+            return std::string(bytes.begin(), bytes.end());
+        };
+        expect(text(0) == "aab" && text(2) == "baa");
+        expect(from_multiset_rank(0, {}).empty()) << "no bytes, one arrangement";
+
+        std::string sentence;
+        random_text(200, 9, 3, sentence);
+        const std::vector<uint8_t> bytes(sentence.begin(), sentence.end());
+        std::vector<size_t> histogram(256);
+        for (const auto byte : bytes) {
+            ++histogram[byte];
+        }
+        const gmprime r = multiset_rank(bytes);
+        expect(r < multiset_arrangements(histogram) && from_multiset_rank(r, histogram) == bytes);
+
+        expect(throws<std::invalid_argument>([&] { [[maybe_unused]] const auto s = from_multiset_rank(3, counts); }));
+        expect(throws<std::invalid_argument>([&] { [[maybe_unused]] const auto s = from_multiset_rank(-1, counts); }));
+    };
+
     "crc32"_test = [] {
         const std::string text = "123456789";
         const std::vector<uint8_t> bytes(text.begin(), text.end());
@@ -2190,6 +2259,48 @@ suite<"gmprime::math"> math = [] {
     };
     "factorial"_test = [] {
         expect(gmprime::factorial(5) == 120);
+    };
+    "binomial"_test = [] {
+        expect(gmprime::binomial(5, 2) == 10 && gmprime::binomial(0, 0) == 1 && gmprime::binomial(3, 5) == 0);
+        expect(gmprime::binomial(100, 50) == gmprime("100891344545564193334812497256"));
+    };
+    "combination_rank"_test = [] {
+        // The i-th bit set adds C(position, i): 0b1100 is the last of the C(4, 2) = 6 arrangements
+        expect(gmprime(0b1).combination_rank(4) == 0 && gmprime(0b1000).combination_rank(4) == 3);
+        expect(gmprime(0b0011).combination_rank(4) == 0 && gmprime(0b1100).combination_rank(4) == 5);
+        expect(gmprime(0).combination_rank(10) == 0 && gmprime(0).combination_rank(0) == 0);
+
+        // Every field of 7 bits: the ranks of each count of ones are 0 to C(7, ones) - 1, and come back
+        bool exact = true;
+        std::vector<std::vector<bool>> seen(8);
+        for (size_t ones = 0; ones <= 7; ++ones) {
+            seen[ones].resize(gmprime::binomial(7, ones).to_primitive<size_t>());
+        }
+        for (unsigned v = 0; v < 128; ++v) {
+            const gmprime field(v);
+            const gmprime rank = field.combination_rank(7);
+            const size_t ones = field.popcount();
+            exact = exact && rank < gmprime::binomial(7, ones) && !seen[ones][rank.to_primitive<size_t>()];
+            seen[ones][rank.to_primitive<size_t>()] = true;
+            exact = exact && gmprime::from_combination_rank(rank, 7, ones) == field;
+        }
+        expect(exact);
+
+        // A long sparse field, with leading zeros kept by the length
+        gmprime sparse;
+        for (size_t p = 3; p < 2000; p += 37 + p % 11) {
+            sparse.get_value() |= mpz_class(1) << static_cast<mp_bitcnt_t>(p);
+        }
+        const gmprime rank = sparse.combination_rank(2500);
+        expect(rank < gmprime::binomial(2500, sparse.popcount()));
+        expect(gmprime::from_combination_rank(rank, 2500, sparse.popcount()) == sparse);
+        expect(gmprime::from_combination_rank(0, 0, 0) == 0 && gmprime::from_combination_rank(0, 5, 0) == 0);
+        expect(gmprime::from_combination_rank(0, 3, 3) == 0b111) << "the only arrangement";
+
+        expect(throws<std::invalid_argument>([] { [[maybe_unused]] const auto r = gmprime(0b10000).combination_rank(4); }));
+        expect(throws<std::invalid_argument>([] { [[maybe_unused]] const auto f = gmprime::from_combination_rank(6, 4, 2); }));
+        expect(throws<std::invalid_argument>([] { [[maybe_unused]] const auto f = gmprime::from_combination_rank(0, 4, 5); }));
+        expect(throws<std::invalid_argument>([] { [[maybe_unused]] const auto f = gmprime::from_combination_rank(-1, 4, 2); }));
     };
     "next_prime_number"_test = [] {
         const gmprime v(42);
