@@ -733,6 +733,127 @@ suite<"gmprime::bit_window"> bit_windows = [] {
     };
 };
 
+// Each function is also checked against a naive bit-by-bit version on large irregular numbers
+suite<"gmprime::bit_analysis"> bit_analysis = [] {
+    // Bits 3, 64 and 200: in the first, second and fourth limbs
+    const gmprime sparse = (gmprime(1) << 3) + (gmprime(1) << 64) + (gmprime(1) << 200);
+    const gmprime factorial = gmprime::factorial(300);
+    const std::vector<gmprime> irregular = {
+        factorial,
+        factorial.next_prime(),
+        (gmprime(1) << 1000) - 1,
+        gmprime("0x0123456789abcdeffedcba9876543210", 0),
+    };
+
+    const auto naive_set_bits = [](const gmprime& value) {
+        std::vector<size_t> positions;
+        for (size_t pos = 0; pos < value.used_bits(); ++pos) {
+            if (value.get_bit(pos)) {
+                positions.push_back(pos);
+            }
+        }
+        return positions;
+    };
+
+    "popcount"_test = [&] {
+        expect(gmprime().popcount() == 0);
+        expect(gmprime(0xFF).popcount() == 8);
+        expect(sparse.popcount() == 3);
+        expect(((gmprime(1) << 1000) - 1).popcount() == 1000);
+        expect(gmprime(-0xFF).popcount() == 8) << "the magnitude, not an infinity of two's complement bits";
+
+        for (const auto& value : irregular) {
+            expect(value.popcount() == naive_set_bits(value).size());
+        }
+    };
+    "popcount_text_file"_test = [] {
+        const auto path = TEST_OUTPUT_DIR "popcount.txt";
+        {
+            std::ofstream out(path, std::ios::binary);
+            out << "abc";
+        }
+
+        gmprime text;
+        text.load_from_file(path);
+        expect(text.popcount() == 10) << "a = 0x61, b = 0x62, c = 0x63: 3 + 3 + 4 bits set";
+
+        std::remove(path);
+    };
+
+    "hamming_distance"_test = [&] {
+        expect(gmprime(0b1010).hamming_distance(gmprime(0b0110)) == 2);
+        expect(gmprime(1).hamming_distance(sparse) == 4) << "operands of different sizes: bits 0, 3, 64 and 200";
+        expect(sparse.hamming_distance(gmprime(1)) == 4) << "symmetric";
+        expect(gmprime().hamming_distance(sparse) == sparse.popcount());
+        expect(gmprime(-5).hamming_distance(gmprime(5)) == 0) << "on the magnitudes";
+
+        for (const auto& a : irregular) {
+            for (const auto& b : irregular) {
+                expect(a.hamming_distance(b) == (a ^ b).popcount());
+            }
+        }
+    };
+
+    "next_set_bit"_test = [&] {
+        expect(sparse.next_set_bit() == 3);
+        expect(sparse.next_set_bit(3) == 3);
+        expect(sparse.next_set_bit(4) == 64) << "skips the rest of a limb";
+        expect(sparse.next_set_bit(65) == 200) << "skips whole zero limbs";
+        expect(sparse.next_set_bit(201) == gmprime::npos);
+        expect(sparse.next_set_bit(100000) == gmprime::npos);
+        expect(gmprime().next_set_bit() == gmprime::npos);
+        expect(gmprime(-8).next_set_bit() == 3) << "on the magnitude";
+    };
+
+    "next_clear_bit"_test = [] {
+        expect(gmprime(0b0111).next_clear_bit() == 3);
+        expect(gmprime(0b0111).next_clear_bit(5) == 5);
+        expect(((gmprime(1) << 64) - 1).next_clear_bit() == 64) << "beyond the magnitude, bits are clear";
+        expect(((gmprime(1) << 130) - 1).next_clear_bit(10) == 130) << "skips whole full limbs";
+        expect(((gmprime(1) << 130) - 1).next_clear_bit(1000) == 1000);
+        expect(gmprime().next_clear_bit(7) == 7);
+        expect(gmprime(-7).next_clear_bit() == 3) << "on the magnitude";
+    };
+
+    "set_bits"_test = [&] {
+        const std::vector<size_t> positions(sparse.set_bits().begin(), sparse.set_bits().end());
+        expect(positions == std::vector<size_t>{3, 64, 200});
+
+        const auto empty = gmprime().set_bits();
+        expect(empty.begin() == empty.end());
+
+        for (const auto& value : irregular) {
+            const auto range = value.set_bits();
+            expect(std::vector<size_t>(range.begin(), range.end()) == naive_set_bits(value));
+        }
+    };
+    "set_bits_temporary"_test = [&] {
+        // The temporary would be destroyed before the loop runs if the range only pointed to it
+        std::vector<size_t> positions;
+        for (const size_t pos : (sparse | gmprime(1)).set_bits()) {
+            positions.push_back(pos);
+        }
+        expect(positions == std::vector<size_t>{0, 3, 64, 200});
+
+        // Copies and moves of an owning range keep a valid number
+        auto owning = (sparse & gmprime(0xFF)).set_bits();
+        const auto copy = owning;
+        const auto moved = std::move(owning);
+        expect(std::vector<size_t>(copy.begin(), copy.end()) == std::vector<size_t>{3});
+        expect(std::vector<size_t>(moved.begin(), moved.end()) == std::vector<size_t>{3});
+    };
+    "set_bits_iterator"_test = [&] {
+        const auto range = sparse.set_bits();
+        auto it = range.begin();
+
+        expect(*it == 3);
+        expect(*it++ == 3) << "postfix returns the previous position";
+        expect(*it == 64);
+        expect(std::distance(range.begin(), range.end()) == 3);
+        expect(std::is_same_v<std::iterator_traits<set_bit_iterator>::iterator_category, std::forward_iterator_tag>);
+    };
+};
+
 suite<"gmprime::iterator"> iterator = [] {
     "range_based_for_loop_read"_test = [] {
         gmprime r(4242);

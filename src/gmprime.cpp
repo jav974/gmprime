@@ -284,6 +284,133 @@ void gmprime::write_window(const size_t pos, const size_t width, const gmprime &
     }
 }
 
+namespace {
+
+// mpn_popcount and mpn_hamdist return an unsigned long, 32 bits on Windows: count by chunks small enough
+constexpr auto max_counted_limbs = static_cast<size_t>(std::min<uintmax_t>(
+    std::numeric_limits<mp_bitcnt_t>::max() / GMP_NUMB_BITS,
+    static_cast<uintmax_t>(std::numeric_limits<mp_size_t>::max())));
+
+size_t popcount_limbs(const mp_limb_t *limbs, size_t count) {
+    size_t total = 0;
+
+    while (count > 0) {
+        const auto chunk = std::min(count, max_counted_limbs);
+        total += mpn_popcount(limbs, static_cast<mp_size_t>(chunk));
+        limbs += chunk;
+        count -= chunk;
+    }
+
+    return total;
+}
+
+size_t hamdist_limbs(const mp_limb_t *a, const mp_limb_t *b, size_t count) {
+    size_t total = 0;
+
+    while (count > 0) {
+        const auto chunk = std::min(count, max_counted_limbs);
+        total += mpn_hamdist(a, b, static_cast<mp_size_t>(chunk));
+        a += chunk;
+        b += chunk;
+        count -= chunk;
+    }
+
+    return total;
+}
+
+// Index of the lowest bit set in a non-zero limb
+size_t lowest_set_bit(mp_limb_t limb) {
+#if defined(__GNUC__) || defined(__clang__)
+    return static_cast<size_t>(__builtin_ctzll(limb));
+#else
+    size_t index = 0;
+    while ((limb & 1) == 0) {
+        limb >>= 1;
+        ++index;
+    }
+    return index;
+#endif
+}
+
+} // namespace
+
+// mpz_popcount, mpz_hamdist, mpz_scan0 and mpz_scan1 use two's complement for negative values (an infinity of
+// bits set), so these work on the limbs of the magnitude directly
+
+size_t gmprime::popcount() const {
+    const auto z = _value.get_mpz_t();
+    return popcount_limbs(mpz_limbs_read(z), mpz_size(z));
+}
+
+size_t gmprime::hamming_distance(const gmprime &other) const {
+    const auto a = _value.get_mpz_t();
+    const auto b = other._value.get_mpz_t();
+    const auto size_a = mpz_size(a);
+    const auto size_b = mpz_size(b);
+    const auto common = std::min(size_a, size_b);
+    const auto longer = size_a > size_b ? mpz_limbs_read(a) : mpz_limbs_read(b);
+
+    // Beyond the shorter magnitude, every bit set in the longer one differs
+    return hamdist_limbs(mpz_limbs_read(a), mpz_limbs_read(b), common)
+           + popcount_limbs(longer + common, std::max(size_a, size_b) - common);
+}
+
+size_t gmprime::next_set_bit(const size_t from) const {
+    constexpr size_t limb_bits = GMP_NUMB_BITS;
+    const auto z = _value.get_mpz_t();
+    const auto size = mpz_size(z);
+    const auto limbs = mpz_limbs_read(z);
+    auto index = from / limb_bits;
+
+    if (index >= size) {
+        return npos;
+    }
+
+    // Ignores the bits below from in its limb, then skips zero limbs whole
+    auto limb = limbs[index] & (~static_cast<mp_limb_t>(0) << (from % limb_bits));
+
+    while (limb == 0) {
+        if (++index == size) {
+            return npos;
+        }
+        limb = limbs[index];
+    }
+
+    return index * limb_bits + lowest_set_bit(limb);
+}
+
+size_t gmprime::next_clear_bit(const size_t from) const {
+    constexpr size_t limb_bits = GMP_NUMB_BITS;
+    const auto z = _value.get_mpz_t();
+    const auto size = mpz_size(z);
+    const auto limbs = mpz_limbs_read(z);
+    auto index = from / limb_bits;
+
+    if (index >= size) {
+        return from;
+    }
+
+    // Same as next_set_bit on the inverted limbs, the bits beyond the magnitude being clear
+    auto limb = ~limbs[index] & (~static_cast<mp_limb_t>(0) << (from % limb_bits));
+
+    while (limb == 0) {
+        if (++index == size) {
+            return size * limb_bits;
+        }
+        limb = ~limbs[index];
+    }
+
+    return index * limb_bits + lowest_set_bit(limb);
+}
+
+set_bit_range gmprime::set_bits() const & {
+    return set_bit_range(*this);
+}
+
+set_bit_range gmprime::set_bits() && {
+    return set_bit_range(std::move(*this));
+}
+
 std::string gmprime::to_string(const int base) const {
     return _value.get_str(base);
 }

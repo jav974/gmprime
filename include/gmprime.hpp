@@ -5,8 +5,11 @@
 #include <climits>
 #include <cmath>
 #include <functional>
+#include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -24,6 +27,8 @@ class word_adapter;
 
 template<bool is_const>
 class bit_window;
+
+class set_bit_range;
 
 class gmprime {
 public:
@@ -143,6 +148,23 @@ public:
     bit_window<false> bits(size_t pos, size_t width);
     [[nodiscard]] bit_window<true> bits(size_t pos, size_t width) const;
 
+    // BIT ANALYSIS, on the magnitude like every bit access
+    static constexpr size_t npos = std::numeric_limits<size_t>::max();
+    // Number of bits set
+    [[nodiscard]] size_t popcount() const;
+    // Number of bits that differ from other (Hamming distance)
+    [[nodiscard]] size_t hamming_distance(const gmprime& other) const;
+    // Position of the first bit set at or after from, npos if there is none
+    [[nodiscard]] size_t next_set_bit(size_t from = 0) const;
+    // Position of the first clear bit at or after from: always found, the magnitude being followed by zeros
+    [[nodiscard]] size_t next_clear_bit(size_t from = 0) const;
+    // Positions of the bits set, in increasing order: for (const size_t pos : a.set_bits()) ...
+    // Skips clear bits a limb at a time, so its cost follows the number of bits set more than the size.
+    // Iterators are invalidated by any change to the number. On a temporary, the range keeps the number,
+    // so that for (const size_t pos : (a & mask).set_bits()) does not dangle.
+    [[nodiscard]] set_bit_range set_bits() const &;
+    [[nodiscard]] set_bit_range set_bits() &&;
+
     template<typename word_t, std::enable_if_t<std::is_integral_v<word_t> && !std::is_same_v<word_t, bool>, bool> = true>
     void set_partial_limb(uint64_t index, word_t value);
 
@@ -199,6 +221,7 @@ private:
 #include "../src/gmprime_reference.tpp"
 #include "../src/gmprime_adapter.tpp"
 #include "../src/gmprime_bit_window.tpp"
+#include "../src/gmprime_set_bits.hpp"
 #include "../src/gmprime.tpp"
 
 // Free functions, found by argument-dependent lookup like the ones for an int: abs(a), gcd(a, b).
