@@ -165,7 +165,8 @@ auto self = data.autocorrelation(4096);
 `analyze_folds` does the search for you, in stream order (each byte from its highest bit, the order of a bitmap's pixels, which `stream_order()` gives to any number), and scores each width against independent bits:
 
 ```cpp
-auto folds = data.analyze_folds();  // widths from 64 to 8192 bits
+auto folds = data.analyze_folds();  // widths from 64 to 8192 bits; analyze_folds(64, 8192, 131072)
+                                    // looks at the first 128 KB only, much sooner on large data
 if (folds.strong()) {               // the best width stands out: bitmap rows, fixed-size records
     folds.width;                    // bits per row
     folds.layer;                    // rows per layer, for a 3D view (0: none)
@@ -204,6 +205,7 @@ The differences are deliberate:
 | Tool | Role |
 |---|---|
 | `stretch(p)`, `squash(x)` | the logistic domain, `ln(p / (1 - p))` and its inverse, where predictions are mixed |
+| `stretch_fast(p)`, `squash_fast(x)` | the same from tables (probabilities on 16 bits, squash interpolated over [-12, 12]), without a logarithm or an exponential per call: what to use in a model's inner loop |
 | `clamp_probability(p)`, `probability_12(p)` | keep `p` within the coder's 12 bits |
 | `bit_counter` | adaptive probability: `update(bit, limit)` moves `p` toward the bit at rate `1 / (n + 1.5)`, fast at first, then more slowly as `n` grows up to `limit` (high for stable data, low to follow changes); `seen()` tells whether it learned anything |
 | `bit_history` | the counts of 0s and 1s seen in a context in one byte (`zeros()`, `ones()`, up to 15), recent bits weighing more |
@@ -215,7 +217,7 @@ The differences are deliberate:
 |---|---|
 | `context_hash(history, pos, order)` | hash of the `order` bytes before `pos`, distinct per order |
 | `hashed_table<T>(bits)` | `2^bits` slots of type `T`; `at(hash)` returns the slot of a context, colliding contexts sharing it; `hashed_counters` holds `bit_counter`s |
-| `checked_table<T>(bits)` | the same with an 8-bit checksum in each slot: a context landing on another's slot resets it rather than sharing its statistics (`T` needs a `check` field) |
+| `checked_table<T>(bits)` | the same with an 8-bit checksum in each slot: a context landing on another's slot resets it rather than sharing its statistics (`T` needs a `check` field). Created from zeroed memory, so only touched pages are used. `prefetch(hash)` brings a slot into cache ahead of time, e.g. both possible slots of the next bit; `at(hash, offset)` addresses 16 adjacent slots per hash, e.g. the nodes of a nibble |
 | `context_slot` | 8 bytes per context: a probability (as `bit_counter`), its `bit_history` and the checksum; `update(bit, limit)` updates both |
 | `last_byte_slot` | the byte that followed the context last time and how many times in a row (`update(byte)`); `expected_bit(c0, bit_count)` predicts its next bit, or -1 if the byte coded so far disagrees |
 
@@ -225,7 +227,7 @@ A table takes `2^bits` times the slot size: 32 MB for `checked_table<context_slo
 
 | Tool | Role |
 |---|---|
-| `logistic_mixer(inputs, sets, rate)` | combines predictions: `add(x)` each input (usually `stretch(p)`, 0 for "no idea"), `mix(set)` returns `p`, `update(bit)` learns the weights. Each set has its own weights, chosen by a small context (e.g. `c0`), so the mixer learns whom to trust when; `set_rate` changes the learning rate, e.g. decreasing over time |
+| `logistic_mixer(inputs, sets, rate)` | combines predictions: `add(x)` each input (usually `stretch(p)`, 0 for "no idea"), `mix(set)` returns `p`, `update(bit)` learns the weights. Each set has its own weights, chosen by a small context (e.g. `c0`), so the mixer learns whom to trust when; `set_rate` changes the learning rate, e.g. decreasing over time. `mix(inputs, set)` reads a `std::vector<float>` kept by the caller instead: several mixers can share the same inputs without copying them |
 | `probability_map(contexts, rate)` | refines a probability given a context: `refine(p, context)`, then `update(bit)`. Averaged with its input, it corrects what the mixer systematically gets wrong |
 | `match_model(min_length)` | finds the last earlier occurrence of the last `min_length` bytes and predicts that what followed comes again: `byte_added(history)` after each byte, `expected_bit(history, c0, bit_count)`, `length()` of the match, `miss()` when a prediction fails |
 
@@ -386,22 +388,31 @@ gmz d data.gmz data.txt    # decompress
 gmz t data.txt             # compress, decompress, check, report
 ```
 
-It analyzes the file first with `analyze_folds`. Data that folds is coded with bit and byte templates across the fold, in 2D and 3D, and pixel runs; anything else with the text model: orders 0 to 8, words, line structure, last occurrences, indirect modeling, four mixers selected by the partial byte, the highest order seen, the previous byte and its class, and chained probability maps. It tries the capitals transform on text, and a bitmap variant on folded data, and keeps the smaller message. Options: `-m` forces a mode, `-C` the capitals transform, `-T` a table size.
+It analyzes the file first with `analyze_folds`. Data that folds is coded with bit and byte templates across the fold, in 2D and 3D, and pixel runs; anything else with the text model: orders 0 to 8, words, line structure, last occurrences, indirect modeling, four mixers selected by the partial byte, the highest order seen, the previous byte and its class, and chained probability maps. It tries the capitals transform on text, and a bitmap variant on folded data, and keeps the smaller message. The two ways are compared on the first 64 KB, then the data is compressed once. Options: `-m` forces a mode, `-C` the capitals transform, `-S` the sample (0 compresses the data both ways, slower and sometimes a little smaller), `-T` a table size.
 
 On the Canterbury corpus, sizes in bytes:
 
 | File | Size | gzip -9 | bzip2 -9 | xz -9e | gmz | Mode found |
 |---|---|---|---|---|---|---|
-| alice29.txt | 152,089 | 54,194 | 43,202 | 48,536 | **35,562** | text + capitals |
+| alice29.txt | 152,089 | 54,194 | 43,202 | 48,536 | **35,563** | text + capitals |
 | asyoulik.txt | 125,179 | 48,803 | 39,569 | 44,600 | **33,542** | text + capitals |
-| lcet10.txt | 426,754 | 144,462 | 107,706 | 119,496 | **86,054** | text |
-| plrabn12.txt | 481,861 | 194,357 | 145,577 | 165,464 | **123,305** | text |
-| ptt5 (fax image) | 513,216 | 52,238 | 49,759 | 39,868 | **21,860** | fold of 1728 bits |
-| kennedy.xls | 1,029,744 | 207,053 | 130,280 | 51,876 | **12,968** | fold of 104 bits, layers of 4 |
-| cp.html | 24,603 | 7,960 | 7,624 | 7,660 | **6,173** | text + capitals |
+| lcet10.txt | 426,754 | 144,462 | 107,706 | 119,496 | **86,149** | text + capitals |
+| plrabn12.txt | 481,861 | 194,357 | 145,577 | 165,464 | **123,382** | text + capitals |
+| ptt5 (fax image) | 513,216 | 52,238 | 49,759 | 39,868 | **21,861** | fold of 1728 bits |
+| kennedy.xls | 1,029,744 | 207,053 | 130,280 | 51,876 | **12,970** | fold of 104 bits, layers of 4 |
+| cp.html | 24,603 | 7,960 | 7,624 | 7,660 | **6,174** | text + capitals |
 | fields.c | 11,150 | 3,136 | 3,039 | 3,040 | **2,319** | text + capitals |
 | grammar.lsp | 3,721 | 1,246 | 1,283 | 1,300 | **990** | text |
-| sum | 38,240 | 12,854 | 12,909 | 9,508 | **9,408** | text |
+| sum | 38,240 | 12,854 | 12,909 | 9,508 | **9,409** | text |
 | xargs.1 | 4,227 | 1,756 | 1,762 | 1,820 | **1,440** | text + capitals |
 
-The price is speed, as for every context-mixing compressor: about 0.9 s to decompress `alice29.txt` and 1.9 s to compress it (two tries, with and without capitals), against hundredths of a second for the others, and up to about 800 MB of memory for large inputs (tables are sized for the data, so small files take much less). Decompression is a single pass of the same model, so it takes about as long as one compression try.
+The price is speed, as for every context-mixing compressor. On Apple Silicon:
+
+| File | gmz compress | gmz decompress | xz -9e compress | xz decompress |
+|---|---|---|---|---|
+| alice29.txt | 1.2 s | 0.5 s | 0.05 s | 0.01 s |
+| lcet10.txt | 1.8 s | 1.3 s | 0.08 s | 0.01 s |
+| ptt5 | 1.8 s | 1.1 s | 0.15 s | 0.01 s |
+| kennedy.xls | 6.0 s | 5.2 s | 0.40 s | 0.02 s |
+
+Memory reaches about 800 MB for large inputs (tables are sized for the data, so small files take much less). Decompression runs the same model once, so it takes about as long as compressing does after the comparison. How these times were reached, 2.2 to 4.4 times faster than the first version, is told in [docs/RESEARCH.md](docs/RESEARCH.md).
