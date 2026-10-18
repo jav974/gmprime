@@ -9,7 +9,11 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <memory>
+#include <new>
 #include <optional>
+#include <type_traits>
 #include <vector>
 #include "gmprime.hpp"
 
@@ -27,6 +31,36 @@ inline double squash(const double x) {
 // Keeps a probability codable on 12 bits
 inline double clamp_probability(const double p) {
     return std::min(std::max(p, 1.0 / 4096), 4095.0 / 4096);
+}
+
+// stretch(clamp_probability(p)) from a table of probabilities on 16 bits: no logarithm per call
+inline double stretch_fast(const double p) {
+    static const auto table = [] {
+        std::vector<float> values(65536);
+        for (int i = 0; i < 65536; ++i) {
+            values[i] = static_cast<float>(stretch(clamp_probability((i + 0.5) / 65536)));
+        }
+        return values;
+    }();
+    const auto index = static_cast<int>(p * 65536);
+    return table[static_cast<size_t>(std::min(65535, std::max(0, index)))];
+}
+
+// squash(x) from a table over [-12, 12] with linear interpolation, clamped beyond (where squash leaves the
+// 12-bit range anyway): no exponential per call
+inline double squash_fast(const double x) {
+    constexpr int steps = 8192;
+    static const auto table = [] {
+        std::vector<double> values(steps + 1);
+        for (int i = 0; i <= steps; ++i) {
+            values[i] = squash(-12 + 24.0 * i / steps);
+        }
+        return values;
+    }();
+    const double s = (std::min(11.9999, std::max(-12.0, x)) + 12) * (steps / 24.0);
+    const auto i = static_cast<size_t>(s);
+    const double w = s - static_cast<double>(i);
+    return table[i] * (1 - w) + table[i + 1] * w;
 }
 
 // 64-bit hash finalizer (MurmurHash3): spreads close context values over a table
@@ -48,6 +82,18 @@ inline uint64_t context_hash(const std::vector<uint8_t>& history, const size_t p
     return h;
 }
 
+// 1 / (n + 1.5) for n up to 1023, the learning rates of the counters, without a division per update
+inline float counter_rate(const int n) {
+    static const auto table = [] {
+        std::vector<float> values(1024);
+        for (int i = 0; i < 1024; ++i) {
+            values[i] = static_cast<float>(1 / (i + 1.5));
+        }
+        return values;
+    }();
+    return table[static_cast<size_t>(n)];
+}
+
 // Adaptive probability that a bit is 1: moves toward each bit at rate 1 / (n + 1.5), fast while few bits
 // were seen, then more slowly as n grows up to limit (a higher limit suits more stationary data)
 struct bit_counter {
@@ -59,7 +105,7 @@ struct bit_counter {
     }
 
     void update(const int bit, const int limit) {
-        p += static_cast<float>((bit - p) / (n + 1.5));
+        p += (static_cast<float>(bit) - p) * counter_rate(n);
         if (n < limit) {
             ++n;
         }
@@ -150,7 +196,7 @@ struct context_slot {
     }
 
     void update(const int bit, const int limit) {
-        p += static_cast<float>((bit - p) / (n + 1.5));
+        p += (static_cast<float>(bit) - p) * counter_rate(n);
         if (n < limit) {
             ++n;
         }
@@ -191,12 +237,40 @@ struct last_byte_slot {
 template<typename T>
 class checked_table {
 public:
-    explicit checked_table(const int bits): _slots(size_t{1} << bits), _mask((size_t{1} << bits) - 1) {
+    // Zeroed memory from calloc: a slot of zero bytes holds checksum 0, which no context has, so it reads as
+    // empty, and the system provides the pages only once touched (fast to create, light on small inputs)
+    explicit checked_table(const int bits)
+        : _slots(static_cast<T*>(std::calloc(size_t{1} << bits, sizeof(T)))), _mask((size_t{1} << bits) - 1) {
+        static_assert(std::is_trivially_copyable_v<T>, "slots are created from zeroed memory");
+        if (!_slots) {
+            throw std::bad_alloc(); // LCOV_EXCL_LINE: sanitizers abort on such a request rather than return null
+        }
     }
 
     T& at(const uint64_t hash) {
+        return at(hash, 0, ~size_t{0});
+    }
+
+    // Asks the processor to bring the slot of hash into cache, without reading it: to overlap the memory
+    // latency of the next accesses with the work on the current ones
+    void prefetch(const uint64_t hash) const {
+#if defined(__GNUC__) || defined(__clang__)
+        __builtin_prefetch(&_slots.get()[hash_mix(hash) & _mask]);
+#else
+        static_cast<void>(hash);
+#endif
+    }
+
+    // Slot offset (below 16) of a bucket of 16 adjacent slots shared by one hash: e.g. the nodes of a nibble's
+    // bit tree, so that coding a nibble touches one bucket instead of a slot anywhere for each bit
+    T& at(const uint64_t hash, const size_t offset) {
+        return at(hash, offset, ~size_t{15});
+    }
+
+private:
+    T& at(const uint64_t hash, const size_t offset, const size_t base_mask) {
         const uint64_t h = hash_mix(hash);
-        auto& slot = _slots[h & _mask];
+        auto& slot = _slots.get()[(h & _mask & base_mask) | offset];
         // Never 0, so that a fresh slot always takes its first context's checksum
         const auto check = static_cast<uint8_t>((h >> 56) | 1);
         if (slot.check != check) {
@@ -206,8 +280,13 @@ public:
         return slot;
     }
 
-private:
-    std::vector<T> _slots;
+    struct free_deleter {
+        void operator()(T* slots) const {
+            std::free(slots);
+        }
+    };
+
+    std::unique_ptr<T, free_deleter> _slots;
     size_t _mask;
 };
 
@@ -418,34 +497,61 @@ private:
 class logistic_mixer {
 public:
     logistic_mixer(const size_t inputs, const size_t sets, const double rate, const double initial_weight = 0.3)
-        : _weights(inputs * sets, initial_weight), _inputs(inputs), _rate(rate) {
+        : _weights(inputs * sets, static_cast<float>(initial_weight)), _inputs(inputs), _rate(rate) {
         _x.reserve(inputs);
     }
 
     void add(const double x) {
-        _x.push_back(x);
+        _x.push_back(static_cast<float>(x));
     }
 
     // Adds several inputs at once, in order: cheaper than one add per input when they are many
-    void add(const std::vector<double>& inputs) {
+    void add(const std::vector<float>& inputs) {
         _x.insert(_x.end(), inputs.begin(), inputs.end());
+    }
+
+    void add(const std::vector<double>& inputs) {
+        for (const double x : inputs) {
+            add(x);
+        }
     }
 
     // Mixes the inputs added since the last update with the weights of set
     double mix(const size_t set) {
+        const double p = mix(_x, set);
+        _in = nullptr;
+        return p;
+    }
+
+    // Mixes inputs kept by the caller, without copying them: they must stay unchanged until update
+    double mix(const std::vector<float>& inputs, const size_t set) {
         _set = set;
-        double dot = 0;
-        for (size_t i = 0; i < _x.size(); ++i) {
-            dot += _weights[_set * _inputs + i] * _x[i];
+        _in = &inputs;
+        const float* w = &_weights[_set * _inputs];
+        const float* x = inputs.data();
+        const size_t n = inputs.size();
+        // Four partial sums, independent so that they run in parallel (vector instructions)
+        float s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+        size_t i = 0;
+        for (; i + 4 <= n; i += 4) {
+            s0 += w[i] * x[i];
+            s1 += w[i + 1] * x[i + 1];
+            s2 += w[i + 2] * x[i + 2];
+            s3 += w[i + 3] * x[i + 3];
         }
-        _p = clamp_probability(squash(dot));
+        for (; i < n; ++i) {
+            s0 += w[i] * x[i];
+        }
+        _p = clamp_probability(squash_fast((s0 + s1) + (s2 + s3)));
         return _p;
     }
 
     void update(const int bit) {
-        const double err = bit - _p;
-        for (size_t i = 0; i < _x.size(); ++i) {
-            _weights[_set * _inputs + i] += _rate * err * _x[i];
+        const auto step = static_cast<float>(_rate * (bit - _p));
+        float* w = &_weights[_set * _inputs];
+        const auto& x = _in ? *_in : _x;
+        for (size_t i = 0; i < x.size(); ++i) {
+            w[i] += step * x[i];
         }
         _x.clear();
     }
@@ -456,7 +562,10 @@ public:
     }
 
 private:
-    std::vector<double> _weights, _x;
+    std::vector<float> _weights, _x;
+    // The caller's inputs given to the last mix, or nullptr for the inputs added to the mixer itself (a
+    // pointer to _x would dangle once the mixer is copied or moved)
+    const std::vector<float>* _in = nullptr;
     size_t _inputs, _set = 0;
     double _rate, _p = 0.5;
 };
@@ -466,8 +575,12 @@ private:
 class probability_map {
 public:
     probability_map(const size_t contexts, const double rate): _values(contexts * 33), _rate(rate) {
-        for (size_t i = 0; i < _values.size(); ++i) {
-            _values[i] = static_cast<float>(squash((static_cast<int>(i % 33) - 16) / 2.0));
+        // The same 33 values in every context: computed once, then copied
+        for (size_t i = 0; i < 33 && i < _values.size(); ++i) {
+            _values[i] = static_cast<float>(squash((static_cast<int>(i) - 16) / 2.0));
+        }
+        for (size_t i = 33; i < _values.size(); ++i) {
+            _values[i] = _values[i - 33];
         }
     }
 

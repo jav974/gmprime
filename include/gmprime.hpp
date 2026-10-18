@@ -236,8 +236,10 @@ public:
         }
     };
     // Searches the fold widths from min_width to max_width bits (at most a quarter of the data), in stream
-    // order: the width where bits most resemble the bits one row before, then the best layer of rows
-    [[nodiscard]] fold_analysis analyze_folds(size_t min_width = 64, size_t max_width = 8192) const;
+    // order: the width where bits most resemble the bits one row before, then the best layer of rows. With
+    // sample_bytes > 0, only the first sample_bytes bytes are analyzed: the cost grows with the size, and the
+    // first 128 KB find the same folds as whole files in the Canterbury corpus.
+    [[nodiscard]] fold_analysis analyze_folds(size_t min_width = 64, size_t max_width = 8192, size_t sample_bytes = 0) const;
 
     template<typename word_t, std::enable_if_t<std::is_integral_v<word_t> && !std::is_same_v<word_t, bool>, bool> = true>
     void set_partial_limb(uint64_t index, word_t value);

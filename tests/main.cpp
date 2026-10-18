@@ -1174,6 +1174,12 @@ suite<"gmprime::context_analysis"> context_analysis = [] {
         const auto tiny = gmprime(5).analyze_folds();
         expect(tiny.width == 0 && !tiny.strong()) << "too short to search";
         expect(value.analyze_folds(100, 50).width == 0) << "no width to search";
+
+        // A sample of 40 rows finds the same fold; a sample larger than the data analyzes all of it
+        const auto sampled = gmprime::from_bytes(bitmap).analyze_folds(64, 8192, width * 40 / 8);
+        expect(sampled.width == width && sampled.strong());
+        const auto all = gmprime::from_bytes(bitmap).analyze_folds(64, 8192, bitmap.size() * 2);
+        expect(all.width == folds.width && all.score == folds.score && all.layer == folds.layer);
     };
 };
 
@@ -1185,6 +1191,22 @@ suite<"gmprime::coding"> coding_suite = [] {
         expect(std::fabs(squash(stretch(0.8)) - 0.8) < 1e-12);
         expect(clamp_probability(0) == 1.0 / 4096 && clamp_probability(1) == 4095.0 / 4096);
         expect(probability_12(0.5) == 2048 && probability_12(0) == 1 && probability_12(1) == 4095);
+    };
+
+    "logistic_tables"_test = [] {
+        // The tables stay within what the 12-bit coder can tell apart
+        double worst_stretch = 0, worst_squash = 0;
+        for (double p = 0.0005; p < 0.9995; p += 0.0007) {
+            worst_stretch = std::max(worst_stretch, std::fabs(stretch_fast(p) - stretch(clamp_probability(p))));
+        }
+        for (double x = -12; x <= 12; x += 0.013) {
+            worst_squash = std::max(worst_squash, std::fabs(squash_fast(x) - squash(x)));
+        }
+        expect(worst_stretch < 0.01) << "stretch_fast error" << worst_stretch;
+        expect(worst_squash < 1e-5) << "squash_fast error" << worst_squash;
+        expect(stretch_fast(0) == stretch_fast(-1) && stretch_fast(1) == stretch_fast(2)) << "clamped";
+        expect(squash_fast(100) == squash_fast(12) && squash_fast(-100) == squash_fast(-12));
+        expect(std::fabs(counter_rate(0) - 1 / 1.5) < 1e-7 && std::fabs(counter_rate(1023) - 1 / 1024.5) < 1e-9);
     };
 
     "bit_counter"_test = [] {
@@ -1253,6 +1275,22 @@ suite<"gmprime::coding"> coding_suite = [] {
         expect(!table.at(other).seen()) << "another context resets the slot instead of sharing it";
         expect(!table.at(0).seen()) << "and the newest context owns it";
     };
+    "checked_table_buckets"_test = [] {
+        checked_table<context_slot> table(10);
+        table.prefetch(42);
+        expect(!table.at(42).seen()) << "a prefetch changes nothing";
+
+        // The 16 offsets of one hash are distinct slots, all owned by that hash
+        for (size_t offset = 0; offset < 16; ++offset) {
+            table.at(7, offset).update(1, 30);
+            table.at(7, offset).n = static_cast<uint16_t>(offset + 1);
+        }
+        bool distinct = true;
+        for (size_t offset = 0; offset < 16; ++offset) {
+            distinct = distinct && table.at(7, offset).n == offset + 1;
+        }
+        expect(distinct);
+    };
 
     "context_slot"_test = [] {
         context_slot slot;
@@ -1299,7 +1337,8 @@ suite<"gmprime::coding"> coding_suite = [] {
 
         mixer.add(1);
         mixer.add(0.3);
-        expect(std::fabs(mixer.mix(1) - squash(0.39)) < 1e-9) << "other sets keep their initial weights";
+        // Within the precision of float weights and of squash_fast
+        expect(std::fabs(mixer.mix(1) - squash(0.39)) < 1e-5) << "other sets keep their initial weights";
         mixer.update(1);
 
         mixer.set_rate(0);
@@ -1323,6 +1362,38 @@ suite<"gmprime::coding"> coding_suite = [] {
             one_by_one.update(i % 3 == 0);
             at_once.update(i % 3 == 0);
         }
+    };
+
+    "logistic_mixer_shared_inputs"_test = [] {
+        // The same inputs given in place, added one by one, or added as doubles mix and learn the same way
+        logistic_mixer shared(3, 2, 0.05), added(3, 2, 0.05), doubles(3, 2, 0.05);
+        const std::vector<float> inputs{0.5f, -1.0f, 2.0f};
+        const std::vector<double> inputs_double{0.5, -1, 2};
+        for (int i = 0; i < 30; ++i) {
+            for (const float x : inputs) {
+                added.add(x);
+            }
+            doubles.add(inputs_double);
+            const double p = shared.mix(inputs, i % 2);
+            expect(p == added.mix(i % 2) && p == doubles.mix(i % 2));
+            shared.update(i % 3 == 0);
+            added.update(i % 3 == 0);
+            doubles.update(i % 3 == 0);
+        }
+
+        // A copy of a mixer holding its own inputs learns from its copy of them
+        logistic_mixer original(2, 1, 0.05);
+        original.add(1.0);
+        original.add(0.5);
+        const double before = original.mix(0);
+        logistic_mixer copy = original;
+        original.update(1);
+        copy.update(1);
+        original.add(1.0);
+        original.add(0.5);
+        copy.add(1.0);
+        copy.add(0.5);
+        expect(original.mix(0) == copy.mix(0) && copy.mix(0) > before);
     };
 
     "probability_map"_test = [] {
