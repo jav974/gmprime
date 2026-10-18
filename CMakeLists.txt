@@ -13,6 +13,18 @@ set(CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/CMake/Modules)
 find_package(GMP REQUIRED)
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra")
+
+# Warnings are errors when developing gmprime, not when it is built as a dependency:
+# a newer compiler with new warnings must not break the projects using it
+if (PROJECT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
+    set(GMPRIME_WARNINGS_AS_ERRORS_DEFAULT ON)
+else ()
+    set(GMPRIME_WARNINGS_AS_ERRORS_DEFAULT OFF)
+endif ()
+option(GMPRIME_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ${GMPRIME_WARNINGS_AS_ERRORS_DEFAULT})
+if (GMPRIME_WARNINGS_AS_ERRORS)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror")
+endif ()
 # Useful troubleshooting flags in release mode
 #set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -g")
 #set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -fsanitize=address -fno-omit-frame-pointer")

@@ -1,6 +1,11 @@
+#include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
+#include <stdexcept>
 #include <sys/stat.h>
+#include <unordered_map>
+#include <unordered_set>
 #include <boost/ut.hpp>
 #include <gmprime.hpp>
 
@@ -22,6 +27,38 @@ struct has_non_member_operators<L, R, std::void_t<
     decltype(std::declval<L>() ^ std::declval<R>()),
     decltype(std::declval<L>() == std::declval<R>()),
     decltype(std::declval<L>() < std::declval<R>())>> : std::true_type {};
+
+template<typename T, typename = void>
+struct has_postfix_increment : std::false_type {};
+
+template<typename T>
+struct has_postfix_increment<T, std::void_t<decltype(std::declval<T&>()++)>> : std::true_type {};
+
+template<typename T, typename = void>
+struct has_postfix_decrement : std::false_type {};
+
+template<typename T>
+struct has_postfix_decrement<T, std::void_t<decltype(std::declval<T&>()--)>> : std::true_type {};
+
+// GMP memory functions that count live allocations, delegating to the default ones
+void* (*gmp_default_alloc)(size_t);
+void* (*gmp_default_realloc)(void*, size_t, size_t);
+void (*gmp_default_free)(void*, size_t);
+long gmp_live_allocations = 0;
+
+void* counting_alloc(const size_t size) {
+    ++gmp_live_allocations;
+    return gmp_default_alloc(size);
+}
+
+void* counting_realloc(void* ptr, const size_t old_size, const size_t new_size) {
+    return gmp_default_realloc(ptr, old_size, new_size);
+}
+
+void counting_free(void* ptr, const size_t size) {
+    --gmp_live_allocations;
+    gmp_default_free(ptr, size);
+}
 
 template<typename L>
 void check_primitive_lhs(const L lhs) {
@@ -77,6 +114,42 @@ suite<"gmprime::ctor"> ctor = [] {
         const gmprime v("2a", 16);
         expect(v == 42);
     };
+
+    "ctor_string_invalid"_test = [] {
+        expect(throws<std::invalid_argument>([] { [[maybe_unused]] const gmprime v("12x4"); }));
+        expect(throws<std::invalid_argument>([] { [[maybe_unused]] const gmprime v(""); }));
+        expect(throws<std::invalid_argument>([] { [[maybe_unused]] const gmprime v("2", 2); }));
+    };
+
+    "ctor_string_invalid_base"_test = [] {
+        expect(throws<std::invalid_argument>([] { [[maybe_unused]] const gmprime v("1", 1); }));
+        expect(throws<std::invalid_argument>([] { [[maybe_unused]] const gmprime v("1", 63); }));
+        expect(throws<std::invalid_argument>([] { [[maybe_unused]] const gmprime v("1", -2); }));
+        expect(gmprime("0x2a", 0) == 42) << "base 0 detects the base from the prefix";
+    };
+
+    "ctor_floating_point_non_finite"_test = [] {
+        expect(throws<std::domain_error>([] { [[maybe_unused]] const gmprime v(std::numeric_limits<double>::infinity()); }));
+        expect(throws<std::domain_error>([] { [[maybe_unused]] const gmprime v(std::numeric_limits<double>::quiet_NaN()); }));
+    };
+
+    "ctor_64_bit_extremes"_test = [] {
+        expect(gmprime(std::numeric_limits<int64_t>::min()) == gmprime("-9223372036854775808"));
+        expect(gmprime(std::numeric_limits<int64_t>::max()) == gmprime("9223372036854775807"));
+        expect(gmprime(std::numeric_limits<uint64_t>::max()) == gmprime("18446744073709551615"));
+    };
+
+#ifdef __SIZEOF_INT128__
+    // Wider than long on every platform: exercises the path used for 64-bit integers where long is 32 bits (e.g. Windows)
+    "ctor_wider_than_long"_test = [] {
+        const auto max = ~static_cast<unsigned __int128>(0);
+        expect(gmprime(max) == gmprime("340282366920938463463374607431768211455"));
+
+        const auto min = -static_cast<__int128>(max >> 1) - 1;
+        expect(gmprime(min) == gmprime("-170141183460469231731687303715884105728"));
+        expect(gmprime(static_cast<__int128>(-42)) == -42);
+    };
+#endif
 };
 
 suite<"gmprime::assigment"> assign = [] {
@@ -191,6 +264,16 @@ suite<"gmprime::arithmetic"> arithmetic = [] {
         a %= b;
         expect(a == 0);
     };
+    "division_by_zero"_test = [] {
+        gmprime a(42);
+        const gmprime zero;
+
+        expect(throws<std::domain_error>([&] { a / zero; }));
+        expect(throws<std::domain_error>([&] { a % zero; }));
+        expect(throws<std::domain_error>([&] { a /= zero; }));
+        expect(throws<std::domain_error>([&] { a %= zero; }));
+        expect(a == 42) << "operand modified by a failed division";
+    };
     "++"_test = [] {
         gmprime r(42);
         ++r;
@@ -200,6 +283,11 @@ suite<"gmprime::arithmetic"> arithmetic = [] {
         gmprime r(42);
         --r;
         expect(r == 41);
+    };
+    "postfix_deleted"_test = [] {
+        expect(!has_postfix_increment<gmprime>::value);
+        expect(!has_postfix_decrement<gmprime>::value);
+        expect(has_postfix_increment<int>::value) << "trait sanity check";
     };
     "unary+"_test = [] {
         const gmprime r(-42);
@@ -280,6 +368,22 @@ suite<"gmprime::logical"> logical = [] {
         constexpr int e = ~42;
         expect(r == e);
     };
+    "explicit_bool"_test = [] {
+        const gmprime positive(42), negative(-42), zero;
+
+        expect(static_cast<bool>(positive));
+        expect(static_cast<bool>(negative));
+        expect(!zero);
+        expect(positive && !zero);
+
+        bool taken = false;
+        if (positive) {
+            taken = true;
+        }
+        expect(taken);
+
+        expect(!std::is_convertible_v<gmprime, bool>) << "conversion to bool must be explicit";
+    };
 };
 
 suite<"gmprime::accessor"> accessor = [] {
@@ -342,6 +446,53 @@ suite<"gmprime::accessor"> accessor = [] {
 
         expect(r == 0xF00);
     };
+    "[]<unsigned short>=_beyond_size"_test = [] {
+        gmprime r(1);
+        r.operator[]<unsigned short>(5) = 0xBEEF;
+
+        expect(r == (gmprime(0xBEEF) << 80) + 1);
+    };
+    "[]<unsigned char>=_negative"_test = [] {
+        gmprime r(-0x1092);
+        r[0_ucw] = 0x61;
+
+        expect(r == -0x1061) << "word write must keep the sign";
+    };
+    "[]<signed char>="_test = [] {
+        gmprime r(0x1000);
+        r.operator[]<signed char>(0) = -1;
+
+        expect(r == 0x10FF);
+        expect(r.operator[]<signed char>(0) == -1);
+    };
+#ifdef __SIZEOF_INT128__
+    // A word wider than a limb spans several limbs
+    "[]<unsigned __int128>"_test = [] {
+        const gmprime r("0x0123456789abcdeffedcba98765432100011223344556677", 0);
+        const auto word0 = r.operator[]<unsigned __int128>(0);
+        const auto word1 = r.operator[]<unsigned __int128>(1);
+
+        expect(gmprime(word0) == gmprime("0xfedcba98765432100011223344556677", 0));
+        expect(gmprime(word1) == gmprime("0x0123456789abcdef", 0));
+    };
+    "[]<unsigned __int128>="_test = [] {
+        gmprime r(1);
+        r.operator[]<unsigned __int128>(1) = (static_cast<unsigned __int128>(0xAAAAAAAAAAAAAAAAULL) << 64) | 0x5555555555555555ULL;
+
+        expect(r == gmprime("0xaaaaaaaaaaaaaaaa555555555555555500000000000000000000000000000001", 0));
+    };
+#endif
+    "[]==_mixed_signedness"_test = [] {
+        gmprime r(ULONG_LONG_MAX);
+
+        expect(!(r[0] == -1)) << "an all-ones word is not equal to -1";
+        expect(r[0] != -1);
+        expect(r[0] == ULONG_LONG_MAX);
+
+        gmprime s(42);
+        expect(s[0] == 42);
+        expect(s[0] != 41);
+    };
     "[]<bool>_negative"_test = [] {
         // Bits follow the magnitude, like words do
         gmprime r(-3);
@@ -359,6 +510,144 @@ suite<"gmprime::accessor"> accessor = [] {
 
         r.set_bit(0, false);
         expect(r == -6);
+    };
+};
+
+// Expected values computed independently (Python integers)
+suite<"gmprime::bit_window"> bit_windows = [] {
+    // 192 bits: three 64-bit limbs
+    const gmprime n("0x0123456789abcdeffedcba98765432100011223344556677", 0);
+
+    "read_unsigned"_test = [&] {
+        const uint8_t byte = n.bits(4, 8);
+        const uint32_t across_limbs = n.bits(48, 32);
+        const uint64_t limb_sized = n.bits(32, 64);
+        const uint16_t beyond_size = n.bits(1000, 13);
+
+        expect(byte == 0x67);
+        expect(across_limbs == 0x32100011u);
+        expect(limb_sized == 0x7654321000112233ull);
+        expect(beyond_size == 0);
+    };
+    "read_gmprime"_test = [&] {
+        const gmprime wide = n.bits(40, 100);
+        expect(wide == gmprime("0xdeffedcba9876543210001122", 0));
+    };
+    "read_negative_magnitude"_test = [&] {
+        const gmprime m = -n;
+        const uint8_t byte = m.bits(4, 8);
+        const gmprime wide = m.bits(40, 100);
+
+        expect(byte == 0x67);
+        expect(wide == gmprime("0xdeffedcba9876543210001122", 0));
+    };
+    "read_wider_than_type"_test = [&] {
+        expect(throws<std::overflow_error>([&] { [[maybe_unused]] const uint8_t x = n.bits(0, 9); }));
+        expect(throws<std::overflow_error>([&] { [[maybe_unused]] const uint64_t x = n.bits(0, 65); }));
+    };
+    "read_empty"_test = [&] {
+        const uint8_t x = n.bits(10, 0);
+        const gmprime g = n.bits(10, 0);
+        expect(x == 0);
+        expect(g == 0);
+    };
+    "word_access_is_a_window"_test = [&] {
+        const uint16_t window = n.bits(5 * 16, 16);
+        expect(n.operator[]<uint16_t>(5) == window);
+        expect(window == 0x7654);
+    };
+    "ostream"_test = [&] {
+        std::stringstream t;
+        t << n.bits(4, 8) << ' ' << gmprime::hex << n.bits(40, 100) << ' ' << gmprime::bin << n.bits(4, 8);
+        expect(t.str() == "103 deffedcba9876543210001122 1100111");
+    };
+    "position_width"_test = [&] {
+        const auto w = n.bits(1000, 13);
+        expect(w.position() == 1000);
+        expect(w.width() == 13);
+    };
+
+    "write_unsigned"_test = [&] {
+        gmprime a(n);
+        a.bits(4, 8) = 0xABu;
+        expect(a == gmprime("0x123456789abcdeffedcba98765432100011223344556ab7", 0));
+    };
+    "write_across_limbs"_test = [&] {
+        gmprime a(n);
+        a.bits(60, 8) = 0xFFu;
+        expect(a == gmprime("0x123456789abcdeffedcba987654321ff011223344556677", 0));
+    };
+    "write_truncates"_test = [] {
+        gmprime a;
+        a.bits(0, 4) = 0xFFu;
+        expect(a == 0xF);
+
+        gmprime b;
+        b.bits(8, 4) = gmprime(0x1FF);
+        expect(b == 0xF00);
+    };
+    "write_beyond_size"_test = [] {
+        gmprime a(1);
+        a.bits(100, 8) = 0x5Au;
+        expect(a == (gmprime(0x5A) << 100) + 1);
+    };
+    "write_keeps_sign"_test = [&] {
+        gmprime a = -n;
+        a.bits(4, 8) = 0xABu;
+        expect(a == gmprime("-0x123456789abcdeffedcba98765432100011223344556ab7", 0));
+
+        // Wider than any integer: goes through GMP operations instead of limb masks
+        gmprime b = -n;
+        b.bits(40, 100) = gmprime("0x0f0f0f0f0f0f0f0f0f0f0f0f0f", 0);
+        expect(b == gmprime("-0x123456789abcf0f0f0f0f0f0f0f0f0f0f0f0f3344556677", 0));
+    };
+    "write_gmprime"_test = [&] {
+        gmprime a(n);
+        a.bits(40, 100) = gmprime("0x0f0f0f0f0f0f0f0f0f0f0f0f0f", 0);
+        expect(a == gmprime("0x123456789abcf0f0f0f0f0f0f0f0f0f0f0f0f3344556677", 0));
+
+        gmprime b;
+        b.bits(0, 8) = gmprime(-5);
+        expect(b == 5) << "the magnitude of the value is written";
+    };
+    "write_zero_extends"_test = [] {
+        gmprime a = (gmprime(1) << 200) - 1;
+        a.bits(0, 100) = static_cast<uint8_t>(5);
+        expect(a == gmprime("0xfffffffffffffffffffffffff0000000000000000000000005", 0));
+    };
+    "write_empty"_test = [&] {
+        gmprime a(n);
+        a.bits(10, 0) = 0xFFu;
+        expect(a == n);
+    };
+    "write_window_copies_bits"_test = [] {
+        gmprime a(0x1234);
+        a.bits(0, 8) = a.bits(8, 8);
+        expect(a == 0x1212) << "assigning a window copies its bits, it does not rebind";
+
+        const gmprime c(0xAB);
+        a.bits(8, 8) = c.bits(0, 8);
+        expect(a == 0xAB12);
+    };
+
+    "unsigned_only"_test = [] {
+        expect(std::is_assignable_v<bit_window<false>, unsigned>);
+        expect(std::is_assignable_v<bit_window<false>, const gmprime&>);
+        expect(!std::is_assignable_v<bit_window<false>, int>) << "signed integers are refused";
+        expect(!std::is_assignable_v<bit_window<false>, bool>);
+        expect(!std::is_assignable_v<bit_window<false>, char>);
+        expect(!std::is_assignable_v<bit_window<false>, double>) << "would silently drop the sign through gmprime";
+
+        expect(std::is_convertible_v<bit_window<false>, unsigned>);
+        expect(std::is_convertible_v<bit_window<false>, gmprime>);
+        expect(!std::is_convertible_v<bit_window<false>, int>) << "signed integers are refused";
+        expect(!std::is_convertible_v<bit_window<false>, char>);
+    };
+    "const_is_read_only"_test = [] {
+        expect(std::is_convertible_v<bit_window<true>, unsigned>);
+        expect(std::is_convertible_v<bit_window<true>, gmprime>);
+        expect(!std::is_assignable_v<bit_window<true>, unsigned>);
+        expect(!std::is_assignable_v<bit_window<true>, const gmprime&>);
     };
 };
 
@@ -644,6 +933,80 @@ suite<"gmprime::string"> string = [] {
         t.str("");
     };
 
+    "ostream_bin_sticky"_test = [] {
+        const gmprime a(5), b(6), c(255);
+        std::stringstream t;
+
+        t << gmprime::bin << a << ' ' << b;
+        expect(t.str() == "101 110") << "binary must stay active, like std::hex";
+        t.str("");
+
+        t << 5;
+        expect(t.str() == "5") << "primitives are printed in decimal";
+        t.str("");
+
+        t << std::hex << c;
+        expect(t.str() == "ff") << "a standard base set afterwards cancels binary";
+        t.str("");
+
+        t << gmprime::bin << std::dec << c;
+        expect(t.str() == "255");
+        t.str("");
+
+        t << gmprime::bin << gmprime::hex << c;
+        expect(t.str() == "ff");
+        t.str("");
+
+        std::stringstream other;
+        other << c;
+        expect(other.str() == "255") << "binary is a per-stream state";
+    };
+
+    "file_read_not_a_file"_test = [] {
+        // Opening a directory succeeds on Linux, then tellg() returns a meaningless size (LLONG_MAX on ext4)
+        const std::string dir_path = TEST_OUTPUT_DIR "a_directory";
+        std::filesystem::create_directory(dir_path);
+        gmprime v(42);
+
+        expect(throws<std::runtime_error>([&] { v.load_from_file(dir_path); }));
+        expect(v == 42) << "value modified by a failed load";
+
+        std::filesystem::remove(dir_path);
+    };
+
+    "file_write_custom_gmp_allocator"_test = [] {
+        const auto out_path = TEST_OUTPUT_DIR "allocator.out.bin";
+        const gmprime v(0x636261);
+
+        mp_get_memory_functions(&gmp_default_alloc, &gmp_default_realloc, &gmp_default_free);
+        mp_set_memory_functions(counting_alloc, counting_realloc, counting_free);
+        gmp_live_allocations = 0;
+
+        // Sanity check of the counting itself, so that the test cannot pass for lack of counting
+        {
+            gmprime grown(v);
+            grown <<= 1000;
+            expect(gmp_live_allocations > 0) << "GMP allocations are not counted";
+        }
+        const auto balance_before_save = gmp_live_allocations;
+
+        v.save_to_file(out_path);
+        mp_set_memory_functions(gmp_default_alloc, gmp_default_realloc, gmp_default_free);
+
+        expect(balance_before_save == 0) << "GMP releases are not counted";
+        expect(gmp_live_allocations == 0) << "memory allocated through GMP must be released through GMP";
+
+        std::remove(out_path);
+    };
+
+#ifdef __linux__
+    "file_write_error"_test = [] {
+        // /dev/full opens fine, then every write fails with ENOSPC
+        const gmprime v(0x636261);
+        expect(throws<std::runtime_error>([&] { v.save_to_file("/dev/full"); }));
+    };
+#endif
+
     "file_read"_test = [] {
         gmprime v;
         expect(throws([&] {v.load_from_file("files/dummy.txt");}));
@@ -661,21 +1024,21 @@ suite<"gmprime::string"> string = [] {
         v.load_from_file(TEST_FILES_DIR "dummy.txt");
         expect(v > 0);
 
-        v.save_to_file(TEST_FILES_DIR "dummy.out.txt");
+        v.save_to_file(TEST_OUTPUT_DIR "dummy.out.txt");
 
         struct stat buffer{};
-        const bool exists = (stat (TEST_FILES_DIR "dummy.out.txt", &buffer) == 0);
+        const bool exists = (stat (TEST_OUTPUT_DIR "dummy.out.txt", &buffer) == 0);
 
         expect(exists) << "Out file not written";
 
         gmprime t;
-        t.load_from_file(TEST_FILES_DIR "dummy.out.txt");
+        t.load_from_file(TEST_OUTPUT_DIR "dummy.out.txt");
 
         expect(t.operator[]<char>(0) == 'a');
         expect(t.operator[]<char>(1) == 'b');
         expect(t.operator[]<char>(2) == 'c');
 
-        std::remove(TEST_FILES_DIR "dummy.out.txt");
+        std::remove(TEST_OUTPUT_DIR "dummy.out.txt");
     };
 };
 
@@ -683,6 +1046,10 @@ suite<"gmprime::math"> math = [] {
     "sqrt"_test = [] {
         const gmprime v(16);
         expect(v.sqrt() == 4);
+    };
+    "sqrt_negative"_test = [] {
+        const gmprime v(-16);
+        expect(throws<std::domain_error>([&] { static_cast<void>(v.sqrt()); }));
     };
     "pow"_test = [] {
         const gmprime v(2);
@@ -715,8 +1082,8 @@ suite<"gmprime::math"> math = [] {
 
     "file_round_trip_trailing_zeros"_test = [] {
         const char data[] = {'a', 'b', 'c', '\0', '\0'};
-        const auto in_path = TEST_FILES_DIR "trailing_zeros.in.bin";
-        const auto out_path = TEST_FILES_DIR "trailing_zeros.out.bin";
+        const auto in_path = TEST_OUTPUT_DIR "trailing_zeros.in.bin";
+        const auto out_path = TEST_OUTPUT_DIR "trailing_zeros.out.bin";
 
         {
             std::ofstream in(in_path, std::ios::binary);
@@ -737,8 +1104,8 @@ suite<"gmprime::math"> math = [] {
     };
 
     "file_size_reset_on_assignment"_test = [] {
-        const auto in_path = TEST_FILES_DIR "trailing_zeros.in.bin";
-        const auto out_path = TEST_FILES_DIR "trailing_zeros.out.bin";
+        const auto in_path = TEST_OUTPUT_DIR "trailing_zeros.in.bin";
+        const auto out_path = TEST_OUTPUT_DIR "trailing_zeros.out.bin";
 
         {
             std::ofstream in(in_path, std::ios::binary);
@@ -758,6 +1125,24 @@ suite<"gmprime::math"> math = [] {
         std::remove(in_path);
         std::remove(out_path);
     };
+
+    "file_write_negative_saves_magnitude"_test = [] {
+        const auto out_path = TEST_OUTPUT_DIR "negative.out.bin";
+
+        const gmprime v(-0x636261);
+        v.save_to_file(out_path);
+
+        std::ifstream out(out_path, std::ios::binary);
+        const std::string written((std::istreambuf_iterator<char>(out)), std::istreambuf_iterator<char>());
+
+        expect(written == std::string("abc"));
+
+        gmprime t;
+        t.load_from_file(out_path);
+        expect(t == 0x636261);
+
+        std::remove(out_path);
+    };
 };
 
 suite<"gmprime::helper"> helper = [] {
@@ -772,7 +1157,8 @@ suite<"gmprime::helper"> helper = [] {
 
         v = -42;
 
-        expect(v.to_primitive<char>() == -42);
+        // plain char is unsigned on some platforms (e.g. Linux on ARM)
+        expect(v.to_primitive<signed char>() == -42);
         expect(v.to_primitive<short>() == -42);
         expect(v.to_primitive<int>() == -42);
         expect(v.to_primitive<long>() == -42);
@@ -784,7 +1170,49 @@ suite<"gmprime::helper"> helper = [] {
         expect(v.to_primitive<unsigned char>() == UINT8_MAX);
         expect(v.to_primitive<unsigned short>() == UINT16_MAX);
         expect(v.to_primitive<unsigned int>() == UINT32_MAX);
-        expect(v.to_primitive<unsigned long>() == UINT64_MAX);
+        // unsigned long is 32 bits on some platforms (e.g. Windows)
+        expect(v.to_primitive<unsigned long long>() == UINT64_MAX);
+    };
+
+    "to_primitive_64_bit_extremes"_test = [] {
+        expect(gmprime("-9223372036854775808").to_primitive<int64_t>() == std::numeric_limits<int64_t>::min());
+        expect(gmprime("9223372036854775807").to_primitive<int64_t>() == std::numeric_limits<int64_t>::max());
+        expect(gmprime("18446744073709551615").to_primitive<uint64_t>() == std::numeric_limits<uint64_t>::max());
+    };
+
+#ifdef __SIZEOF_INT128__
+    "to_primitive_wider_than_long"_test = [] {
+        const auto max = ~static_cast<unsigned __int128>(0);
+        expect(gmprime("340282366920938463463374607431768211455").to_primitive<unsigned __int128>() == max);
+        expect(gmprime("-170141183460469231731687303715884105728").to_primitive<__int128>() == -static_cast<__int128>(max >> 1) - 1);
+        expect(gmprime(-42).to_primitive<__int128>() == -42);
+    };
+#endif
+
+    "hash"_test = [] {
+        const std::hash<gmprime> hash;
+        const gmprime big("123456789012345678901234567890");
+
+        expect(hash(gmprime(42)) == hash(gmprime("42")));
+        expect(hash(big) == hash(gmprime("123456789012345678901234567890")));
+        expect(hash(gmprime()) == hash(gmprime(0)));
+
+        // The size of the last loaded file is not part of equality, so not of the hash either
+        gmprime loaded;
+        loaded.load_from_file(TEST_FILES_DIR "dummy.txt");
+        const gmprime rebuilt(loaded.to_string());
+        expect(loaded == rebuilt);
+        expect(hash(loaded) == hash(rebuilt));
+
+        const std::unordered_set<gmprime> set{gmprime(1), gmprime(-1), gmprime(1), big};
+        expect(set.size() == 3);
+        expect(set.count(gmprime("-1")) == 1);
+
+        std::unordered_map<gmprime, int> map;
+        map[gmprime(5)] = 1;
+        map[gmprime("5")] += 1;
+        expect(map.size() == 1);
+        expect(map.at(5) == 2);
     };
 
     "used_words"_test = [] {

@@ -1,13 +1,36 @@
 #pragma once
 
+static_assert(GMP_NAIL_BITS == 0, "GMP builds with nail bits are not supported");
+
 template<typename word_t, std::enable_if_t<std::is_arithmetic_v<word_t> && !std::is_same_v<word_t, bool>, bool>>
-gmprime::gmprime(word_t value) {
-    if (std::is_floating_point_v<word_t>) {
-        mpz_set_d(_value.get_mpz_t(), value);
-    } else if (std::is_signed_v<word_t>) {
-        mpz_set_si(_value.get_mpz_t(), static_cast<signed long int>(value));
+gmprime::gmprime(const word_t value) {
+    if constexpr (std::is_floating_point_v<word_t>) {
+        // GMP raises SIGFPE on infinity and NaN
+        if (!std::isfinite(value)) {
+            throw std::domain_error("Cannot construct from an infinite or NaN value");
+        }
+        mpz_set_d(_value.get_mpz_t(), static_cast<double>(value));
+    } else if constexpr (sizeof(word_t) <= sizeof(long int)) {
+        if constexpr (std::is_signed_v<word_t>) {
+            mpz_set_si(_value.get_mpz_t(), static_cast<signed long int>(value));
+        } else {
+            mpz_set_ui(_value.get_mpz_t(), static_cast<unsigned long int>(value));
+        }
     } else {
-        mpz_set_ui(_value.get_mpz_t(), static_cast<unsigned long int>(value));
+        // Wider than long (e.g. 64-bit integers where long is 32 bits, like Windows): write the magnitude
+        using unsigned_t = std::make_unsigned_t<word_t>;
+        bool negative = false;
+
+        if constexpr (std::is_signed_v<word_t>) {
+            negative = value < 0;
+        }
+
+        const auto magnitude = negative ? static_cast<unsigned_t>(0 - static_cast<unsigned_t>(value)) : static_cast<unsigned_t>(value);
+        write_bits<unsigned_t>(0, sizeof(unsigned_t) * CHAR_BIT, magnitude);
+
+        if (negative) {
+            mpz_neg(_value.get_mpz_t(), _value.get_mpz_t());
+        }
     }
 }
 
@@ -51,50 +74,96 @@ size_t gmprime::used_words() const {
 
 template<typename word_t, std::enable_if_t<std::is_arithmetic_v<word_t> && !std::is_same_v<word_t, bool>, bool>>
 word_t gmprime::to_primitive() const {
-    if (std::is_floating_point_v<word_t>) {
-        return _value.get_d();
-    }
+    if constexpr (std::is_floating_point_v<word_t>) {
+        return static_cast<word_t>(_value.get_d());
+    } else if constexpr (sizeof(word_t) <= sizeof(long int)) {
+        if constexpr (std::is_signed_v<word_t>) {
+            return static_cast<word_t>(_value.get_si());
+        } else {
+            return static_cast<word_t>(_value.get_ui());
+        }
+    } else {
+        // Wider than long: same semantics as get_si/get_ui, low bits of the magnitude, with the sign if signed
+        using unsigned_t = std::make_unsigned_t<word_t>;
+        const auto magnitude = read_bits<unsigned_t>(0, sizeof(unsigned_t) * CHAR_BIT);
 
-    if (std::is_signed_v<word_t>) {
-        return _value.get_si();
-    }
+        if constexpr (std::is_signed_v<word_t>) {
+            if (mpz_sgn(_value.get_mpz_t()) < 0) {
+                return static_cast<word_t>(0 - magnitude);
+            }
+        }
 
-    return _value.get_ui();
+        return static_cast<word_t>(magnitude);
+    }
 }
 
 template<typename word_t, std::enable_if_t<std::is_integral_v<word_t> && !std::is_same_v<word_t, bool>, bool>>
 void gmprime::set_partial_limb(const uint64_t index, const word_t value) {
-    constexpr auto word_size = sizeof(word_t);
-    constexpr auto limb_size = sizeof(mp_limb_t);
-    auto current_size = mpz_size(_value.get_mpz_t());
-    const auto limbs_required = (index + 1) * word_size / limb_size + ((index + 1) * word_size % limb_size > 0 ? 1 : 0);
-    const auto new_size = std::max<std::size_t>(std::max<std::size_t>(current_size, 1), limbs_required);
-    const auto limbs_ptr = mpz_limbs_modify(_value.get_mpz_t(), new_size);
-    const auto ptr = reinterpret_cast<word_t*>(limbs_ptr);
-    const auto sign = mpz_sgn(_value.get_mpz_t()) < 0 ? -1 : 1;
+    using unsigned_t = std::make_unsigned_t<word_t>;
+    constexpr auto word_bits = sizeof(word_t) * CHAR_BIT;
 
-    // With -fsanitize=address compiler option, new limbs contain random bits, so let's 0'em out
-    while (current_size < new_size) {
-        limbs_ptr[current_size++] = 0;
-    }
-
-    ptr[index] = value;
-
-    mpz_limbs_finish(_value.get_mpz_t(), new_size * sign);
+    write_bits<unsigned_t>(index * word_bits, word_bits, static_cast<unsigned_t>(value));
 }
 
 template<typename word_t, std::enable_if_t<std::is_integral_v<word_t> && !std::is_same_v<word_t, bool>, bool>>
 word_t gmprime::get_partial_limb(const uint64_t index) const {
-    constexpr auto word_size = sizeof(word_t);
-    constexpr auto limb_size = sizeof(mp_limb_t);
-    const auto limb = mpz_getlimbn(_value.get_mpz_t(), index * word_size / limb_size);
+    using unsigned_t = std::make_unsigned_t<word_t>;
+    constexpr auto word_bits = sizeof(word_t) * CHAR_BIT;
 
-    if (word_size == limb_size) {
-        return static_cast<word_t>(limb);
+    return static_cast<word_t>(read_bits<unsigned_t>(index * word_bits, word_bits));
+}
+
+template<typename unsigned_t>
+unsigned_t gmprime::read_bits(const size_t pos, const size_t width) const {
+    constexpr size_t limb_bits = GMP_NUMB_BITS;
+    unsigned_t result = 0;
+
+    for (size_t done = 0; done < width;) {
+        const auto offset = (pos + done) % limb_bits;
+        const auto count = std::min(width - done, limb_bits - offset);
+        // mpz_getlimbn reads the magnitude and returns 0 beyond the used limbs
+        auto bits = mpz_getlimbn(_value.get_mpz_t(), static_cast<mp_size_t>((pos + done) / limb_bits)) >> offset;
+
+        if (count < limb_bits) {
+            bits &= (static_cast<mp_limb_t>(1) << count) - 1;
+        }
+
+        result |= static_cast<unsigned_t>(static_cast<unsigned_t>(bits) << done);
+        done += count;
     }
 
-    constexpr word_t mask = ~static_cast<word_t>(0);
-    const auto limb_sector = index * word_size % limb_size;
+    return result;
+}
 
-    return (limb >> (limb_sector * CHAR_BIT)) & mask;
+template<typename unsigned_t>
+void gmprime::write_bits(const size_t pos, const size_t width, const unsigned_t value) {
+    constexpr size_t limb_bits = GMP_NUMB_BITS;
+
+    if (width == 0) {
+        return;
+    }
+
+    const auto sign = mpz_sgn(_value.get_mpz_t()) < 0 ? -1 : 1;
+    auto current_size = mpz_size(_value.get_mpz_t());
+    const auto new_size = std::max(current_size, (pos + width - 1) / limb_bits + 1);
+    const auto limbs = mpz_limbs_modify(_value.get_mpz_t(), static_cast<mp_size_t>(new_size));
+
+    // mpz_limbs_modify does not initialize the limbs it adds
+    while (current_size < new_size) {
+        limbs[current_size++] = 0;
+    }
+
+    for (size_t done = 0; done < width;) {
+        const auto index = (pos + done) / limb_bits;
+        const auto offset = (pos + done) % limb_bits;
+        const auto count = std::min(width - done, limb_bits - offset);
+        const auto mask = (count < limb_bits ? (static_cast<mp_limb_t>(1) << count) - 1 : ~static_cast<mp_limb_t>(0)) << offset;
+        const auto bits = static_cast<mp_limb_t>(value >> done) << offset;
+
+        limbs[index] = (limbs[index] & ~mask) | (bits & mask);
+        done += count;
+    }
+
+    // Normalizes away the high zero limbs
+    mpz_limbs_finish(_value.get_mpz_t(), static_cast<mp_size_t>(new_size) * sign);
 }

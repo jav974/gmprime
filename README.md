@@ -61,6 +61,17 @@ target_link_libraries(${PROJECT_NAME} gmprime)
    ctest --output-on-failure
     ```
 
+### Linux test matrix (Docker)
+
+Builds and tests with GCC and Clang, on x86_64 and ARM64, in Release then in Debug with AddressSanitizer and UndefinedBehaviorSanitizer:
+
+```sh
+docker/test-all.sh                  # every combination in parallel, with a summary
+docker compose run --rm gcc-amd64   # a single one (see compose.yaml for the list)
+```
+
+Sources are mounted read-only and build trees are kept in Docker volumes, so later runs only rebuild what changed. The non-native architecture runs emulated. `docker compose down -v` removes the build volumes.
+
 ## Basic usage
 
 ```cpp
@@ -78,4 +89,18 @@ int main() {
     std::cout << "Sum: " << sum << std::endl;
     return 0;
 }
+```
+
+### Bit windows
+
+`bits(pos, width)` accesses `width` bits starting at bit `pos`, at any position and of any width. A window holds bits of the magnitude: a sign has no meaning in it, so only unsigned integers and `gmprime` convert to and from it.
+
+```cpp
+gmprime n("0x0123456789abcdef", 0);
+
+uint8_t byte = n.bits(4, 8);     // 0xde; std::overflow_error if the window is wider than the type
+gmprime wide = n.bits(8, 40);    // 0x456789abcd, any width
+n.bits(0, 4) = 0u;               // keeps the low 4 bits of the value, like a C bit field
+
+std::cout << gmprime::hex << n;  // 123456789abcde0
 ```
