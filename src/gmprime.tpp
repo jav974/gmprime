@@ -68,7 +68,7 @@ void gmprime::set_partial_limb(const uint64_t index, const word_t value) {
     constexpr auto limb_size = sizeof(mp_limb_t);
     auto current_size = mpz_size(_value.get_mpz_t());
     const auto limbs_required = (index + 1) * word_size / limb_size + ((index + 1) * word_size % limb_size > 0 ? 1 : 0);
-    const auto new_size = std::max(std::max(current_size, static_cast<unsigned long>(1)), limbs_required);
+    const auto new_size = std::max<std::size_t>(std::max<std::size_t>(current_size, 1), limbs_required);
     const auto limbs_ptr = mpz_limbs_modify(_value.get_mpz_t(), new_size);
     const auto ptr = reinterpret_cast<word_t*>(limbs_ptr);
     const auto sign = mpz_sgn(_value.get_mpz_t()) < 0 ? -1 : 1;

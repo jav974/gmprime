@@ -648,7 +648,7 @@ suite<"gmprime::string"> string = [] {
         gmprime v;
         expect(throws([&] {v.load_from_file("files/dummy.txt");}));
 
-        v.load_from_file("../../tests/files/dummy.txt");
+        v.load_from_file(TEST_FILES_DIR "dummy.txt");
         expect(v > 0);
 
         expect(v.operator[]<char>(0) == 'a');
@@ -658,24 +658,24 @@ suite<"gmprime::string"> string = [] {
 
     "file_write"_test = [] {
         gmprime v;
-        v.load_from_file("../../tests/files/dummy.txt");
+        v.load_from_file(TEST_FILES_DIR "dummy.txt");
         expect(v > 0);
 
-        v.save_to_file("../../tests/files/dummy.out.txt");
+        v.save_to_file(TEST_FILES_DIR "dummy.out.txt");
 
         struct stat buffer{};
-        const bool exists = (stat ("../../tests/files/dummy.out.txt", &buffer) == 0);
+        const bool exists = (stat (TEST_FILES_DIR "dummy.out.txt", &buffer) == 0);
 
         expect(exists) << "Out file not written";
 
         gmprime t;
-        t.load_from_file("../../tests/files/dummy.out.txt");
+        t.load_from_file(TEST_FILES_DIR "dummy.out.txt");
 
         expect(t.operator[]<char>(0) == 'a');
         expect(t.operator[]<char>(1) == 'b');
         expect(t.operator[]<char>(2) == 'c');
 
-        std::remove("../../tests/files/dummy.out.txt");
+        std::remove(TEST_FILES_DIR "dummy.out.txt");
     };
 };
 
@@ -715,8 +715,8 @@ suite<"gmprime::math"> math = [] {
 
     "file_round_trip_trailing_zeros"_test = [] {
         const char data[] = {'a', 'b', 'c', '\0', '\0'};
-        const auto in_path = "../../tests/files/trailing_zeros.in.bin";
-        const auto out_path = "../../tests/files/trailing_zeros.out.bin";
+        const auto in_path = TEST_FILES_DIR "trailing_zeros.in.bin";
+        const auto out_path = TEST_FILES_DIR "trailing_zeros.out.bin";
 
         {
             std::ofstream in(in_path, std::ios::binary);
@@ -737,8 +737,8 @@ suite<"gmprime::math"> math = [] {
     };
 
     "file_size_reset_on_assignment"_test = [] {
-        const auto in_path = "../../tests/files/trailing_zeros.in.bin";
-        const auto out_path = "../../tests/files/trailing_zeros.out.bin";
+        const auto in_path = TEST_FILES_DIR "trailing_zeros.in.bin";
+        const auto out_path = TEST_FILES_DIR "trailing_zeros.out.bin";
 
         {
             std::ofstream in(in_path, std::ios::binary);

@@ -49,7 +49,8 @@ file(GLOB_RECURSE GMPRIME_INCLUDE_FILES
 
 # Build gmprime static lib
 add_library(${PROJECT_NAME} STATIC ${GMPRIME_INCLUDE_FILES} ${GMPRIME_SOURCE_FILES})
-target_link_libraries(${PROJECT_NAME} PRIVATE ${GMP_LIBRARIES} PUBLIC coverage_config)
+# gmpxx.h is included by the public header, so GMP must propagate to consumers
+target_link_libraries(${PROJECT_NAME} PUBLIC GMP::gmpxx coverage_config)
 target_include_directories(${PROJECT_NAME} PUBLIC ${GMPRIME_PUBLIC_INCLUDE_DIRECTORIES})
 target_include_directories(${PROJECT_NAME} PRIVATE ${GMPRIME_PRIVATE_INCLUDE_DIRECTORIES})
 set_target_properties(${PROJECT_NAME} PROPERTIES PUBLIC_HEADER "${GMPRIME_INCLUDE_FILES}")
