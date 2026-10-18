@@ -1,3 +1,4 @@
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -38,6 +39,26 @@ struct has_postfix_decrement : std::false_type {};
 
 template<typename T>
 struct has_postfix_decrement<T, std::void_t<decltype(std::declval<T&>()--)>> : std::true_type {};
+
+// GMP memory functions that count live allocations, delegating to the default ones
+void* (*gmp_default_alloc)(size_t);
+void* (*gmp_default_realloc)(void*, size_t, size_t);
+void (*gmp_default_free)(void*, size_t);
+long gmp_live_allocations = 0;
+
+void* counting_alloc(const size_t size) {
+    ++gmp_live_allocations;
+    return gmp_default_alloc(size);
+}
+
+void* counting_realloc(void* ptr, const size_t old_size, const size_t new_size) {
+    return gmp_default_realloc(ptr, old_size, new_size);
+}
+
+void counting_free(void* ptr, const size_t size) {
+    --gmp_live_allocations;
+    gmp_default_free(ptr, size);
+}
 
 template<typename L>
 void check_primitive_lhs(const L lhs) {
@@ -454,6 +475,17 @@ suite<"gmprime::accessor"> accessor = [] {
         expect(r == gmprime("0xaaaaaaaaaaaaaaaa555555555555555500000000000000000000000000000001", 0));
     };
 #endif
+    "[]==_mixed_signedness"_test = [] {
+        gmprime r(ULONG_LONG_MAX);
+
+        expect(!(r[0] == -1)) << "an all-ones word is not equal to -1";
+        expect(r[0] != -1);
+        expect(r[0] == ULONG_LONG_MAX);
+
+        gmprime s(42);
+        expect(s[0] == 42);
+        expect(s[0] != 41);
+    };
     "[]<bool>_negative"_test = [] {
         // Bits follow the magnitude, like words do
         gmprime r(-3);
@@ -754,6 +786,62 @@ suite<"gmprime::string"> string = [] {
         t << gmprime::dec << u[0];
         expect(t.str() == "6548");
         t.str("");
+    };
+
+    "ostream_bin_sticky"_test = [] {
+        const gmprime a(5), b(6), c(255);
+        std::stringstream t;
+
+        t << gmprime::bin << a << ' ' << b;
+        expect(t.str() == "101 110") << "binary must stay active, like std::hex";
+        t.str("");
+
+        t << 5;
+        expect(t.str() == "5") << "primitives are printed in decimal";
+        t.str("");
+
+        t << std::hex << c;
+        expect(t.str() == "ff") << "a standard base set afterwards cancels binary";
+        t.str("");
+
+        t << gmprime::bin << std::dec << c;
+        expect(t.str() == "255");
+        t.str("");
+
+        t << gmprime::bin << gmprime::hex << c;
+        expect(t.str() == "ff");
+        t.str("");
+
+        std::stringstream other;
+        other << c;
+        expect(other.str() == "255") << "binary is a per-stream state";
+    };
+
+    "file_read_not_a_file"_test = [] {
+        // Opening a directory succeeds on Linux, then tellg() fails (on ext4, overlayfs...)
+        const std::string dir_path = TEST_OUTPUT_DIR "a_directory";
+        std::filesystem::create_directory(dir_path);
+        gmprime v(42);
+
+        expect(throws<std::runtime_error>([&] { v.load_from_file(dir_path); }));
+        expect(v == 42) << "value modified by a failed load";
+
+        std::filesystem::remove(dir_path);
+    };
+
+    "file_write_custom_gmp_allocator"_test = [] {
+        const auto out_path = TEST_OUTPUT_DIR "allocator.out.bin";
+        const gmprime v(0x636261);
+
+        mp_get_memory_functions(&gmp_default_alloc, &gmp_default_realloc, &gmp_default_free);
+        mp_set_memory_functions(counting_alloc, counting_realloc, counting_free);
+        gmp_live_allocations = 0;
+        v.save_to_file(out_path);
+        mp_set_memory_functions(gmp_default_alloc, gmp_default_realloc, gmp_default_free);
+
+        expect(gmp_live_allocations == 0) << "memory allocated through GMP must be released through GMP";
+
+        std::remove(out_path);
     };
 
     "file_read"_test = [] {
