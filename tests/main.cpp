@@ -1563,6 +1563,66 @@ suite<"gmprime::coding"> coding_suite = [] {
         expect(runs_at(bytes, 0, 8).left == 64) << "bits before the start count as 0";
     };
 
+    "stream_bits"_test = [] {
+        const std::vector<uint8_t> bytes{0b10110000, 0xFF};
+        expect(stream_bits(bytes, 0, 4) == 0b1011 && stream_bits(bytes, 2, 4) == 0b1100);
+        expect(stream_bits(bytes, -2, 4) == 0b0010) << "0 before the start";
+        expect(stream_bits(bytes, 12, 8) == 0b11110000) << "0 beyond the end";
+        expect(stream_bits(bytes, -9, 4) == 0 && stream_bits(bytes, 5, 57) >> 46 == 0b00011111111);
+        expect(reverse_bits(0b1101, 4) == 0b1011 && reverse_bits(0b1101, 6) == 0b101100);
+    };
+
+    "compiled_template"_test = [] {
+        std::string text;
+        random_text(300, 2, 7, text);
+        const std::vector<uint8_t> bytes(text.begin(), text.end());
+
+        // Single distances, runs both ways, a run longer than one word read, distances beyond the start
+        std::vector<size_t> long_run;
+        for (size_t d = 1; d <= 64; ++d) {
+            long_run.push_back(d);
+        }
+        const std::vector<std::vector<size_t>> templates{
+            {1, 2, 105, 104, 103, 208}, {5}, {9, 8, 7, 6, 3, 4, 5, 300, 301}, long_run, {2000, 1999, 3000}};
+        bool same = true;
+        for (const auto& distances : templates) {
+            const compiled_template compiled(distances);
+            for (size_t pos = 0; pos <= bytes.size() * 8; pos += 7) {
+                same = same && compiled.at(bytes, pos) == bit_template(bytes, pos, distances);
+            }
+        }
+        expect(same) << "the same contexts as bit_template";
+    };
+
+    "runs_at_words"_test = [] {
+        // Long runs, spanning several words, compared with a bit by bit count
+        std::vector<uint8_t> bytes(64, 0);
+        for (size_t i = 20; i < 40; ++i) {
+            bytes[i] = 0xFF;
+        }
+        bytes[45] = 0b00111100;
+        const auto bit = [&](const size_t pos, const size_t distance) {
+            return distance <= pos ? stream_bit(bytes, pos - distance) : 0;
+        };
+        bool same = true;
+        for (const size_t width : {2, 3, 64, 100, 200}) {
+            for (const size_t limit : {1, 64, 300}) {
+                for (size_t pos = 0; pos < bytes.size() * 8; pos += 3) {
+                    size_t left = 1, above = 0;
+                    while (left < limit && bit(pos, left) == bit(pos, left + 1)) {
+                        ++left;
+                    }
+                    while (above < limit && above + 2 < width && bit(pos, width - above) == bit(pos, width - above - 1)) {
+                        ++above;
+                    }
+                    const auto runs = runs_at(bytes, pos, width, limit);
+                    same = same && runs.left == left && runs.above == above;
+                }
+            }
+        }
+        expect(same);
+    };
+
     "table_bits"_test = [] {
         expect(table_bits(0) == 16) << "at least min_bits";
         expect(table_bits(3721) == 17) << "four slots per bit of data: 119,072 slots";

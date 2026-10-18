@@ -62,6 +62,25 @@ public:
             for (size_t k = 0; k <= 2; ++k) large.push_back(3 * l + 1 - k);
             _bit_templates.push_back(large);
             _byte_templates = bytes ? 2 + (cfg.layer > 0 ? 1 : 0) : 0;
+
+            // Templates read at every bit, compiled once
+            for (const auto& distances : _bit_templates) {
+                _compiled.emplace_back(distances);
+            }
+            _runs_template.emplace(std::vector<size_t>{1, l, l - 1});
+            _set_template.emplace(std::vector<size_t>{1, 2, l - 1, l, l + 1, 2 * l, l - 2, l + 2});
+            // The byte above, two above and one layer behind, aligned on the current byte's first bit: one
+            // template per bit position in the byte
+            const size_t rows[] = {l, 2 * l, l * cfg.layer};
+            for (size_t r = 0; r < _byte_templates; ++r) {
+                for (size_t b = 0; b < 8; ++b) {
+                    std::vector<size_t> distances;
+                    for (size_t k = 0; k < 8; ++k) {
+                        distances.push_back(rows[r] + b - k);
+                    }
+                    _aligned[r].emplace_back(distances);
+                }
+            }
         }
         _contexts = _byte_contexts + _bit_templates.size() + (cfg.fold ? 1 : 0) + _byte_templates;
 
@@ -194,31 +213,27 @@ private:
         size_t t = _byte_contexts;
 
         for (size_t k = 0; k < _bit_templates.size(); ++k) {
-            _hashes[t++] = bit_template(_stream, pos, _bit_templates[k]) * 0x9E3779B97F4A7C15ull + 977 * (k + 1);
+            _hashes[t++] = _compiled[k].at(_stream, pos) * 0x9E3779B97F4A7C15ull + 977 * (k + 1);
         }
         const auto runs = runs_at(_stream, pos, l);
-        const uint64_t runs_key = (std::min<size_t>(runs.left, 63) << 6 | std::min<size_t>(runs.above, 63)) << 3 | bit_template(_stream, pos, {1, l, l - 1});
+        const uint64_t runs_key = (std::min<size_t>(runs.left, 63) << 6 | std::min<size_t>(runs.above, 63)) << 3 | _runs_template->at(_stream, pos);
         _hashes[t++] = runs_key * 0x9E3779B97F4A7C15ull + 4444;
 
         if (_byte_templates > 0) {
             // The byte above (and two above, and one layer behind), aligned on the current byte's first bit
-            const auto aligned = [&](const size_t distance) {
-                std::vector<size_t> distances;
-                for (size_t k = 0; k < 8; ++k) {
-                    distances.push_back(distance + static_cast<size_t>(_bit_count) - k);
-                }
-                return bit_template(_stream, pos, distances);
+            const auto aligned = [&](const size_t row) {
+                return _aligned[row][static_cast<size_t>(_bit_count)].at(_stream, pos);
             };
-            const uint64_t above = aligned(l);
-            const uint64_t above2 = aligned(2 * l);
+            const uint64_t above = aligned(0);
+            const uint64_t above2 = aligned(1);
             _hashes[t++] = (above << 9 | _c0) * 0x9E3779B97F4A7C15ull + 1111;
             _hashes[t++] = ((above2 << 8 | above) << 9 | _c0) * 0x9E3779B97F4A7C15ull + 2222;
             if (_byte_templates > 2) {
-                const uint64_t behind = aligned(l * _cfg.layer);
+                const uint64_t behind = aligned(2);
                 _hashes[t++] = ((behind << 8 | above) << 9 | _c0) * 0x9E3779B97F4A7C15ull + 3333;
             }
         }
-        _fold_set = bit_template(_stream, pos, {1, 2, l - 1, l, l + 1, 2 * l, l - 2, l + 2});
+        _fold_set = _set_template->at(_stream, pos);
     }
 
     void byte_done(const uint8_t byte) {
@@ -284,6 +299,8 @@ private:
     size_t _byte_contexts = 0, _contexts = 0, _byte_templates = 0;
     bool _text = false;
     std::vector<std::vector<size_t>> _bit_templates;
+    std::vector<compiled_template> _compiled, _aligned[3];
+    std::optional<compiled_template> _runs_template, _set_template;
     std::vector<checked_table<context_slot>> _tables;
     std::vector<history_map> _maps;
     std::vector<context_slot*> _slots;

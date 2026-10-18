@@ -473,6 +473,100 @@ inline uint64_t bit_template(const std::vector<uint8_t>& bytes, const size_t pos
     return context;
 }
 
+// Stream bits [first, first + count), count from 1 to 57, packed the first one highest: a word at a time instead
+// of bit by bit. first may be negative: bits before the start, and beyond the end, are 0
+inline uint64_t stream_bits(const std::vector<uint8_t>& bytes, const int64_t first, const int count) {
+    if (first + count <= 0) {
+        return 0;
+    }
+    if (first < 0) {
+        return stream_bits(bytes, 0, static_cast<int>(first + count));
+    }
+    const auto byte = static_cast<size_t>(first) / 8;
+    const auto offset = static_cast<int>(first % 8);
+    uint64_t word = 0;
+    for (size_t i = 0; i < 8; ++i) {
+        word = (word << 8) | (byte + i < bytes.size() ? bytes[byte + i] : 0);
+    }
+    return (word << offset) >> (64 - count);
+}
+
+// The low count bits of value in reverse order
+inline uint64_t reverse_bits(uint64_t value, const int count) {
+    uint64_t reversed = 0;
+    for (int i = 0; i < count; ++i) {
+        reversed = (reversed << 1) | (value & 1);
+        value >>= 1;
+    }
+    return reversed;
+}
+
+// bit_template with its distances grouped once into runs of consecutive ones (d, d + 1... or d, d - 1...), each
+// read as one word: the same context in a few word reads instead of one bit read per distance, for templates
+// used at every bit
+class compiled_template {
+public:
+    explicit compiled_template(const std::vector<size_t>& distances) {
+        for (size_t i = 0; i < distances.size();) {
+            segment s{distances[i], 1, false};
+            if (i + 1 < distances.size() && (distances[i + 1] == distances[i] + 1 || distances[i + 1] + 1 == distances[i])) {
+                s.ascending = distances[i + 1] == distances[i] + 1;
+                while (i + static_cast<size_t>(s.length) < distances.size() && s.length < 57
+                       && distances[i + static_cast<size_t>(s.length)] == (s.ascending ? distances[i] + static_cast<size_t>(s.length) : distances[i] - static_cast<size_t>(s.length))) {
+                    ++s.length;
+                }
+            }
+            _segments.push_back(s);
+            i += static_cast<size_t>(s.length);
+        }
+    }
+
+    [[nodiscard]] uint64_t at(const std::vector<uint8_t>& bytes, const size_t pos) const {
+        uint64_t context = 0;
+        for (const auto& s : _segments) {
+            const auto p = static_cast<int64_t>(pos) - static_cast<int64_t>(s.distance);
+            // Descending distances are ascending positions, in stream order; ascending ones the reverse
+            const uint64_t bits = s.ascending ? reverse_bits(stream_bits(bytes, p - s.length + 1, s.length), s.length)
+                                              : stream_bits(bytes, p, s.length);
+            context = (context << s.length) | bits;
+        }
+        return context;
+    }
+
+private:
+    struct segment {
+        size_t distance;
+        int length;
+        bool ascending;
+    };
+    std::vector<segment> _segments;
+};
+
+// Number of zero bits below the lowest one, and above the highest one, of a non-zero word
+inline int trailing_zeros(uint64_t word) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_ctzll(word);
+#else
+    int count = 0;
+    for (; (word & 1) == 0; word >>= 1) {
+        ++count;
+    }
+    return count;
+#endif
+}
+
+inline int leading_zeros(uint64_t word) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_clzll(word);
+#else
+    int count = 0;
+    for (; (word >> 63) == 0; word <<= 1) {
+        ++count;
+    }
+    return count;
+#endif
+}
+
 // Pixel runs at stream bit pos of a bitmap folded at width bits per row: left, the length of the run of equal
 // bits ending just before pos (1 to limit); above, how many bits the one above pos stays the same toward the
 // right (0 to limit). Bits before the start count as 0.
@@ -482,16 +576,33 @@ struct bitmap_runs {
 };
 
 inline bitmap_runs runs_at(const std::vector<uint8_t>& bytes, const size_t pos, const size_t width, const size_t limit = 64) {
-    const auto bit = [&](const size_t distance) {
-        return distance <= pos ? stream_bit(bytes, pos - distance) : 0;
-    };
+    // Bits compared 56 pairs at a time: in a word of 57 stream bits, word ^ (word >> 1) marks where neighbours differ
+    constexpr uint64_t pairs = (uint64_t{1} << 56) - 1;
+    const auto p = static_cast<int64_t>(pos);
     bitmap_runs runs;
+
+    // Left: equal neighbours going back from pos - 1, the lowest bit of each word
     runs.left = 1;
-    while (runs.left < limit && bit(runs.left) == bit(runs.left + 1)) {
-        ++runs.left;
+    for (int64_t end = p - 1; runs.left < limit; end -= 56) {
+        const uint64_t word = stream_bits(bytes, end - 56, 57);
+        const uint64_t differ = (word ^ (word >> 1)) & pairs;
+        const auto equal = static_cast<size_t>(differ == 0 ? 56 : trailing_zeros(differ));
+        runs.left = std::min(limit, runs.left + equal);
+        if (equal < 56) {
+            break;
+        }
     }
-    while (runs.above < limit && runs.above + 2 < width && bit(width - runs.above) == bit(width - runs.above - 1)) {
-        ++runs.above;
+
+    // Above: equal neighbours going forward from pos - width, the highest bit of each word, before pos - 1
+    const size_t cap = std::min(limit, width >= 2 ? width - 2 : 0);
+    for (int64_t first = p - static_cast<int64_t>(width); runs.above < cap; first += 56) {
+        const uint64_t word = stream_bits(bytes, first, 57);
+        const uint64_t differ = (word ^ (word >> 1)) & pairs;
+        const auto equal = static_cast<size_t>(differ == 0 ? 56 : leading_zeros(differ) - 8);
+        runs.above = std::min(cap, runs.above + equal);
+        if (equal < 56) {
+            break;
+        }
     }
     return runs;
 }

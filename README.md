@@ -239,6 +239,8 @@ A table takes `2^bits` times the slot size: 32 MB for `checked_table<context_slo
 | `capitals_encode(text)`, `capitals_decode(encoded)` | reversible lowercasing: a capitalized word is lowercased behind `0x01`, an all-capitals word behind `0x02`, so that "The" and "the" share statistics; `capitals_encode` returns nothing if the text holds those bytes |
 | `stream_bit(bytes, p)` | bit `p` of bytes read as a stream, each byte from its highest bit, the order of a bitmap's pixels |
 | `bit_template(bytes, pos, distances)` | the stream bits at `pos - d` for each distance `d`, packed into a context. With the fold width `L` found by `gmprime::analyze_folds`, distances such as 1, 2, `L - 1`, `L`, `L + 1` form a 2D neighbourhood, and `L * H` reaches the layer behind in 3D |
+| `stream_bits(bytes, first, count)` | up to 57 consecutive stream bits in one word read, the first one highest; bits before the start (`first` may be negative) and beyond the end are 0 |
+| `compiled_template(distances)` | `bit_template` prepared once: `at(bytes, pos)` gives the same context, reading each run of consecutive distances (`L + 1, L, L - 1`...) as one word. For templates used at every bit |
 | `runs_at(bytes, pos, width)` | pixel runs of a bitmap folded at `width` bits: `left`, the run of equal bits ending before `pos`, and `above`, how far the bit above stays the same to the right |
 
 ### Coding and measuring

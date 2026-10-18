@@ -117,6 +117,12 @@ Apple Silicon. Sizes change only where noted.
 Fold analysis on the first 128 KB instead of the whole file finds the same folds on all 12 files, 0.4 to 1 s
 sooner.
 
+Folded data, after the integer arithmetic, with identical messages: bit templates compiled once into runs of
+consecutive distances, each read as one word (`compiled_template`, `stream_bits`), the aligned byte templates
+prepared for each bit position, and pixel runs counted 56 bits at a time. kennedy.xls compresses 25% faster and
+decompresses 27% faster, ptt5 16% and 26% (measured on a loaded machine, so as ratios). Prefetching the fold
+contexts, or the first bit of each byte, gained nothing measurable: dropped.
+
 After these steps the time is spread over the context lookups (33%), learning (25%), counter updates (29%) and
 the mixers (9%): memory accesses rather than arithmetic.
 
@@ -161,5 +167,3 @@ Without the checksum, sizes moved by at most 5 bytes (kennedy.xls 12,970 to 12,9
 ## Open ideas
 
 - A fast mode trading a little compression: nibble buckets, fewer contexts, smaller tables.
-- Prefetching for the first bit of each byte and for the fold templates: kennedy.xls, coded with fold
-  templates, gained least.
