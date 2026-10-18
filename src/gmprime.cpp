@@ -389,6 +389,28 @@ gmprime gmprime::factorial(const unsigned int n) {
     return result;
 }
 
+gmprime GMPrime::abs(const gmprime &value) {
+    gmprime result;
+    mpz_abs(result.get_value().get_mpz_t(), value.get_value().get_mpz_t());
+    return result;
+}
+
+gmprime GMPrime::gcd(const gmprime &a, const gmprime &b) {
+    gmprime result;
+    mpz_gcd(result.get_value().get_mpz_t(), a.get_value().get_mpz_t(), b.get_value().get_mpz_t());
+    return result;
+}
+
+gmprime GMPrime::lcm(const gmprime &a, const gmprime &b) {
+    gmprime result;
+    mpz_lcm(result.get_value().get_mpz_t(), a.get_value().get_mpz_t(), b.get_value().get_mpz_t());
+    return result;
+}
+
+std::string GMPrime::to_string(const gmprime &value) {
+    return value.to_string();
+}
+
 size_t std::hash<gmprime>::operator()(const gmprime &value) const noexcept {
     // GMP keeps numbers normalized (no high zero limb), so equal values have the same limbs
     const auto mpz = value.get_value().get_mpz_t();

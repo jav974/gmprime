@@ -199,6 +199,16 @@ private:
 #include "../src/gmprime_bit_window.tpp"
 #include "../src/gmprime.tpp"
 
+// Free functions, found by argument-dependent lookup like the ones for an int: abs(a), gcd(a, b).
+// std::to_string cannot be overloaded (adding overloads to std is undefined behavior), so call
+// to_string unqualified, after using std::to_string if needed.
+[[nodiscard]] gmprime abs(const gmprime& value);
+// Always >= 0, and gcd(0, 0) = 0, like std::gcd
+[[nodiscard]] gmprime gcd(const gmprime& a, const gmprime& b);
+// Always >= 0, and 0 if either is 0, like std::lcm
+[[nodiscard]] gmprime lcm(const gmprime& a, const gmprime& b);
+[[nodiscard]] std::string to_string(const gmprime& value);
+
 } // GMPrime
 
 namespace std {
@@ -208,6 +218,49 @@ namespace std {
 template<>
 struct hash<GMPrime::gmprime> {
     size_t operator()(const GMPrime::gmprime& value) const noexcept;
+};
+
+// An unbounded integer: the members that only make sense for bounded or floating point types are zero,
+// false, or gmprime(), like the primary template
+template<>
+class numeric_limits<GMPrime::gmprime> {
+public:
+    static constexpr bool is_specialized = true;
+    static constexpr bool is_signed = true;
+    static constexpr bool is_integer = true;
+    static constexpr bool is_exact = true;
+    static constexpr bool has_infinity = false;
+    static constexpr bool has_quiet_NaN = false;
+    static constexpr bool has_signaling_NaN = false;
+#if __cplusplus < 202302L
+    static constexpr float_denorm_style has_denorm = denorm_absent;
+    static constexpr bool has_denorm_loss = false;
+#endif
+    static constexpr float_round_style round_style = round_toward_zero;
+    static constexpr bool is_iec559 = false;
+    static constexpr bool is_bounded = false;
+    static constexpr bool is_modulo = false;
+    static constexpr int digits = 0;
+    static constexpr int digits10 = 0;
+    static constexpr int max_digits10 = 0;
+    static constexpr int radix = 2;
+    static constexpr int min_exponent = 0;
+    static constexpr int min_exponent10 = 0;
+    static constexpr int max_exponent = 0;
+    static constexpr int max_exponent10 = 0;
+    // Division by zero throws an exception rather than trapping
+    static constexpr bool traps = false;
+    static constexpr bool tinyness_before = false;
+
+    static GMPrime::gmprime min() { return {}; }
+    static GMPrime::gmprime max() { return {}; }
+    static GMPrime::gmprime lowest() { return {}; }
+    static GMPrime::gmprime epsilon() { return {}; }
+    static GMPrime::gmprime round_error() { return {}; }
+    static GMPrime::gmprime infinity() { return {}; }
+    static GMPrime::gmprime quiet_NaN() { return {}; }
+    static GMPrime::gmprime signaling_NaN() { return {}; }
+    static GMPrime::gmprime denorm_min() { return {}; }
 };
 
 } // std

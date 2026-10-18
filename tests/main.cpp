@@ -1414,6 +1414,34 @@ suite<"gmprime::helper"> helper = [] {
         expect(map.at(5) == 2);
     };
 
+    "free_functions"_test = [] {
+        const gmprime a(-12), b(18), zero;
+
+        expect(abs(a) == 12);
+        expect(abs(b) == 18);
+        expect(abs(zero) == 0);
+
+        expect(gcd(a, b) == 6) << "always >= 0, like std::gcd";
+        expect(gcd(zero, zero) == 0);
+        expect(gcd(a, 8) == 4) << "a primitive operand converts";
+        expect(lcm(a, b) == 36) << "always >= 0, like std::lcm";
+        expect(lcm(a, zero) == 0);
+
+        using std::to_string;
+        expect(to_string(a) == "-12");
+        expect(to_string(42) == "42") << "std::to_string stays available";
+    };
+
+    "numeric_limits"_test = [] {
+        using limits = std::numeric_limits<gmprime>;
+
+        expect(limits::is_specialized);
+        expect(limits::is_integer && limits::is_signed && limits::is_exact);
+        expect(!limits::is_bounded && !limits::is_modulo);
+        expect(limits::radix == 2);
+        expect(limits::max() == 0) << "meaningless for an unbounded type, gmprime() like the primary template";
+    };
+
     "used_words"_test = [] {
         gmprime v(ULONG_LONG_MAX);
 
