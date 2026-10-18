@@ -105,6 +105,24 @@ n.bits(0, 4) = 0u;               // keeps the low 4 bits of the value, like a C 
 std::cout << gmprime::hex << n;  // 123456789abcde0
 ```
 
+### Bit analysis
+
+Counting and scanning work on the magnitude like every bit access, a limb at a time:
+
+```cpp
+gmprime text;
+text.load_from_file("data.txt");
+
+size_t ones = text.popcount();                    // number of bits set
+size_t diff = text.hamming_distance(other);       // number of bits that differ
+size_t first = text.next_set_bit();               // gmprime::npos if there is none
+size_t hole = text.next_clear_bit(first);         // always found: bits beyond the magnitude are clear
+
+for (const size_t pos : (text & mask).set_bits()) {
+    // positions of the bits set, in increasing order: whole zero limbs are skipped
+}
+```
+
 ### Integer behavior
 
 A `gmprime` is used like an `int`: arithmetic, bitwise and comparison operators (with a primitive on either side), `if (a)`, streams with every formatting flag (`std::showbase`, `std::setw`...) and `>>`, `abs`, `gcd`, `lcm`, `to_string`, `std::hash` and `std::numeric_limits`. Comparisons with a floating point value are exact: `gmprime(5) < 5.5`.
