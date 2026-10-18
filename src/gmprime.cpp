@@ -182,6 +182,10 @@ gmprime gmprime::operator-() const {
     return result;
 }
 
+gmprime::operator bool() const {
+    return mpz_sgn(_value.get_mpz_t()) != 0;
+}
+
 size_t gmprime::used_bits() const {
     if (_value == 0) return 0;
 

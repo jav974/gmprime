@@ -80,6 +80,10 @@ public:
     gmprime operator+() const;
     gmprime operator-() const;
 
+    // CONVERSION OPERATOR bool: true when non-zero. Explicit so that if (a) and !a work like with
+    // a primitive, without a gmprime silently converting to bool in arithmetic or comparisons
+    explicit operator bool() const;
+
     // COMPARISON OPERATORS  ==  <=  >=  <  >  !=
     friend bool operator==(const gmprime& lhs, const gmprime& rhs);
     friend bool operator!=(const gmprime& lhs, const gmprime& rhs);

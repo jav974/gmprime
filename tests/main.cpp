@@ -338,6 +338,22 @@ suite<"gmprime::logical"> logical = [] {
         constexpr int e = ~42;
         expect(r == e);
     };
+    "explicit_bool"_test = [] {
+        const gmprime positive(42), negative(-42), zero;
+
+        expect(static_cast<bool>(positive));
+        expect(static_cast<bool>(negative));
+        expect(!zero);
+        expect(positive && !zero);
+
+        bool taken = false;
+        if (zero) {
+            taken = true;
+        }
+        expect(!taken);
+
+        expect(!std::is_convertible_v<gmprime, bool>) << "conversion to bool must be explicit";
+    };
 };
 
 suite<"gmprime::accessor"> accessor = [] {
