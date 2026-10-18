@@ -3,6 +3,7 @@
 #
 #   docker/test-all.sh                    every service in parallel, with a summary
 #   docker compose run --rm gcc-amd64     a single service
+#   docker/coverage.sh [base]             lines added since base (default main) that tests do not cover
 #
 # Sources are mounted read-only, build trees are kept in named volumes so reruns are incremental.
 # The non-native architecture runs emulated (Rosetta on Apple Silicon, QEMU elsewhere).
@@ -49,8 +50,22 @@ services:
       - .:/src:ro
       - build-clang-arm64:/build
 
+  # Patch coverage as measured by the CI (see docker/coverage.sh); in its own profile so that
+  # docker compose up (docker/test-all.sh) leaves it out
+  coverage:
+    build: docker
+    profiles: [coverage]
+    platform: linux/amd64
+    command: ["bash", "/src/docker/run-coverage.sh"]
+    environment:
+      BASE: ${BASE:-main}
+    volumes:
+      - .:/src:ro
+      - build-coverage:/build
+
 volumes:
   build-gcc-amd64:
   build-clang-amd64:
   build-gcc-arm64:
   build-clang-arm64:
+  build-coverage:

@@ -1,5 +1,6 @@
 # Linux test environment, same distribution as the CI runners.
-# libclang-rt-18-dev holds Clang's sanitizer runtimes (only recommended by the clang package).
+# libclang-rt-18-dev holds Clang's sanitizer runtimes (only recommended by the clang package),
+# lcov measures coverage like the CI.
 FROM ubuntu:24.04
 
 RUN apt-get update \
@@ -9,6 +10,7 @@ RUN apt-get update \
         cmake \
         g++ \
         git \
+        lcov \
         libclang-rt-18-dev \
         libgmp-dev \
         ninja-build \
