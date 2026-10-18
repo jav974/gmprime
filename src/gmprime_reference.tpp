@@ -1,6 +1,27 @@
 // ReSharper disable CppNonExplicitConversionOperator
 #pragma once
 
+namespace detail {
+
+// std::cmp_equal for C++17: integers of different signedness are compared by value,
+// so that an all-ones unsigned word is not equal to -1
+template<typename A, typename B>
+constexpr bool cmp_equal(const A a, const B b) {
+    if constexpr (std::is_integral_v<A> && std::is_integral_v<B>
+                  && !std::is_same_v<A, bool> && !std::is_same_v<B, bool>
+                  && std::is_signed_v<A> != std::is_signed_v<B>) {
+        if constexpr (std::is_signed_v<A>) {
+            return a >= 0 && static_cast<std::make_unsigned_t<A>>(a) == b;
+        } else {
+            return b >= 0 && a == static_cast<std::make_unsigned_t<B>>(b);
+        }
+    } else {
+        return a == b;
+    }
+}
+
+} // detail
+
 template<typename T, std::enable_if_t<std::is_integral_v<T>, bool>>
 class reference {
 public:
@@ -40,12 +61,12 @@ public:
 
     template<typename U = T, std::enable_if_t<std::is_arithmetic_v<U>, bool> = true>
     bool operator==(const U value) const {
-        return operator T() == value;
+        return detail::cmp_equal(operator T(), value);
     }
 
     template<typename U = T, std::enable_if_t<std::is_arithmetic_v<U>, bool> = true>
     bool operator!=(const U value) const {
-        return operator T() != value;
+        return !detail::cmp_equal(operator T(), value);
     }
 
     template<typename U = T, std::enable_if_t<!std::is_same_v<U, bool> && !std::is_same_v<T, bool>, bool> = true>
