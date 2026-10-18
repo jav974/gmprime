@@ -117,3 +117,4 @@ The differences are deliberate:
 - Bit access (`[]`, `get_bit`, `bits`, `as_span`) reads the magnitude as GMP stores it, while bitwise operators (`&`, `|`, `^`, `~`, `>>`) follow two's complement like an `int`. For -2, `get_bit(2)` is 0 but `((a >> 2) & 1)` is 1.
 - A negative number prints as a sign and its magnitude in every base (`-0xff`), where an `int` prints its two's complement in octal and hexadecimal.
 - There is no implicit conversion to a primitive, which could truncate: use `to_primitive<T>()`.
+- Mixed arithmetic with a floating point value converts it to `gmprime` first, truncating it: `a + 0.5` is `a`. Use `a.to_primitive<double>() + 0.5` for a floating point result.
