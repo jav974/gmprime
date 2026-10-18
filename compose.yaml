@@ -1,0 +1,56 @@
+# Linux test matrix: GCC and Clang, on x86_64 and ARM64 (where plain char is unsigned).
+# Each service builds and tests in Release, then in Debug with ASan + UBSan (see docker/run-tests.sh).
+#
+#   docker/test-all.sh                    every service in parallel, with a summary
+#   docker compose run --rm gcc-amd64     a single service
+#
+# Sources are mounted read-only, build trees are kept in named volumes so reruns are incremental.
+# The non-native architecture runs emulated (Rosetta on Apple Silicon, QEMU elsewhere).
+name: gmprime-tests
+
+x-test: &test
+  build: docker
+  command: ["bash", "/src/docker/run-tests.sh"]
+
+services:
+  gcc-amd64:
+    <<: *test
+    platform: linux/amd64
+    environment:
+      CXX: g++
+    volumes:
+      - .:/src:ro
+      - build-gcc-amd64:/build
+
+  clang-amd64:
+    <<: *test
+    platform: linux/amd64
+    environment:
+      CXX: clang++
+    volumes:
+      - .:/src:ro
+      - build-clang-amd64:/build
+
+  gcc-arm64:
+    <<: *test
+    platform: linux/arm64
+    environment:
+      CXX: g++
+    volumes:
+      - .:/src:ro
+      - build-gcc-arm64:/build
+
+  clang-arm64:
+    <<: *test
+    platform: linux/arm64
+    environment:
+      CXX: clang++
+    volumes:
+      - .:/src:ro
+      - build-clang-arm64:/build
+
+volumes:
+  build-gcc-amd64:
+  build-clang-amd64:
+  build-gcc-arm64:
+  build-clang-arm64:

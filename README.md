@@ -61,6 +61,17 @@ target_link_libraries(${PROJECT_NAME} gmprime)
    ctest --output-on-failure
     ```
 
+### Linux test matrix (Docker)
+
+Builds and tests with GCC and Clang, on x86_64 and ARM64, in Release then in Debug with AddressSanitizer and UndefinedBehaviorSanitizer:
+
+```sh
+docker/test-all.sh                  # every combination in parallel, with a summary
+docker compose run --rm gcc-amd64   # a single one (see compose.yaml for the list)
+```
+
+Sources are mounted read-only and build trees are kept in Docker volumes, so later runs only rebuild what changed. The non-native architecture runs emulated. `docker compose down -v` removes the build volumes.
+
 ## Basic usage
 
 ```cpp
