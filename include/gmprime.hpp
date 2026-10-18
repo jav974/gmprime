@@ -72,13 +72,20 @@ public:
     gmprime& operator&=(const gmprime& other);
     gmprime& operator|=(const gmprime& other);
     gmprime& operator^=(const gmprime& other);
-    gmprime& operator<<=(size_t shift);
-    gmprime& operator>>=(size_t shift);
+    // Shift counts of any integer type. A negative count throws std::domain_error, a left shift beyond the
+    // maximum size of a GMP number throws std::length_error (GMP would abort the program). Right shifts round
+    // toward minus infinity, like an int.
+    template<typename shift_t, std::enable_if_t<std::is_integral_v<shift_t> && !std::is_same_v<shift_t, bool>, bool> = true>
+    gmprime& operator<<=(shift_t shift);
+    template<typename shift_t, std::enable_if_t<std::is_integral_v<shift_t> && !std::is_same_v<shift_t, bool>, bool> = true>
+    gmprime& operator>>=(shift_t shift);
     friend gmprime operator&(const gmprime& lhs, const gmprime& rhs);
     friend gmprime operator|(const gmprime& lhs, const gmprime& rhs);
     friend gmprime operator^(const gmprime& lhs, const gmprime& rhs);
-    gmprime operator<<(size_t shift) const;
-    gmprime operator>>(size_t shift) const;
+    template<typename shift_t, std::enable_if_t<std::is_integral_v<shift_t> && !std::is_same_v<shift_t, bool>, bool> = true>
+    gmprime operator<<(shift_t shift) const;
+    template<typename shift_t, std::enable_if_t<std::is_integral_v<shift_t> && !std::is_same_v<shift_t, bool>, bool> = true>
+    gmprime operator>>(shift_t shift) const;
     gmprime operator~() const;
 
     // UNARY OPERATORS -    +
@@ -171,6 +178,12 @@ private:
     // Same on windows of any width, through GMP operations
     [[nodiscard]] gmprime read_window(size_t pos, size_t width) const;
     void write_window(size_t pos, size_t width, const gmprime& value);
+
+    // Shift count as an unsigned integer, std::domain_error if negative
+    template<typename shift_t>
+    static uintmax_t shift_count(shift_t shift);
+    void shift_left(uintmax_t count);
+    void shift_right(uintmax_t count);
 
     template<bool is_const>
     friend class bit_window;

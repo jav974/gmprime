@@ -64,6 +64,46 @@ word_adapter<word_t> gmprime::as_span(const bool reverse) {
     return word_adapter<word_t>(*this, reverse);
 }
 
+template<typename shift_t>
+uintmax_t gmprime::shift_count(const shift_t shift) {
+    if constexpr (std::is_signed_v<shift_t>) {
+        if (shift < 0) {
+            throw std::domain_error("Negative shift count");
+        }
+    }
+
+    // Wider than uintmax_t (e.g. __int128): saturate, the count is out of reach anyway
+    if constexpr (sizeof(shift_t) > sizeof(uintmax_t)) {
+        if (shift > static_cast<shift_t>(std::numeric_limits<uintmax_t>::max())) {
+            return std::numeric_limits<uintmax_t>::max();
+        }
+    }
+
+    return static_cast<uintmax_t>(shift);
+}
+
+template<typename shift_t, std::enable_if_t<std::is_integral_v<shift_t> && !std::is_same_v<shift_t, bool>, bool>>
+gmprime& gmprime::operator<<=(const shift_t shift) {
+    shift_left(shift_count(shift));
+    return *this;
+}
+
+template<typename shift_t, std::enable_if_t<std::is_integral_v<shift_t> && !std::is_same_v<shift_t, bool>, bool>>
+gmprime& gmprime::operator>>=(const shift_t shift) {
+    shift_right(shift_count(shift));
+    return *this;
+}
+
+template<typename shift_t, std::enable_if_t<std::is_integral_v<shift_t> && !std::is_same_v<shift_t, bool>, bool>>
+gmprime gmprime::operator<<(const shift_t shift) const {
+    return gmprime(*this) <<= shift;
+}
+
+template<typename shift_t, std::enable_if_t<std::is_integral_v<shift_t> && !std::is_same_v<shift_t, bool>, bool>>
+gmprime gmprime::operator>>(const shift_t shift) const {
+    return gmprime(*this) >>= shift;
+}
+
 template<typename word_t>
 size_t gmprime::used_words() const {
     constexpr auto word_size = sizeof(word_t) * CHAR_BIT;

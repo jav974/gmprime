@@ -147,22 +147,38 @@ gmprime & gmprime::operator^=(const gmprime &other) {
     return *this;
 }
 
-gmprime & gmprime::operator<<=(const size_t shift) {
-    _value <<= shift;
-    return *this;
+void gmprime::shift_left(const uintmax_t count) {
+    const auto z = _value.get_mpz_t();
+
+    if (mpz_sgn(z) == 0) {
+        return;
+    }
+
+    // GMP aborts the program beyond its maximum number of limbs (same limit as in its _mpz_realloc), and
+    // takes shift counts as unsigned long (32 bits on Windows)
+    constexpr uintmax_t max_limbs = sizeof(mp_size_t) == sizeof(int)
+        ? std::numeric_limits<unsigned long>::max() / GMP_NUMB_BITS
+        : static_cast<uintmax_t>(std::numeric_limits<int>::max());
+    constexpr uintmax_t max_bits = max_limbs * GMP_NUMB_BITS;
+
+    if (count > std::numeric_limits<mp_bitcnt_t>::max() || count > max_bits - used_bits()) {
+        throw std::length_error("Left shift beyond the maximum size of a number");
+    }
+
+    mpz_mul_2exp(z, z, static_cast<mp_bitcnt_t>(count));
 }
 
-gmprime & gmprime::operator>>=(const size_t shift) {
-    _value >>= shift;
-    return *this;
-}
+void gmprime::shift_right(const uintmax_t count) {
+    const auto z = _value.get_mpz_t();
 
-gmprime gmprime::operator<<(const size_t shift) const {
-    return gmprime(*this) <<= shift;
-}
+    // Every bit shifted out: 0, or -1 for a negative number since the shift rounds toward minus infinity.
+    // Also keeps a huge count from being truncated to unsigned long.
+    if (count >= used_bits()) {
+        mpz_set_si(z, mpz_sgn(z) < 0 ? -1 : 0);
+        return;
+    }
 
-gmprime gmprime::operator>>(const size_t shift) const {
-    return gmprime(*this) >>= shift;
+    mpz_fdiv_q_2exp(z, z, static_cast<mp_bitcnt_t>(count));
 }
 
 gmprime gmprime::operator~() const {
