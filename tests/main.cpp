@@ -1,5 +1,7 @@
 #include <fstream>
 #include <iostream>
+#include <limits>
+#include <stdexcept>
 #include <sys/stat.h>
 #include <boost/ut.hpp>
 #include <gmprime.hpp>
@@ -77,6 +79,35 @@ suite<"gmprime::ctor"> ctor = [] {
         const gmprime v("2a", 16);
         expect(v == 42);
     };
+
+    "ctor_string_invalid"_test = [] {
+        expect(throws<std::invalid_argument>([] { [[maybe_unused]] const gmprime v("12x4"); }));
+        expect(throws<std::invalid_argument>([] { [[maybe_unused]] const gmprime v(""); }));
+        expect(throws<std::invalid_argument>([] { [[maybe_unused]] const gmprime v("2", 2); }));
+    };
+
+    "ctor_floating_point_non_finite"_test = [] {
+        expect(throws<std::domain_error>([] { [[maybe_unused]] const gmprime v(std::numeric_limits<double>::infinity()); }));
+        expect(throws<std::domain_error>([] { [[maybe_unused]] const gmprime v(std::numeric_limits<double>::quiet_NaN()); }));
+    };
+
+    "ctor_64_bit_extremes"_test = [] {
+        expect(gmprime(std::numeric_limits<int64_t>::min()) == gmprime("-9223372036854775808"));
+        expect(gmprime(std::numeric_limits<int64_t>::max()) == gmprime("9223372036854775807"));
+        expect(gmprime(std::numeric_limits<uint64_t>::max()) == gmprime("18446744073709551615"));
+    };
+
+#ifdef __SIZEOF_INT128__
+    // Wider than long on every platform: exercises the path used for 64-bit integers where long is 32 bits (e.g. Windows)
+    "ctor_wider_than_long"_test = [] {
+        const auto max = ~static_cast<unsigned __int128>(0);
+        expect(gmprime(max) == gmprime("340282366920938463463374607431768211455"));
+
+        const auto min = -static_cast<__int128>(max >> 1) - 1;
+        expect(gmprime(min) == gmprime("-170141183460469231731687303715884105728"));
+        expect(gmprime(static_cast<__int128>(-42)) == -42);
+    };
+#endif
 };
 
 suite<"gmprime::assigment"> assign = [] {
@@ -190,6 +221,16 @@ suite<"gmprime::arithmetic"> arithmetic = [] {
         const gmprime b(42);
         a %= b;
         expect(a == 0);
+    };
+    "division_by_zero"_test = [] {
+        gmprime a(42);
+        const gmprime zero;
+
+        expect(throws<std::domain_error>([&] { a / zero; }));
+        expect(throws<std::domain_error>([&] { a % zero; }));
+        expect(throws<std::domain_error>([&] { a /= zero; }));
+        expect(throws<std::domain_error>([&] { a %= zero; }));
+        expect(a == 42) << "operand modified by a failed division";
     };
     "++"_test = [] {
         gmprime r(42);
@@ -342,6 +383,42 @@ suite<"gmprime::accessor"> accessor = [] {
 
         expect(r == 0xF00);
     };
+    "[]<unsigned short>=_beyond_size"_test = [] {
+        gmprime r(1);
+        r.operator[]<unsigned short>(5) = 0xBEEF;
+
+        expect(r == (gmprime(0xBEEF) << 80) + 1);
+    };
+    "[]<unsigned char>=_negative"_test = [] {
+        gmprime r(-0x1092);
+        r[0_ucw] = 0x61;
+
+        expect(r == -0x1061) << "word write must keep the sign";
+    };
+    "[]<signed char>="_test = [] {
+        gmprime r(0x1000);
+        r.operator[]<signed char>(0) = -1;
+
+        expect(r == 0x10FF);
+        expect(r.operator[]<signed char>(0) == -1);
+    };
+#ifdef __SIZEOF_INT128__
+    // A word wider than a limb spans several limbs
+    "[]<unsigned __int128>"_test = [] {
+        const gmprime r("0x0123456789abcdeffedcba98765432100011223344556677", 0);
+        const auto word0 = r.operator[]<unsigned __int128>(0);
+        const auto word1 = r.operator[]<unsigned __int128>(1);
+
+        expect(gmprime(word0) == gmprime("0xfedcba98765432100011223344556677", 0));
+        expect(gmprime(word1) == gmprime("0x0123456789abcdef", 0));
+    };
+    "[]<unsigned __int128>="_test = [] {
+        gmprime r(1);
+        r.operator[]<unsigned __int128>(1) = (static_cast<unsigned __int128>(0xAAAAAAAAAAAAAAAAULL) << 64) | 0x5555555555555555ULL;
+
+        expect(r == gmprime("0xaaaaaaaaaaaaaaaa555555555555555500000000000000000000000000000001", 0));
+    };
+#endif
     "[]<bool>_negative"_test = [] {
         // Bits follow the magnitude, like words do
         gmprime r(-3);
@@ -684,6 +761,10 @@ suite<"gmprime::math"> math = [] {
         const gmprime v(16);
         expect(v.sqrt() == 4);
     };
+    "sqrt_negative"_test = [] {
+        const gmprime v(-16);
+        expect(throws<std::domain_error>([&] { static_cast<void>(v.sqrt()); }));
+    };
     "pow"_test = [] {
         const gmprime v(2);
         expect(v.pow(4) == 16);
@@ -758,6 +839,24 @@ suite<"gmprime::math"> math = [] {
         std::remove(in_path);
         std::remove(out_path);
     };
+
+    "file_write_negative_saves_magnitude"_test = [] {
+        const auto out_path = TEST_FILES_DIR "negative.out.bin";
+
+        const gmprime v(-0x636261);
+        v.save_to_file(out_path);
+
+        std::ifstream out(out_path, std::ios::binary);
+        const std::string written((std::istreambuf_iterator<char>(out)), std::istreambuf_iterator<char>());
+
+        expect(written == std::string("abc"));
+
+        gmprime t;
+        t.load_from_file(out_path);
+        expect(t == 0x636261);
+
+        std::remove(out_path);
+    };
 };
 
 suite<"gmprime::helper"> helper = [] {
@@ -772,7 +871,8 @@ suite<"gmprime::helper"> helper = [] {
 
         v = -42;
 
-        expect(v.to_primitive<char>() == -42);
+        // plain char is unsigned on some platforms (e.g. Linux on ARM)
+        expect(v.to_primitive<signed char>() == -42);
         expect(v.to_primitive<short>() == -42);
         expect(v.to_primitive<int>() == -42);
         expect(v.to_primitive<long>() == -42);
@@ -784,8 +884,24 @@ suite<"gmprime::helper"> helper = [] {
         expect(v.to_primitive<unsigned char>() == UINT8_MAX);
         expect(v.to_primitive<unsigned short>() == UINT16_MAX);
         expect(v.to_primitive<unsigned int>() == UINT32_MAX);
-        expect(v.to_primitive<unsigned long>() == UINT64_MAX);
+        // unsigned long is 32 bits on some platforms (e.g. Windows)
+        expect(v.to_primitive<unsigned long long>() == UINT64_MAX);
     };
+
+    "to_primitive_64_bit_extremes"_test = [] {
+        expect(gmprime("-9223372036854775808").to_primitive<int64_t>() == std::numeric_limits<int64_t>::min());
+        expect(gmprime("9223372036854775807").to_primitive<int64_t>() == std::numeric_limits<int64_t>::max());
+        expect(gmprime("18446744073709551615").to_primitive<uint64_t>() == std::numeric_limits<uint64_t>::max());
+    };
+
+#ifdef __SIZEOF_INT128__
+    "to_primitive_wider_than_long"_test = [] {
+        const auto max = ~static_cast<unsigned __int128>(0);
+        expect(gmprime("340282366920938463463374607431768211455").to_primitive<unsigned __int128>() == max);
+        expect(gmprime("-170141183460469231731687303715884105728").to_primitive<__int128>() == -static_cast<__int128>(max >> 1) - 1);
+        expect(gmprime(-42).to_primitive<__int128>() == -42);
+    };
+#endif
 
     "used_words"_test = [] {
         gmprime v(ULONG_LONG_MAX);
