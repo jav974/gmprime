@@ -37,7 +37,7 @@ struct config {
 
 class model {
 public:
-    explicit model(const config& cfg): _cfg(cfg), _final(1, 1, 0.002), _map1(256 * 256, 0.02), _map2(size_t{1} << 16, 0.02), _match(6) {
+    explicit model(const config& cfg): _cfg(cfg), _final(1, 1, 131), _map1(256 * 256, 1311), _map2(size_t{1} << 16, 1311), _match(6) {
         // Byte contexts, left out by the bitmap variant: orders with their counter limits (stable statistics for
         // low orders, adaptive ones above), words, line structure, last occurrences
         const bool bytes = !cfg.bitmap;
@@ -79,23 +79,23 @@ public:
         // Mixers with weights selected by: the partial byte, the highest order seen with the match state, the
         // previous byte and the bit position, the previous byte's class, the fold neighbourhood
         const size_t inputs = _contexts * 3 + 2 + 1;
-        _mixers.emplace_back(inputs, 256, 0.003);
-        _mixers.emplace_back(inputs, (_orders.size() + 1) * 4, 0.003);
-        _mixers.emplace_back(inputs, 256 * 8, 0.003);
-        _mixers.emplace_back(inputs, 8 * 256, 0.003);
+        _mixers.emplace_back(inputs, 256, 197);
+        _mixers.emplace_back(inputs, (_orders.size() + 1) * 4, 197);
+        _mixers.emplace_back(inputs, 256 * 8, 197);
+        _mixers.emplace_back(inputs, 8 * 256, 197);
         if (cfg.fold) {
-            _mixers.emplace_back(inputs, 256, 0.003);
+            _mixers.emplace_back(inputs, 256, 197);
         }
-        _final = logistic_mixer(_mixers.size() + 1, 1, 0.002, 1.0 / static_cast<double>(_mixers.size()));
+        _final = logistic_mixer(_mixers.size() + 1, 1, 131, 65536 / static_cast<int>(_mixers.size()));
         _x.reserve(inputs);
         _stream.push_back(0);
         new_byte();
     }
 
     // Probability that the next bit is 1
-    double p() {
+    int p() {
         // Mixers learn faster at the start
-        const double rate = 0.003 * (1 + 6.0 * 65536 / (65536 + static_cast<double>(_bits)));
+        const auto rate = 197 + static_cast<int>(uint64_t{197} * 6 * 65536 / (65536 + _bits));
         for (auto& mixer : _mixers) {
             mixer.set_rate(rate);
         }
@@ -107,8 +107,8 @@ public:
 
         // Each context: its probability, its history's probability across contexts, and a deterministic input
         // when only one bit value was ever seen
-        const auto input = [&](const double x) {
-            _x.push_back(static_cast<float>(x));
+        const auto input = [&](const int x) {
+            _x.push_back(x);
         };
         size_t highest_seen = 0;
         for (size_t t = 0; t < _contexts; ++t) {
@@ -121,10 +121,10 @@ public:
                 _tables[t].prefetch(_hashes[t] ^ (next * 0x9E3779B97F4A7C15ull));
                 _tables[t].prefetch(_hashes[t] ^ ((next | 1) * 0x9E3779B97F4A7C15ull));
             }
-            input(slot.seen() ? stretch_fast(slot.p) : 0.0);
-            input(stretch_fast(_maps[t].p(slot.history)));
+            input(slot.seen() ? stretch(clamp_probability(slot.p16())) : 0);
+            input(stretch(clamp_probability(_maps[t].p(slot.history))));
             const int zeros = slot.history.zeros(), ones = slot.history.ones();
-            input(zeros == 0 && ones > 0 ? ones / 4.0 : ones == 0 && zeros > 0 ? -zeros / 4.0 : 0.0);
+            input(zeros == 0 && ones > 0 ? ones * 64 : ones == 0 && zeros > 0 ? -zeros * 64 : 0);
             if (slot.seen() && t < _orders.size()) {
                 highest_seen = t + 1;
             }
@@ -133,11 +133,11 @@ public:
         _expected = _match.expected_bit(_history, _c0, _bit_count);
         const uint32_t length = _match.length();
         _bucket = _expected < 0 ? 0 : std::min(length, 31u) + 1;
-        const double sign = _expected == 1 ? 1.0 : -1.0;
-        input(_expected < 0 ? 0.0 : sign * stretch_fast(_match_counters[_bucket].p));
-        input(_expected < 0 ? 0.0 : sign * std::min(length, 32u) / 16.0);
+        const int sign = _expected == 1 ? 1 : -1;
+        input(_expected < 0 ? 0 : sign * stretch(clamp_probability(_match_counters[_bucket].p16())));
+        input(_expected < 0 ? 0 : sign * static_cast<int>(std::min(length, 32u)) * 16);
         const size_t match_state = _expected < 0 ? 0 : length < 16 ? 1 : length < 32 ? 2 : 3;
-        input(0.3);
+        input(77);
 
         const size_t sets[] = {
             _c0,
@@ -148,14 +148,14 @@ public:
         };
         // Every mixer reads the same inputs, without copying them
         for (size_t i = 0; i < _mixers.size(); ++i) {
-            _final.add(stretch_fast(_mixers[i].mix(_x, sets[i])));
+            _final.add(stretch(_mixers[i].mix(_x, sets[i])));
         }
-        _final.add(0.3);
+        _final.add(77);
         _mixed = _final.mix(0);
 
         // Chained maps: order 1, then order 2 refining the first
-        const double p1 = _map1.refine(_mixed, static_cast<size_t>(_last) * 256 + _c0);
-        const double p2 = _map2.refine(p1, (hash_mix(context_hash(_history, _history.size(), 2)) ^ _c0) & 0xFFFF);
+        const int p1 = _map1.refine(_mixed, static_cast<size_t>(_last) * 256 + _c0);
+        const int p2 = _map2.refine(p1, (hash_mix(context_hash(_history, _history.size(), 2)) ^ _c0) & 0xFFFF);
         return clamp_probability((_mixed + p1 + 2 * p2) / 4);
     }
 
@@ -291,7 +291,7 @@ private:
     last_byte_slot *_word_slot = nullptr, *_three_slot = nullptr;
     std::vector<logistic_mixer> _mixers;
     logistic_mixer _final;
-    std::vector<float> _x;
+    std::vector<int> _x;
     probability_map _map1, _map2;
     match_model _match;
     bit_counter _match_counters[33];
@@ -302,19 +302,19 @@ private:
     int _bit_count = 0, _expected = -1;
     uint8_t _last = 0;
     uint64_t _word = 0, _previous_word = 0;
-    double _mixed = 0.5;
+    int _mixed = 32768;
 };
 
 void encode_number(arithmetic_encoder& encoder, const size_t value, const int bits) {
     for (int i = bits - 1; i >= 0; --i) {
-        encoder.encode(static_cast<int>((value >> i) & 1), 0.5);
+        encoder.encode(static_cast<int>((value >> i) & 1), 32768);
     }
 }
 
 size_t decode_number(arithmetic_decoder& decoder, const int bits) {
     size_t value = 0;
     for (int i = 0; i < bits; ++i) {
-        value = (value << 1) | static_cast<size_t>(decoder.decode(0.5));
+        value = (value << 1) | static_cast<size_t>(decoder.decode(32768));
     }
     return value;
 }

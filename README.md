@@ -196,18 +196,17 @@ The differences are deliberate:
 ### Principles
 
 - **Bit by bit.** Each byte is coded from its highest bit. While coding a byte, `c0` holds the bits coded so far behind a leading 1 (1 at the start of the byte, up to 255), and `bit_count` how many there are. Contexts usually combine the previous bytes with `c0`.
-- **A probability per bit.** A model gives the probability `p` that the next bit is 1. The coder spends about `-log2(p)` bits on a 1 and `-log2(1 - p)` on a 0, so good predictions mean a small message. `clamp_probability` keeps `p` within what the coder handles.
+- **A probability per bit.** A model gives the probability `p` that the next bit is 1, on 16 bits (0 to 65535 for 0 to 1). The coder spends about `-log2(p)` bits on a 1 and `-log2(1 - p)` on a 0, so good predictions mean a small message. `clamp_probability` keeps `p` within what the coder handles.
 - **Causal models, identical on both sides.** For every bit: ask the model for `p`, code (or decode) the bit, then let the model learn it. Models only use what precedes the bit, so the decoder, running the same code on the bits it has decoded, makes the same predictions.
-- **Same build, same platform.** Models compute in floating point (`std::log`, `std::exp`): a message is guaranteed to decode with a decoder built like the encoder, on the same platform.
+- **Integers only.** Models compute in fixed point, without floating point: the same model gives the same predictions with any compiler on any platform, so a message coded on one decodes on all the others. Floating point does not guarantee it (fused multiply-add, for example, changes the last bits of a result, and a single different prediction corrupts the rest of the message).
 
 ### Probabilities
 
 | Tool | Role |
 |---|---|
-| `stretch(p)`, `squash(x)` | the logistic domain, `ln(p / (1 - p))` and its inverse, where predictions are mixed |
-| `stretch_fast(p)`, `squash_fast(x)` | the same from tables (probabilities on 16 bits, squash interpolated over [-12, 12]), without a logarithm or an exponential per call: what to use in a model's inner loop |
+| `stretch(p)`, `squash(x)` | the logistic domain, where predictions are mixed: `stretch` is `ln(p / (1 - p))` in 1/256 units (-3071 to 3071), `squash` its inverse, interpolated from a table and clamped beyond ±12 |
 | `clamp_probability(p)`, `probability_12(p)` | keep `p` within the coder's 12 bits |
-| `bit_counter` | adaptive probability: `update(bit, limit)` moves `p` toward the bit at rate `1 / (n + 1.5)`, fast at first, then more slowly as `n` grows up to `limit` (high for stable data, low to follow changes); `seen()` tells whether it learned anything |
+| `bit_counter` | adaptive probability: `update(bit, limit)` moves it toward the bit at rate `1 / (n + 1.5)`, fast at first, then more slowly as `n` grows up to `limit` (high for stable data, low to follow changes); `p16()` gives it on 16 bits (it keeps 22, so that slow rates still move it); `seen()` tells whether it learned anything |
 | `bit_history` | the counts of 0s and 1s seen in a context in one byte (`zeros()`, `ones()`, up to 15), recent bits weighing more |
 | `history_map` | indirect modeling: `p(history)` is the probability learned, across every context, for contexts with that history; `update(history, bit)` after coding. Rare contexts know little alone, their history generalizes |
 
@@ -227,8 +226,8 @@ A table takes `2^bits` times the slot size: 32 MB for `checked_table<context_slo
 
 | Tool | Role |
 |---|---|
-| `logistic_mixer(inputs, sets, rate)` | combines predictions: `add(x)` each input (usually `stretch(p)`, 0 for "no idea"), `mix(set)` returns `p`, `update(bit)` learns the weights. Each set has its own weights, chosen by a small context (e.g. `c0`), so the mixer learns whom to trust when; `set_rate` changes the learning rate, e.g. decreasing over time. `mix(inputs, set)` reads a `std::vector<float>` kept by the caller instead: several mixers can share the same inputs without copying them |
-| `probability_map(contexts, rate)` | refines a probability given a context: `refine(p, context)`, then `update(bit)`. Averaged with its input, it corrects what the mixer systematically gets wrong |
+| `logistic_mixer(inputs, sets, rate)` | combines predictions: `add(x)` each input (usually `stretch(p)`, 0 for "no idea"), `mix(set)` returns `p`, `update(bit)` learns the weights. Each set has its own weights, chosen by a small context (e.g. `c0`), so the mixer learns whom to trust when. Rates are scaled by 65536 (197 for 0.003); `set_rate` changes it, e.g. decreasing over time. `mix(inputs, set)` reads a `std::vector<int>` kept by the caller instead: several mixers can share the same inputs without copying them |
+| `probability_map(contexts, rate)` | refines a probability given a context: `refine(p, context)`, then `update(bit)`; rate scaled by 65536 (1311 for 0.02). Averaged with its input, it corrects what the mixer systematically gets wrong |
 | `match_model(min_length)` | finds the last earlier occurrence of the last `min_length` bytes and predicts that what followed comes again: `byte_added(history)` after each byte, `expected_bit(history, c0, bit_count)`, `length()` of the match, `miss()` when a prediction fails |
 
 ### Text and bit geometry
@@ -263,26 +262,26 @@ using namespace GMPrime::coding;
 
 class model {
 public:
-    model(): _mixer(2 * 4 + 2 + 1, 256, 0.005), _map(256 * 256, 0.02), _match(6) {
+    model(): _mixer(2 * 4 + 2 + 1, 256, 328), _map(256 * 256, 1311), _match(6) {
         for (int i = 0; i < 4; ++i) {
             _tables.emplace_back(22);
         }
     }
 
-    // Probability that the next bit is 1
-    double p() {
+    // Probability that the next bit is 1, on 16 bits
+    int p() {
         for (size_t i = 0; i < _tables.size(); ++i) {
             _slots[i] = &_tables[i].at(context_hash(_history, _history.size(), i + 1) * 256 + _c0);
-            _mixer.add(_slots[i]->seen() ? stretch(clamp_probability(_slots[i]->p)) : 0.0);
+            _mixer.add(_slots[i]->seen() ? stretch(clamp_probability(_slots[i]->p16())) : 0);
             _mixer.add(stretch(clamp_probability(_maps[i].p(_slots[i]->history))));
         }
         _expected = _match.expected_bit(_history, _c0, _bit_count);
-        const double sign = _expected == 1 ? 1.0 : -1.0;
-        _mixer.add(_expected < 0 ? 0.0 : sign * std::min(_match.length(), 32u) / 4.0);
-        _mixer.add(_expected < 0 ? 0.0 : sign);
-        _mixer.add(0.3);  // bias
+        const int sign = _expected == 1 ? 1 : -1;
+        _mixer.add(_expected < 0 ? 0 : sign * static_cast<int>(std::min(_match.length(), 32u)) * 64);
+        _mixer.add(_expected < 0 ? 0 : sign * 256);
+        _mixer.add(77);  // bias
 
-        const double mixed = _mixer.mix(_c0);
+        const int mixed = _mixer.mix(_c0);
         const uint8_t previous = _history.empty() ? 0 : _history.back();
         return clamp_probability((mixed + 3 * _map.refine(mixed, previous * 256u + _c0)) / 4);
     }
@@ -322,7 +321,7 @@ private:
 gmprime compress(const std::vector<uint8_t>& data) {
     arithmetic_encoder encoder;
     for (int i = 31; i >= 0; --i) {
-        encoder.encode(static_cast<int>(data.size() >> i) & 1, 0.5);  // the length, for the decoder
+        encoder.encode(static_cast<int>(data.size() >> i) & 1, 32768);  // the length, for the decoder
     }
     model m;
     for (const uint8_t byte : data) {
@@ -339,7 +338,7 @@ std::vector<uint8_t> decompress(const gmprime& code) {
     arithmetic_decoder decoder(code);
     size_t size = 0;
     for (int i = 0; i < 32; ++i) {
-        size = (size << 1) | static_cast<size_t>(decoder.decode(0.5));
+        size = (size << 1) | static_cast<size_t>(decoder.decode(32768));
     }
     model m;
     std::vector<uint8_t> data;
@@ -368,7 +367,7 @@ code.load_from_file("alice29.gmc");
 std::vector<uint8_t> data = decompress(code);
 ```
 
-This model compresses `alice29.txt` (152,089 bytes, from the Canterbury corpus) to 38,869 bytes, where bzip2 -9 gives 43,202 and xz -9e 48,536. A research compressor adding the text tools, more orders and a second mixer reaches 1.95 bits per character on it, and folding at the width found by `autocorrelation` halves what xz achieves on a fax image.
+This model compresses `alice29.txt` (152,089 bytes, from the Canterbury corpus) to 38,871 bytes, where bzip2 -9 gives 43,202 and xz -9e 48,536. A research compressor adding the text tools, more orders and a second mixer reaches 1.95 bits per character on it, and folding at the width found by `autocorrelation` halves what xz achieves on a fax image.
 
 ### Going further
 
@@ -394,15 +393,15 @@ On the Canterbury corpus, sizes in bytes:
 
 | File | Size | gzip -9 | bzip2 -9 | xz -9e | gmz | Mode found |
 |---|---|---|---|---|---|---|
-| alice29.txt | 152,089 | 54,194 | 43,202 | 48,536 | **35,563** | text + capitals |
-| asyoulik.txt | 125,179 | 48,803 | 39,569 | 44,600 | **33,542** | text + capitals |
-| lcet10.txt | 426,754 | 144,462 | 107,706 | 119,496 | **86,149** | text + capitals |
-| plrabn12.txt | 481,861 | 194,357 | 145,577 | 165,464 | **123,382** | text + capitals |
-| ptt5 (fax image) | 513,216 | 52,238 | 49,759 | 39,868 | **21,861** | fold of 1728 bits |
-| kennedy.xls | 1,029,744 | 207,053 | 130,280 | 51,876 | **12,970** | fold of 104 bits, layers of 4 |
-| cp.html | 24,603 | 7,960 | 7,624 | 7,660 | **6,174** | text + capitals |
+| alice29.txt | 152,089 | 54,194 | 43,202 | 48,536 | **35,562** | text + capitals |
+| asyoulik.txt | 125,179 | 48,803 | 39,569 | 44,600 | **33,541** | text + capitals |
+| lcet10.txt | 426,754 | 144,462 | 107,706 | 119,496 | **86,148** | text + capitals |
+| plrabn12.txt | 481,861 | 194,357 | 145,577 | 165,464 | **123,383** | text + capitals |
+| ptt5 (fax image) | 513,216 | 52,238 | 49,759 | 39,868 | **21,859** | fold of 1728 bits |
+| kennedy.xls | 1,029,744 | 207,053 | 130,280 | 51,876 | **12,965** | fold of 104 bits, layers of 4 |
+| cp.html | 24,603 | 7,960 | 7,624 | 7,660 | **6,173** | text + capitals |
 | fields.c | 11,150 | 3,136 | 3,039 | 3,040 | **2,319** | text + capitals |
-| grammar.lsp | 3,721 | 1,246 | 1,283 | 1,300 | **990** | text |
+| grammar.lsp | 3,721 | 1,246 | 1,283 | 1,300 | **989** | text |
 | sum | 38,240 | 12,854 | 12,909 | 9,508 | **9,409** | text |
 | xargs.1 | 4,227 | 1,756 | 1,762 | 1,820 | **1,440** | text + capitals |
 
@@ -414,5 +413,7 @@ The price is speed, as for every context-mixing compressor. On Apple Silicon:
 | lcet10.txt | 1.8 s | 1.3 s | 0.08 s | 0.01 s |
 | ptt5 | 1.8 s | 1.1 s | 0.15 s | 0.01 s |
 | kennedy.xls | 6.0 s | 5.2 s | 0.40 s | 0.02 s |
+
+Messages are portable: the same file gives the same message with GCC and Clang, on x86_64 and ARM64, Linux and macOS, and each decodes the others'.
 
 Memory reaches about 800 MB for large inputs (tables are sized for the data, so small files take much less). Decompression runs the same model once, so it takes about as long as compressing does after the comparison. How these times were reached, 2.2 to 4.4 times faster than the first version, is told in [docs/RESEARCH.md](docs/RESEARCH.md).

@@ -19,48 +19,78 @@
 
 namespace GMPrime::coding {
 
-// Logistic domain: stretch(p) = ln(p / (1 - p)), its inverse squash
-inline double stretch(const double p) {
-    return std::log(p / (1 - p));
+// INTEGER ARITHMETIC: probabilities on 16 bits (0 to 65535 for 0 to 1; counters keep 22 bits), the logistic
+// domain in 1/256 units over [-12, 12] (-3072 to 3072), mixer weights in 8.24 fixed point, rates scaled by 65536.
+// No floating point in the models: tables come from integer code or constants, so every platform and compiler
+// computes exactly the same predictions, and a message decodes everywhere (floating point does not guarantee
+// it: compilers may fuse multiplications and additions differently).
+
+// Products of negative values are shifted right throughout, which must keep their sign (guaranteed from C++20,
+// done by every mainstream compiler before)
+static_assert((-5 >> 1) == -3 && (int64_t{-5} >> 1) == -3, "right shifts must be arithmetic");
+
+// squash(d / 256) * 65536 at d = -3072, -3040, ..., 3072, rounded (constants: no exp at run time)
+inline const uint16_t* squash_points() {
+    static const uint16_t points[193] = {
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2,
+    2, 2, 2, 3, 3, 3, 4, 4, 5, 6, 6, 7,
+    8, 9, 10, 12, 13, 15, 17, 19, 22, 25, 28, 32,
+    36, 41, 47, 53, 60, 68, 77, 87, 98, 111, 126, 143,
+    162, 184, 208, 236, 267, 302, 342, 387, 439, 497, 562, 636,
+    720, 815, 922, 1042, 1179, 1333, 1506, 1701, 1921, 2168, 2446, 2758,
+    3108, 3500, 3938, 4427, 4971, 5577, 6249, 6992, 7812, 8714, 9702, 10782,
+    11955, 13226, 14595, 16062, 17625, 19282, 21025, 22849, 24743, 26695, 28693, 30723,
+    32768, 34813, 36843, 38841, 40793, 42687, 44511, 46254, 47911, 49474, 50941, 52310,
+    53581, 54754, 55834, 56822, 57724, 58544, 59287, 59959, 60565, 61109, 61598, 62036,
+    62428, 62778, 63090, 63368, 63615, 63835, 64030, 64203, 64357, 64494, 64614, 64721,
+    64816, 64900, 64974, 65039, 65097, 65149, 65194, 65234, 65269, 65300, 65328, 65352,
+    65374, 65393, 65410, 65425, 65438, 65449, 65459, 65468, 65476, 65483, 65489, 65495,
+    65500, 65504, 65508, 65511, 65514, 65517, 65519, 65521, 65523, 65524, 65526, 65527,
+    65528, 65529, 65530, 65530, 65531, 65532, 65532, 65533, 65533, 65533, 65534, 65534,
+    65534, 65534, 65535, 65535, 65535, 65535, 65535, 65535, 65535, 65535, 65535, 65535,
+    65535,
+    };
+    return points;
 }
 
-inline double squash(const double x) {
-    return 1 / (1 + std::exp(-x));
+// 1 / (1 + e^(-d / 256)) on 16 bits, linearly interpolated between the constant points, clamped beyond 12
+inline int squash(int d) {
+    if (d >= 3072) return 65535;
+    if (d <= -3072) return 1;
+    const int i = (d + 3072) >> 5;
+    const int w = (d + 3072) & 31;
+    const uint16_t* p = squash_points();
+    return (p[i] * (32 - w) + p[i + 1] * w + 16) >> 5;
 }
 
-// Keeps a probability codable on 12 bits
-inline double clamp_probability(const double p) {
-    return std::min(std::max(p, 1.0 / 4096), 4095.0 / 4096);
-}
-
-// stretch(clamp_probability(p)) from a table of probabilities on 16 bits: no logarithm per call
-inline double stretch_fast(const double p) {
+// ln(p / (1 - p)) * 256 for p on 16 bits: the inverse of squash, as a table built from it
+inline int stretch(const int p16) {
     static const auto table = [] {
-        std::vector<float> values(65536);
-        for (int i = 0; i < 65536; ++i) {
-            values[i] = static_cast<float>(stretch(clamp_probability((i + 0.5) / 65536)));
+        std::vector<int16_t> t(65536);
+        int next = 0;
+        for (int d = -3071; d <= 3071; ++d) {
+            const int v = squash(d);
+            for (int i = next; i <= v && i < 65536; ++i) {
+                t[static_cast<size_t>(i)] = static_cast<int16_t>(d);
+            }
+            next = std::max(next, v + 1);
         }
-        return values;
+        for (int i = next; i < 65536; ++i) {
+            t[static_cast<size_t>(i)] = 3071;
+        }
+        return t;
     }();
-    const auto index = static_cast<int>(p * 65536);
-    return table[static_cast<size_t>(std::min(65535, std::max(0, index)))];
+    return table[static_cast<size_t>(std::min(65535, std::max(0, p16)))];
 }
 
-// squash(x) from a table over [-12, 12] with linear interpolation, clamped beyond (where squash leaves the
-// 12-bit range anyway): no exponential per call
-inline double squash_fast(const double x) {
-    constexpr int steps = 8192;
-    static const auto table = [] {
-        std::vector<double> values(steps + 1);
-        for (int i = 0; i <= steps; ++i) {
-            values[i] = squash(-12 + 24.0 * i / steps);
-        }
-        return values;
-    }();
-    const double s = (std::min(11.9999, std::max(-12.0, x)) + 12) * (steps / 24.0);
-    const auto i = static_cast<size_t>(s);
-    const double w = s - static_cast<double>(i);
-    return table[i] * (1 - w) + table[i + 1] * w;
+// Keeps a 16-bit probability within the coder's 12 bits: 1/4096 to 4095/4096
+inline int clamp_probability(const int p16) {
+    return std::min(65520, std::max(16, p16));
+}
+
+// The coder's 12-bit probability of a 16-bit one
+inline uint32_t probability_12(const int p16) {
+    return static_cast<uint32_t>(std::min(4095, std::max(1, (p16 + 8) >> 4)));
 }
 
 // 64-bit hash finalizer (MurmurHash3): spreads close context values over a table
@@ -82,30 +112,42 @@ inline uint64_t context_hash(const std::vector<uint8_t>& history, const size_t p
     return h;
 }
 
-// 1 / (n + 1.5) for n up to 1023, the learning rates of the counters, without a division per update
-inline float counter_rate(const int n) {
+// 65536 / (n + 1.5) for n up to 1023, the learning rates of the counters, by integer division
+inline int counter_rate(const int n) {
     static const auto table = [] {
-        std::vector<float> values(1024);
+        std::vector<int> values(1024);
         for (int i = 0; i < 1024; ++i) {
-            values[i] = static_cast<float>(1 / (i + 1.5));
+            values[static_cast<size_t>(i)] = 131072 / (2 * i + 3);
         }
         return values;
     }();
     return table[static_cast<size_t>(n)];
 }
 
-// Adaptive probability that a bit is 1: moves toward each bit at rate 1 / (n + 1.5), fast while few bits
-// were seen, then more slowly as n grows up to limit (a higher limit suits more stationary data)
+// Moves a 22-bit probability toward a bit at rate counter_rate(n) / 65536. 22 bits, not 16: with slow rates
+// (n large), steps on 16 bits round to 0 well before the probability nears what the coder can use
+inline void learn(uint32_t& p, const int bit, const int n) {
+    const int64_t target = bit ? (1 << 22) - 1 : 0;
+    p = static_cast<uint32_t>(static_cast<int64_t>(p) + (((target - static_cast<int64_t>(p)) * counter_rate(n)) >> 16));
+}
+
+// Adaptive probability that a bit is 1, on 16 bits: moves toward each bit at rate 1 / (n + 1.5), fast while
+// few bits were seen, then more slowly as n grows up to limit
 struct bit_counter {
-    float p = 0.5f;
+    uint32_t p = 1 << 21;   // on 22 bits
     uint16_t n = 0;
 
     [[nodiscard]] bool seen() const {
         return n != 0;
     }
 
+    // The probability on 16 bits
+    [[nodiscard]] int p16() const {
+        return static_cast<int>(p >> 6);
+    }
+
     void update(const int bit, const int limit) {
-        p += (static_cast<float>(bit) - p) * counter_rate(n);
+        learn(p, bit, n);
         if (n < limit) {
             ++n;
         }
@@ -147,12 +189,13 @@ public:
     explicit history_map(const int limit = 1023): _limit(limit) {
         for (int state = 0; state < 256; ++state) {
             // Starts from the counts themselves: (n1 + 1/2) / (n0 + n1 + 1)
-            _counters[state].p = static_cast<float>(((state & 15) + 0.5) / ((state >> 4) + (state & 15) + 1.0));
+            const int n0 = state >> 4, n1 = state & 15;
+            _counters[state].p = static_cast<uint32_t>((2 * n1 + 1) * (1 << 22) / (2 * (n0 + n1 + 1)));
         }
     }
 
-    [[nodiscard]] double p(const bit_history history) const {
-        return _counters[history.state].p;
+    [[nodiscard]] int p(const bit_history history) const {
+        return _counters[history.state].p16();
     }
 
     void update(const bit_history history, const int bit) {
@@ -186,7 +229,7 @@ using hashed_counters = hashed_table<bit_counter>;
 // Everything a context knows about the next bit, in 8 bytes: a direct adaptive probability (as bit_counter),
 // its bit history (for a history_map), and the checksum used by checked_table
 struct context_slot {
-    float p = 0.5f;
+    uint32_t p = 1 << 21;   // on 22 bits
     uint16_t n = 0;
     bit_history history;
     uint8_t check = 0;
@@ -195,8 +238,12 @@ struct context_slot {
         return n != 0;
     }
 
+    [[nodiscard]] int p16() const {
+        return static_cast<int>(p >> 6);
+    }
+
     void update(const int bit, const int limit) {
-        p += (static_cast<float>(bit) - p) * counter_rate(n);
+        learn(p, bit, n);
         if (n < limit) {
             ++n;
         }
@@ -464,7 +511,8 @@ inline int table_bits(const size_t data_bytes, const int max_bits = 22, const in
 class cost_profile {
 public:
     // Records a coded bit and the probability that it is 1 given to the coder
-    void add(const int bit, const double p) {
+    void add(const int bit, const int p16) {
+        const double p = p16 / 65536.0;
         _current -= std::log2(bit ? p : 1 - p);
         if (++_bits == 8) {
             _costs.push_back(_current);
@@ -496,110 +544,92 @@ private:
 // learned by gradient descent on the coding cost, one weight vector per selected set (e.g. per context)
 class logistic_mixer {
 public:
-    logistic_mixer(const size_t inputs, const size_t sets, const double rate, const double initial_weight = 0.3)
-        : _weights(inputs * sets, static_cast<float>(initial_weight)), _inputs(inputs), _rate(rate) {
+    // Weights in 8.24 fixed point (24 bits of fraction, so that the tiny errors of near-certain predictions
+    // still move them). rate: the learning rate times 65536, e.g. 197 for 0.003; weights start at
+    // initial_weight / 65536
+    logistic_mixer(const size_t inputs, const size_t sets, const int rate, const int initial_weight = 19661)
+        : _weights(inputs * sets, initial_weight * 256), _inputs(inputs), _rate(rate) {
         _x.reserve(inputs);
     }
 
-    void add(const double x) {
-        _x.push_back(static_cast<float>(x));
+    // An input in the logistic domain, in 1/256 units (a stretched probability)
+    void add(const int x) {
+        _x.push_back(x);
     }
 
-    // Adds several inputs at once, in order: cheaper than one add per input when they are many
-    void add(const std::vector<float>& inputs) {
-        _x.insert(_x.end(), inputs.begin(), inputs.end());
-    }
-
-    void add(const std::vector<double>& inputs) {
-        for (const double x : inputs) {
-            add(x);
-        }
-    }
-
-    // Mixes the inputs added since the last update with the weights of set
-    double mix(const size_t set) {
-        const double p = mix(_x, set);
+    // Mixes the inputs added since the last update with the weights of set: a 16-bit probability
+    int mix(const size_t set) {
+        const int p = mix(_x, set);
         _in = nullptr;
         return p;
     }
 
     // Mixes inputs kept by the caller, without copying them: they must stay unchanged until update
-    double mix(const std::vector<float>& inputs, const size_t set) {
+    int mix(const std::vector<int>& inputs, const size_t set) {
         _set = set;
         _in = &inputs;
-        const float* w = &_weights[_set * _inputs];
-        const float* x = inputs.data();
-        const size_t n = inputs.size();
-        // Four partial sums, independent so that they run in parallel (vector instructions)
-        float s0 = 0, s1 = 0, s2 = 0, s3 = 0;
-        size_t i = 0;
-        for (; i + 4 <= n; i += 4) {
-            s0 += w[i] * x[i];
-            s1 += w[i + 1] * x[i + 1];
-            s2 += w[i + 2] * x[i + 2];
-            s3 += w[i + 3] * x[i + 3];
+        const int32_t* w = &_weights[_set * _inputs];
+        int64_t dot = 0;
+        for (size_t i = 0; i < inputs.size(); ++i) {
+            dot += static_cast<int64_t>(w[i]) * inputs[i];
         }
-        for (; i < n; ++i) {
-            s0 += w[i] * x[i];
-        }
-        _p = clamp_probability(squash_fast((s0 + s1) + (s2 + s3)));
+        _p = clamp_probability(squash(static_cast<int>(std::max<int64_t>(-3072, std::min<int64_t>(3072, dot >> 24)))));
         return _p;
     }
 
     void update(const int bit) {
-        const auto step = static_cast<float>(_rate * (bit - _p));
-        float* w = &_weights[_set * _inputs];
+        const int64_t err = (bit ? 65535 : 0) - _p;
+        int32_t* w = &_weights[_set * _inputs];
         const auto& x = _in ? *_in : _x;
         for (size_t i = 0; i < x.size(); ++i) {
-            w[i] += step * x[i];
+            w[i] += static_cast<int32_t>((x[i] * err * _rate) >> 16);
         }
         _x.clear();
     }
 
-    // Changes the learning rate, e.g. for a schedule decreasing with the bits seen
-    void set_rate(const double rate) {
+    void set_rate(const int rate) {
         _rate = rate;
     }
 
 private:
-    std::vector<float> _weights, _x;
-    // The caller's inputs given to the last mix, or nullptr for the inputs added to the mixer itself (a
-    // pointer to _x would dangle once the mixer is copied or moved)
-    const std::vector<float>* _in = nullptr;
+    std::vector<int32_t> _weights;
+    std::vector<int> _x;
+    const std::vector<int>* _in = nullptr;
     size_t _inputs, _set = 0;
-    double _rate, _p = 0.5;
+    int64_t _rate;
+    int _p = 32768;
 };
 
-// Adaptive probability map (secondary estimation): refines a probability given a context, interpolating
-// between 33 learned values over its stretched range
+// Adaptive probability map (secondary estimation): refines a 16-bit probability given a context, interpolating
+// between 33 learned values over its stretched range [-8, 8]; rate in 1/65536 (e.g. 1311 for 0.02)
 class probability_map {
 public:
-    probability_map(const size_t contexts, const double rate): _values(contexts * 33), _rate(rate) {
-        // The same 33 values in every context: computed once, then copied
+    probability_map(const size_t contexts, const int rate): _values(contexts * 33), _rate(rate) {
         for (size_t i = 0; i < 33 && i < _values.size(); ++i) {
-            _values[i] = static_cast<float>(squash((static_cast<int>(i) - 16) / 2.0));
+            _values[i] = static_cast<uint32_t>(squash((static_cast<int>(i) - 16) * 128)) << 6;
         }
         for (size_t i = 33; i < _values.size(); ++i) {
             _values[i] = _values[i - 33];
         }
     }
 
-    double refine(const double p, const size_t context) {
-        const double s = std::max(-7.999, std::min(7.999, stretch(p))) * 2 + 16;
-        const auto low = static_cast<size_t>(s);
-        _weight = s - static_cast<double>(low);
-        _index = context * 33 + low;
-        return clamp_probability(_values[_index] * (1 - _weight) + _values[_index + 1] * _weight);
+    int refine(const int p16, const size_t context) {
+        const int s = std::max(-2047, std::min(2047, stretch(p16))) + 2048;
+        _weight = s & 127;
+        _index = context * 33 + static_cast<size_t>(s >> 7);
+        return clamp_probability(static_cast<int>(((static_cast<int64_t>(_values[_index]) * (128 - _weight) + static_cast<int64_t>(_values[_index + 1]) * _weight) >> 7) >> 6));
     }
 
     void update(const int bit) {
-        _values[_index] += static_cast<float>((bit - _values[_index]) * _rate * (1 - _weight));
-        _values[_index + 1] += static_cast<float>((bit - _values[_index + 1]) * _rate * _weight);
+        const int64_t target = bit ? (1 << 22) - 1 : 0;
+        _values[_index] = static_cast<uint32_t>(_values[_index] + (((target - _values[_index]) * _rate * (128 - _weight)) >> 23));
+        _values[_index + 1] = static_cast<uint32_t>(_values[_index + 1] + (((target - _values[_index + 1]) * _rate * _weight) >> 23));
     }
 
 private:
-    std::vector<float> _values;
-    double _rate, _weight = 0;
+    std::vector<uint32_t> _values;   // on 22 bits
+    int64_t _rate;
+    int _weight = 0;
     size_t _index = 0;
 };
 
@@ -676,14 +706,11 @@ private:
 
 // Binary arithmetic coder on 32 bits (carryless), probabilities rounded to 12 bits. The code is the gmprime
 // whose bytes are the output, the first one lowest: the coded message as one number.
-inline uint32_t probability_12(const double p) {
-    return static_cast<uint32_t>(std::min(4095.0, std::max(1.0, std::round(p * 4096))));
-}
 
 class arithmetic_encoder {
 public:
     // Codes bit, p being the probability that it is 1
-    void encode(const int bit, const double p) {
+    void encode(const int bit, const int p) {
         const uint32_t mid = _x1 + static_cast<uint32_t>((static_cast<uint64_t>(_x2 - _x1) * probability_12(p)) >> 12);
         if (bit) {
             _x2 = mid;
@@ -719,7 +746,7 @@ public:
     }
 
     // Decodes a bit, p being the probability that it is 1, as given to the encoder
-    int decode(const double p) {
+    int decode(const int p) {
         const uint32_t mid = _x1 + static_cast<uint32_t>((static_cast<uint64_t>(_x2 - _x1) * probability_12(p)) >> 12);
         const int bit = _x <= mid ? 1 : 0;
         if (bit) {

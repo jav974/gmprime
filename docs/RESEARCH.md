@@ -134,10 +134,28 @@ gmz with everything kept, compared with the first version (compress / decompress
 Sizes moved by at most 2 bytes, except lcet10.txt (+95 bytes) and plrabn12.txt (+77 bytes), where the 64 KB
 sample picks the capitals transform that the whole file does not.
 
+## Portability: integer arithmetic
+
+Floating point broke the decoding across platforms. The same gmz source, compressing the same files, gave 2 to 4
+different messages per file over macOS and Linux, GCC and Clang, x86_64 and ARM64. Compilers may contract
+`a * b + c` into a fused multiply-add where the processor has one, rounding once instead of twice, and do so
+differently; `std::log` and `std::exp` differ between libraries too. One prediction off by the last bit and the
+decoder goes astray for the rest of the message, silently. Sizes and times measured on one platform stay valid:
+each build is consistent with itself.
+
+The toolkit now computes on integers only, as lpaq does:
+
+- probabilities on 16 bits (counters keep 22, so that the slow rates of frequent contexts still move them);
+- the logistic domain in 1/256 units over [-12, 12]: `squash` interpolates 193 constant points, `stretch` is a
+  table built from it;
+- mixer weights in 8.24 fixed point, rates scaled by 65536, dot products on 64 bits;
+- right shifts of negative numbers checked to be arithmetic at compile time.
+
+Messages are now the same bytes on every build, and each decodes the others. Sizes moved by at most 5 bytes
+(kennedy.xls 12,970 to 12,965, alice29.txt 35,563 to 35,562), and speed is the same or up to 16% better.
+
 ## Open ideas
 
-- Integer arithmetic throughout (as lpaq): faster, and messages decodable across platforms, which floating point
-  does not guarantee.
 - A fast mode trading a little compression: nibble buckets, fewer contexts, smaller tables.
 - Prefetching for the first bit of each byte and for the fold templates: kennedy.xls, coded with fold
   templates, gained least.

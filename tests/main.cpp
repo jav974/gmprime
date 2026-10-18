@@ -1187,39 +1187,42 @@ suite<"gmprime::coding"> coding_suite = [] {
     using namespace GMPrime::coding;
 
     "logistic_domain"_test = [] {
-        expect(std::fabs(stretch(0.5)) < 1e-12);
-        expect(std::fabs(squash(stretch(0.8)) - 0.8) < 1e-12);
-        expect(clamp_probability(0) == 1.0 / 4096 && clamp_probability(1) == 4095.0 / 4096);
-        expect(probability_12(0.5) == 2048 && probability_12(0) == 1 && probability_12(1) == 4095);
+        expect(squash(0) == 32768);
+        expect(squash(3072) == 65535 && squash(5000) == 65535 && squash(-3072) == 1 && squash(-5000) == 1) << "clamped beyond 12";
+
+        // Within what the 12-bit coder can tell apart of 65536 / (1 + e^(-d / 256))
+        double worst_squash = 0;
+        int worst_round_trip = 0;
+        for (int d = -3071; d <= 3071; ++d) {
+            worst_squash = std::max(worst_squash, std::fabs(squash(d) - 65536 / (1 + std::exp(-d / 256.0))));
+            if (d >= -1500 && d <= 1500) {
+                worst_round_trip = std::max(worst_round_trip, std::abs(stretch(squash(d)) - d));
+            }
+        }
+        expect(worst_squash < 16) << "squash error" << worst_squash;
+        expect(worst_round_trip <= 1) << "stretch inverts squash" << worst_round_trip;
+        expect(stretch(32768) == 0 && stretch(-5) == stretch(0) && stretch(70000) == stretch(65535));
+
+        expect(clamp_probability(0) == 16 && clamp_probability(65535) == 65520 && clamp_probability(1000) == 1000);
+        expect(probability_12(32768) == 2048 && probability_12(0) == 1 && probability_12(65535) == 4095);
     };
 
-    "logistic_tables"_test = [] {
-        // The tables stay within what the 12-bit coder can tell apart
-        double worst_stretch = 0, worst_squash = 0;
-        for (double p = 0.0005; p < 0.9995; p += 0.0007) {
-            worst_stretch = std::max(worst_stretch, std::fabs(stretch_fast(p) - stretch(clamp_probability(p))));
-        }
-        for (double x = -12; x <= 12; x += 0.013) {
-            worst_squash = std::max(worst_squash, std::fabs(squash_fast(x) - squash(x)));
-        }
-        expect(worst_stretch < 0.01) << "stretch_fast error" << worst_stretch;
-        expect(worst_squash < 1e-5) << "squash_fast error" << worst_squash;
-        expect(stretch_fast(0) == stretch_fast(-1) && stretch_fast(1) == stretch_fast(2)) << "clamped";
-        expect(squash_fast(100) == squash_fast(12) && squash_fast(-100) == squash_fast(-12));
-        expect(std::fabs(counter_rate(0) - 1 / 1.5) < 1e-7 && std::fabs(counter_rate(1023) - 1 / 1024.5) < 1e-9);
+    "counter_rate"_test = [] {
+        // 65536 / (n + 1.5), by integer division
+        expect(counter_rate(0) == 43690 && counter_rate(1) == 26214 && counter_rate(1023) == 63);
     };
 
     "bit_counter"_test = [] {
         bit_counter counter;
-        expect(!counter.seen() && counter.p == 0.5f);
+        expect(!counter.seen() && counter.p16() == 32768);
 
         counter.update(1, 3);
-        expect(counter.seen() && counter.p > 0.8f) << "learns fast at first: rate 1 / 1.5";
+        expect(counter.seen() && counter.p16() > 52428) << "learns fast at first: rate 1 / 1.5";
         for (int i = 0; i < 10; ++i) {
             counter.update(1, 3);
         }
         expect(counter.n == 3) << "the count stops at the limit";
-        expect(counter.p > 0.95f);
+        expect(counter.p16() > 62259);
     };
 
     "bit_history"_test = [] {
@@ -1242,12 +1245,12 @@ suite<"gmprime::coding"> coding_suite = [] {
         history_map map;
         bit_history seen_one;
         seen_one.update(1);
-        expect(std::fabs(map.p(seen_one) - 0.75) < 1e-6) << "starts from the counts: (1 + 1/2) / (0 + 1 + 1)";
+        expect(std::abs(map.p(seen_one) - 49152) <= 1) << "starts from the counts: (1 + 1/2) / (0 + 1 + 1)";
 
         for (int i = 0; i < 50; ++i) {
             map.update(seen_one, 0);
         }
-        expect(map.p(seen_one) < 0.2) << "learns what follows that history in practice";
+        expect(map.p(seen_one) < 13107) << "learns what follows that history in practice";
     };
 
     "hashed_tables"_test = [] {
@@ -1297,7 +1300,7 @@ suite<"gmprime::coding"> coding_suite = [] {
         expect(!slot.seen());
         slot.update(1, 30);
         slot.update(1, 30);
-        expect(slot.seen() && slot.n == 2 && slot.p > 0.9f);
+        expect(slot.seen() && slot.n == 2 && slot.p16() > 58900) << "1/2, then 5/6, then 9/10";
         expect(slot.history.ones() == 2 && slot.history.zeros() == 0);
         expect(sizeof(context_slot) == 8);
     };
@@ -1323,90 +1326,83 @@ suite<"gmprime::coding"> coding_suite = [] {
     };
 
     "logistic_mixer"_test = [] {
-        logistic_mixer mixer(2, 2, 0.05);
+        // Inputs in 1/256 units: 256 is 1, 77 about 0.3; rate 3277 is 0.05
+        logistic_mixer mixer(2, 2, 3277);
         for (int i = 0; i < 200; ++i) {
-            mixer.add(1);
-            mixer.add(0.3);
+            mixer.add(256);
+            mixer.add(77);
             mixer.mix(0);
             mixer.update(1);
         }
-        mixer.add(1);
-        mixer.add(0.3);
-        expect(mixer.mix(0) > 0.9) << "learns to trust an input that predicts well";
+        mixer.add(256);
+        mixer.add(77);
+        expect(mixer.mix(0) > 58982) << "learns to trust an input that predicts well";
         mixer.update(1);
 
-        mixer.add(1);
-        mixer.add(0.3);
-        // Within the precision of float weights and of squash_fast
-        expect(std::fabs(mixer.mix(1) - squash(0.39)) < 1e-5) << "other sets keep their initial weights";
+        mixer.add(256);
+        mixer.add(77);
+        // Initial weights 19661 / 65536, about 0.3, in 8.24
+        expect(mixer.mix(1) == squash(static_cast<int>((int64_t{19661} * 256 * (256 + 77)) >> 24))) << "other sets keep their initial weights";
         mixer.update(1);
 
         mixer.set_rate(0);
-        mixer.add(1);
-        mixer.add(0.3);
-        const double before = mixer.mix(1);
+        mixer.add(256);
+        mixer.add(77);
+        const int before = mixer.mix(1);
         mixer.update(0);
-        mixer.add(1);
-        mixer.add(0.3);
+        mixer.add(256);
+        mixer.add(77);
         expect(mixer.mix(1) == before) << "a zero rate freezes the weights";
         mixer.update(0);
 
-        logistic_mixer one_by_one(3, 1, 0.05), at_once(3, 1, 0.05);
-        const std::vector<double> inputs{0.5, -1, 2};
-        for (int i = 0; i < 20; ++i) {
-            for (const double x : inputs) {
-                one_by_one.add(x);
-            }
-            at_once.add(inputs);
-            expect(one_by_one.mix(0) == at_once.mix(0)) << "adding inputs at once is the same as one by one";
-            one_by_one.update(i % 3 == 0);
-            at_once.update(i % 3 == 0);
-        }
+        logistic_mixer saturated(1, 1, 3277, 65536 * 4);
+        saturated.add(3071);
+        const std::vector<int> negative{-3071};
+        expect(saturated.mix(0) == 65520 && saturated.mix(negative, 0) == 16) << "clamped for the coder";
+        saturated.update(0);
     };
 
     "logistic_mixer_shared_inputs"_test = [] {
-        // The same inputs given in place, added one by one, or added as doubles mix and learn the same way
-        logistic_mixer shared(3, 2, 0.05), added(3, 2, 0.05), doubles(3, 2, 0.05);
-        const std::vector<float> inputs{0.5f, -1.0f, 2.0f};
-        const std::vector<double> inputs_double{0.5, -1, 2};
+        // The same inputs given in place or added one by one mix and learn the same way
+        logistic_mixer shared(3, 2, 3277), added(3, 2, 3277);
+        const std::vector<int> inputs{128, -256, 512};
         for (int i = 0; i < 30; ++i) {
-            for (const float x : inputs) {
+            for (const int x : inputs) {
                 added.add(x);
             }
-            doubles.add(inputs_double);
-            const double p = shared.mix(inputs, i % 2);
-            expect(p == added.mix(i % 2) && p == doubles.mix(i % 2));
+            const int p = shared.mix(inputs, i % 2);
+            expect(p == added.mix(i % 2));
             shared.update(i % 3 == 0);
             added.update(i % 3 == 0);
-            doubles.update(i % 3 == 0);
         }
 
         // A copy of a mixer holding its own inputs learns from its copy of them
-        logistic_mixer original(2, 1, 0.05);
-        original.add(1.0);
-        original.add(0.5);
-        const double before = original.mix(0);
+        logistic_mixer original(2, 1, 3277);
+        original.add(256);
+        original.add(128);
+        const int before = original.mix(0);
         logistic_mixer copy = original;
         original.update(1);
         copy.update(1);
-        original.add(1.0);
-        original.add(0.5);
-        copy.add(1.0);
-        copy.add(0.5);
+        original.add(256);
+        original.add(128);
+        copy.add(256);
+        copy.add(128);
         expect(original.mix(0) == copy.mix(0) && copy.mix(0) > before);
     };
 
     "probability_map"_test = [] {
-        probability_map map(2, 0.1);
-        expect(std::fabs(map.refine(0.7, 0) - 0.7) < 0.02) << "starts close to the identity";
+        // 45875 is about 0.7; rate 6554 is 0.1
+        probability_map map(2, 6554);
+        expect(std::abs(map.refine(45875, 0) - 45875) < 1311) << "starts close to the identity";
 
         for (int i = 0; i < 200; ++i) {
-            map.refine(0.7, 0);
+            map.refine(45875, 0);
             map.update(0);
         }
-        expect(map.refine(0.7, 0) < 0.2) << "learns that 0.7 means 0 in context 0";
+        expect(map.refine(45875, 0) < 13107) << "learns that 0.7 means 0 in context 0";
         map.update(0);
-        expect(std::fabs(map.refine(0.7, 1) - 0.7) < 0.02) << "context 1 unchanged";
+        expect(std::abs(map.refine(45875, 1) - 45875) < 1311) << "context 1 unchanged";
         map.update(1);
     };
 
@@ -1441,7 +1437,7 @@ suite<"gmprime::coding"> coding_suite = [] {
                 uint32_t c0 = 1;
                 for (int i = 7; i >= 0; --i) {
                     auto& counter = counters.at(previous * 256u + c0);
-                    const int bit = code_bit(clamp_probability(counter.p), (static_cast<uint8_t>(text[n]) >> i) & 1);
+                    const int bit = code_bit(clamp_probability(counter.p16()), (static_cast<uint8_t>(text[n]) >> i) & 1);
                     counter.update(bit, 255);
                     c0 = (c0 << 1) | static_cast<uint32_t>(bit);
                 }
@@ -1452,11 +1448,11 @@ suite<"gmprime::coding"> coding_suite = [] {
         };
 
         arithmetic_encoder encoder;
-        code([&](const double p, const int bit) { encoder.encode(bit, p); return bit; });
+        code([&](const int p, const int bit) { encoder.encode(bit, p); return bit; });
         const gmprime compressed = encoder.finish();
 
         arithmetic_decoder decoder(compressed);
-        const auto decoded = code([&](const double p, int) { return decoder.decode(p); });
+        const auto decoded = code([&](const int p, int) { return decoder.decode(p); });
 
         expect(decoded == std::vector<uint8_t>(text.begin(), text.end())) << "decodes what was encoded";
         expect(compressed.bytes().size() < text.size() / 2) << "3 letters: under 2 bits each";
@@ -1465,7 +1461,7 @@ suite<"gmprime::coding"> coding_suite = [] {
         // Certain probabilities, right and wrong, and an empty message
         arithmetic_encoder encoder;
         const int bits[] = {1, 1, 0, 1, 0, 0, 1};
-        const double ps[] = {0.999, 0.001, 0.5, 1.0, 0.0, 0.9999, 0.5};
+        const int ps[] = {65470, 66, 32768, 65535, 0, 65530, 32768};
         for (int i = 0; i < 7; ++i) {
             encoder.encode(bits[i], ps[i]);
         }
@@ -1578,9 +1574,9 @@ suite<"gmprime::coding"> coding_suite = [] {
     "cost_profile"_test = [] {
         cost_profile cost;
         for (int i = 0; i < 8; ++i) {
-            cost.add(i % 2, 0.5);
+            cost.add(i % 2, 32768);
         }
-        cost.add(1, 0.25);
+        cost.add(1, 16384);
 
         expect(cost.per_byte().size() == 1 && std::fabs(cost.per_byte()[0] - 8) < 1e-12) << "1 bit at p = 1/2";
         expect(std::fabs(cost.total() - 10) < 1e-12) << "and the started byte: 2 bits at p = 1/4";
