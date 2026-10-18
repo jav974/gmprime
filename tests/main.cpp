@@ -60,6 +60,15 @@ void counting_free(void* ptr, const size_t size) {
     gmp_default_free(ptr, size);
 }
 
+// Positions of the bits set, read one by one: reference for the bit analysis functions
+void naive_set_bits(const gmprime& value, std::vector<size_t>& positions) {
+    for (size_t pos = 0; pos < value.used_bits(); ++pos) {
+        if (value.get_bit(pos)) {
+            positions.push_back(pos);
+        }
+    }
+}
+
 template<typename L>
 void check_primitive_lhs(const L lhs) {
     if constexpr (has_non_member_operators<L, gmprime>::value) {
@@ -730,6 +739,195 @@ suite<"gmprime::bit_window"> bit_windows = [] {
         expect(std::is_convertible_v<bit_window<true>, gmprime>);
         expect(!std::is_assignable_v<bit_window<true>, unsigned>);
         expect(!std::is_assignable_v<bit_window<true>, const gmprime&>);
+    };
+};
+
+// Each function is also checked against a naive bit-by-bit version on large irregular numbers
+suite<"gmprime::bit_analysis"> bit_analysis = [] {
+    // Bits 3, 64 and 200: in the first, second and fourth limbs
+    const gmprime sparse = (gmprime(1) << 3) + (gmprime(1) << 64) + (gmprime(1) << 200);
+    const gmprime factorial = gmprime::factorial(300);
+    const std::vector<gmprime> irregular = {
+        factorial,
+        factorial.next_prime(),
+        (gmprime(1) << 1000) - 1,
+        gmprime("0x0123456789abcdeffedcba9876543210", 0),
+    };
+
+    "popcount"_test = [&] {
+        expect(gmprime().popcount() == 0);
+        expect(gmprime(0xFF).popcount() == 8);
+        expect(sparse.popcount() == 3);
+        expect(((gmprime(1) << 1000) - 1).popcount() == 1000);
+        expect(gmprime(-0xFF).popcount() == 8) << "the magnitude, not an infinity of two's complement bits";
+
+        for (const auto& value : irregular) {
+            std::vector<size_t> expected;
+            naive_set_bits(value, expected);
+            expect(value.popcount() == expected.size());
+        }
+    };
+    "popcount_text_file"_test = [] {
+        const auto path = TEST_OUTPUT_DIR "popcount.txt";
+        {
+            std::ofstream out(path, std::ios::binary);
+            out << "abc";
+        }
+
+        gmprime text;
+        text.load_from_file(path);
+        expect(text.popcount() == 10) << "a = 0x61, b = 0x62, c = 0x63: 3 + 3 + 4 bits set";
+
+        std::remove(path);
+    };
+
+    "hamming_distance"_test = [&] {
+        expect(gmprime(0b1010).hamming_distance(gmprime(0b0110)) == 2);
+        expect(gmprime(1).hamming_distance(sparse) == 4) << "operands of different sizes: bits 0, 3, 64 and 200";
+        expect(sparse.hamming_distance(gmprime(1)) == 4) << "symmetric";
+        expect(gmprime().hamming_distance(sparse) == sparse.popcount());
+        expect(gmprime(-5).hamming_distance(gmprime(5)) == 0) << "on the magnitudes";
+
+        for (const auto& a : irregular) {
+            for (const auto& b : irregular) {
+                expect(a.hamming_distance(b) == (a ^ b).popcount());
+            }
+        }
+    };
+
+    "next_set_bit"_test = [&] {
+        expect(sparse.next_set_bit() == 3);
+        expect(sparse.next_set_bit(3) == 3);
+        expect(sparse.next_set_bit(4) == 64) << "skips the rest of a limb";
+        expect(sparse.next_set_bit(65) == 200) << "skips whole zero limbs";
+        expect(sparse.next_set_bit(201) == gmprime::npos);
+        expect(sparse.next_set_bit(100000) == gmprime::npos);
+        expect(gmprime().next_set_bit() == gmprime::npos);
+        expect(gmprime(-8).next_set_bit() == 3) << "on the magnitude";
+    };
+
+    "next_clear_bit"_test = [] {
+        expect(gmprime(0b0111).next_clear_bit() == 3);
+        expect(gmprime(0b0111).next_clear_bit(5) == 5);
+        expect(((gmprime(1) << 64) - 1).next_clear_bit() == 64) << "beyond the magnitude, bits are clear";
+        expect(((gmprime(1) << 130) - 1).next_clear_bit(10) == 130) << "skips whole full limbs";
+        expect(((gmprime(1) << 130) - 1).next_clear_bit(1000) == 1000);
+        expect(gmprime().next_clear_bit(7) == 7);
+        expect(gmprime(-7).next_clear_bit() == 3) << "on the magnitude";
+    };
+
+    "set_bits"_test = [&] {
+        const std::vector<size_t> positions(sparse.set_bits().begin(), sparse.set_bits().end());
+        expect(positions == std::vector<size_t>{3, 64, 200});
+
+        const auto empty = gmprime().set_bits();
+        expect(empty.begin() == empty.end());
+
+        for (const auto& value : irregular) {
+            std::vector<size_t> expected;
+            naive_set_bits(value, expected);
+            const auto range = value.set_bits();
+            expect(std::vector<size_t>(range.begin(), range.end()) == expected);
+        }
+    };
+    "set_bits_temporary"_test = [&] {
+        // The temporary would be destroyed before the loop runs if the range only pointed to it
+        std::vector<size_t> positions;
+        for (const size_t pos : (sparse | gmprime(1)).set_bits()) {
+            positions.push_back(pos);
+        }
+        expect(positions == std::vector<size_t>{0, 3, 64, 200});
+
+        // Copies and moves of an owning range keep a valid number
+        auto owning = (sparse & gmprime(0xFF)).set_bits();
+        const auto copy = owning;
+        const auto moved = std::move(owning);
+        expect(std::vector<size_t>(copy.begin(), copy.end()) == std::vector<size_t>{3});
+        expect(std::vector<size_t>(moved.begin(), moved.end()) == std::vector<size_t>{3});
+    };
+    "set_bits_iterator"_test = [&] {
+        const auto range = sparse.set_bits();
+        auto it = range.begin();
+
+        expect(*it == 3);
+        expect(*it++ == 3) << "postfix returns the previous position";
+        expect(*it == 64);
+        expect(std::distance(range.begin(), range.end()) == 3);
+        expect(std::is_same_v<std::iterator_traits<set_bit_iterator>::iterator_category, std::forward_iterator_tag>);
+    };
+
+    "histogram_small"_test = [] {
+        // 0b1101 over 4 bits, sliding windows of 2 bits: bits 0-1 hold 01 (value 1), bits 1-2 hold 10
+        // (value 2, bit 1 being its low bit), bits 2-3 hold 11 (value 3)
+        expect(gmprime(0b1101).histogram(2, 1) == std::vector<size_t>{0, 1, 1, 1});
+        expect(gmprime(0b1101).histogram(2) == std::vector<size_t>{0, 1, 0, 1}) << "aligned: bits 0-1, then 2-3";
+        expect(gmprime(0x0F0F).histogram(4, 8) == std::vector<size_t>{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2})
+            << "step wider than width: the low nibble of each byte";
+        expect(gmprime(1).histogram(8, 0, 24)[0] == 2) << "explicit length: the zero bytes above count";
+        expect(gmprime(-0b1101).histogram(2) == gmprime(0b1101).histogram(2)) << "on the magnitude";
+        expect(gmprime(0b1101).histogram(8) == std::vector<size_t>(256, 0)) << "no complete window";
+    };
+    "histogram_invalid_width"_test = [] {
+        expect(throws<std::invalid_argument>([] { static_cast<void>(gmprime(1).histogram(0)); }));
+        constexpr auto too_wide = gmprime::max_histogram_width + 1;
+        expect(throws<std::invalid_argument>([] { static_cast<void>(gmprime(1).histogram(too_wide)); }));
+    };
+    "histogram_matches_windows"_test = [&] {
+        for (const auto& value : irregular) {
+            for (const size_t width : {1, 3, 8, 13}) {
+                for (const size_t step : {size_t{1}, width, size_t{5}}) {
+                    std::vector<size_t> expected(size_t{1} << width, 0);
+                    for (size_t pos = 0; pos + width <= value.used_bits(); pos += step) {
+                        const uint32_t symbol = value.bits(pos, width);
+                        ++expected[symbol];
+                    }
+                    expect(value.histogram(width, step) == expected);
+                }
+            }
+        }
+    };
+    "histogram_text_file"_test = [] {
+        const auto path = TEST_OUTPUT_DIR "histogram.txt";
+        gmprime text;
+
+        {
+            std::ofstream out(path, std::ios::binary);
+            out << "abca";
+        }
+        text.load_from_file(path);
+        const auto bytes = text.histogram(8);
+        expect(bytes['a'] == 2 && bytes['b'] == 1 && bytes['c'] == 1);
+
+        {
+            std::ofstream out(path, std::ios::binary);
+            out.write("ab\0\0", 4);
+        }
+        text.load_from_file(path);
+        expect(text.histogram(8)[0] == 2) << "the file's high zero bytes count, though GMP does not store them";
+
+        std::remove(path);
+    };
+
+    "entropy"_test = [] {
+        const auto close = [](const double a, const double b) { return std::fabs(a - b) < 1e-12; };
+
+        expect(close(gmprime::entropy({}), 0));
+        expect(close(gmprime::entropy({0, 0}), 0));
+        expect(close(gmprime::entropy({5}), 0)) << "a single symbol carries no information";
+        expect(close(gmprime::entropy({7, 7}), 1));
+        expect(close(gmprime::entropy({3, 1}), 0.8112781244591328));
+        expect(close(gmprime::entropy(std::vector<size_t>(256, 1)), 8)) << "uniform bytes: 8 bits per byte";
+    };
+    "entropy_text"_test = [] {
+        const gmprime same("0x61616161", 0);
+        expect(gmprime::entropy(same.histogram(8)) == 0) << "aaaa";
+
+        // Every byte value once: incompressible byte by byte
+        gmprime all;
+        for (unsigned value = 0; value < 256; ++value) {
+            all.bits(8 * value, 8) = value;
+        }
+        expect(std::fabs(gmprime::entropy(all.histogram(8)) - 8) < 1e-12);
     };
 };
 
