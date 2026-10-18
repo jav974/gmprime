@@ -773,21 +773,21 @@ suite<"gmprime::string"> string = [] {
         v.load_from_file(TEST_FILES_DIR "dummy.txt");
         expect(v > 0);
 
-        v.save_to_file(TEST_FILES_DIR "dummy.out.txt");
+        v.save_to_file(TEST_OUTPUT_DIR "dummy.out.txt");
 
         struct stat buffer{};
-        const bool exists = (stat (TEST_FILES_DIR "dummy.out.txt", &buffer) == 0);
+        const bool exists = (stat (TEST_OUTPUT_DIR "dummy.out.txt", &buffer) == 0);
 
         expect(exists) << "Out file not written";
 
         gmprime t;
-        t.load_from_file(TEST_FILES_DIR "dummy.out.txt");
+        t.load_from_file(TEST_OUTPUT_DIR "dummy.out.txt");
 
         expect(t.operator[]<char>(0) == 'a');
         expect(t.operator[]<char>(1) == 'b');
         expect(t.operator[]<char>(2) == 'c');
 
-        std::remove(TEST_FILES_DIR "dummy.out.txt");
+        std::remove(TEST_OUTPUT_DIR "dummy.out.txt");
     };
 };
 
@@ -831,8 +831,8 @@ suite<"gmprime::math"> math = [] {
 
     "file_round_trip_trailing_zeros"_test = [] {
         const char data[] = {'a', 'b', 'c', '\0', '\0'};
-        const auto in_path = TEST_FILES_DIR "trailing_zeros.in.bin";
-        const auto out_path = TEST_FILES_DIR "trailing_zeros.out.bin";
+        const auto in_path = TEST_OUTPUT_DIR "trailing_zeros.in.bin";
+        const auto out_path = TEST_OUTPUT_DIR "trailing_zeros.out.bin";
 
         {
             std::ofstream in(in_path, std::ios::binary);
@@ -853,8 +853,8 @@ suite<"gmprime::math"> math = [] {
     };
 
     "file_size_reset_on_assignment"_test = [] {
-        const auto in_path = TEST_FILES_DIR "trailing_zeros.in.bin";
-        const auto out_path = TEST_FILES_DIR "trailing_zeros.out.bin";
+        const auto in_path = TEST_OUTPUT_DIR "trailing_zeros.in.bin";
+        const auto out_path = TEST_OUTPUT_DIR "trailing_zeros.out.bin";
 
         {
             std::ofstream in(in_path, std::ios::binary);
@@ -876,7 +876,7 @@ suite<"gmprime::math"> math = [] {
     };
 
     "file_write_negative_saves_magnitude"_test = [] {
-        const auto out_path = TEST_FILES_DIR "negative.out.bin";
+        const auto out_path = TEST_OUTPUT_DIR "negative.out.bin";
 
         const gmprime v(-0x636261);
         v.save_to_file(out_path);
