@@ -60,6 +60,15 @@ void counting_free(void* ptr, const size_t size) {
     gmp_default_free(ptr, size);
 }
 
+// Positions of the bits set, read one by one: reference for the bit analysis functions
+void naive_set_bits(const gmprime& value, std::vector<size_t>& positions) {
+    for (size_t pos = 0; pos < value.used_bits(); ++pos) {
+        if (value.get_bit(pos)) {
+            positions.push_back(pos);
+        }
+    }
+}
+
 template<typename L>
 void check_primitive_lhs(const L lhs) {
     if constexpr (has_non_member_operators<L, gmprime>::value) {
@@ -745,16 +754,6 @@ suite<"gmprime::bit_analysis"> bit_analysis = [] {
         gmprime("0x0123456789abcdeffedcba9876543210", 0),
     };
 
-    const auto naive_set_bits = [](const gmprime& value) {
-        std::vector<size_t> positions;
-        for (size_t pos = 0; pos < value.used_bits(); ++pos) {
-            if (value.get_bit(pos)) {
-                positions.push_back(pos);
-            }
-        }
-        return positions;
-    };
-
     "popcount"_test = [&] {
         expect(gmprime().popcount() == 0);
         expect(gmprime(0xFF).popcount() == 8);
@@ -763,7 +762,9 @@ suite<"gmprime::bit_analysis"> bit_analysis = [] {
         expect(gmprime(-0xFF).popcount() == 8) << "the magnitude, not an infinity of two's complement bits";
 
         for (const auto& value : irregular) {
-            expect(value.popcount() == naive_set_bits(value).size());
+            std::vector<size_t> expected;
+            naive_set_bits(value, expected);
+            expect(value.popcount() == expected.size());
         }
     };
     "popcount_text_file"_test = [] {
@@ -823,8 +824,10 @@ suite<"gmprime::bit_analysis"> bit_analysis = [] {
         expect(empty.begin() == empty.end());
 
         for (const auto& value : irregular) {
+            std::vector<size_t> expected;
+            naive_set_bits(value, expected);
             const auto range = value.set_bits();
-            expect(std::vector<size_t>(range.begin(), range.end()) == naive_set_bits(value));
+            expect(std::vector<size_t>(range.begin(), range.end()) == expected);
         }
     };
     "set_bits_temporary"_test = [&] {
