@@ -55,7 +55,7 @@ public:
 
     template<typename U = T, std::enable_if_t<!std::is_same_v<U, bool> && !std::is_same_v<T, bool>, bool> = true>
     reference& operator-=(const U value) {
-        return operator=(operator T() + value);
+        return operator=(operator T() - value);
     }
 
     template<typename U = T, std::enable_if_t<!std::is_same_v<U, bool>, bool> = true>

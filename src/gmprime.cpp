@@ -19,25 +19,65 @@ const mpz_class & gmprime::get_value() const {
     return _value;
 }
 
-gmprime gmprime::operator+(const gmprime &other) const {
-    return gmprime(*this) += other;
+namespace GMPrime {
+
+gmprime operator+(const gmprime &lhs, const gmprime &rhs) {
+    return gmprime(lhs) += rhs;
 }
 
-gmprime gmprime::operator-(const gmprime &other) const {
-    return gmprime(*this) -= other;
+gmprime operator-(const gmprime &lhs, const gmprime &rhs) {
+    return gmprime(lhs) -= rhs;
 }
 
-gmprime gmprime::operator*(const gmprime &other) const {
-    return gmprime(*this) *= other;
+gmprime operator*(const gmprime &lhs, const gmprime &rhs) {
+    return gmprime(lhs) *= rhs;
 }
 
-gmprime gmprime::operator/(const gmprime &other) const {
-    return gmprime(*this) /= other;
+gmprime operator/(const gmprime &lhs, const gmprime &rhs) {
+    return gmprime(lhs) /= rhs;
 }
 
-gmprime gmprime::operator%(const gmprime &other) const {
-    return gmprime(*this) %= other;
+gmprime operator%(const gmprime &lhs, const gmprime &rhs) {
+    return gmprime(lhs) %= rhs;
 }
+
+gmprime operator&(const gmprime &lhs, const gmprime &rhs) {
+    return gmprime(lhs) &= rhs;
+}
+
+gmprime operator|(const gmprime &lhs, const gmprime &rhs) {
+    return gmprime(lhs) |= rhs;
+}
+
+gmprime operator^(const gmprime &lhs, const gmprime &rhs) {
+    return gmprime(lhs) ^= rhs;
+}
+
+bool operator==(const gmprime &lhs, const gmprime &rhs) {
+    return lhs._value == rhs._value;
+}
+
+bool operator!=(const gmprime &lhs, const gmprime &rhs) {
+    return lhs._value != rhs._value;
+}
+
+bool operator<=(const gmprime &lhs, const gmprime &rhs) {
+    return lhs._value <= rhs._value;
+}
+
+bool operator>=(const gmprime &lhs, const gmprime &rhs) {
+    return lhs._value >= rhs._value;
+}
+
+bool operator<(const gmprime &lhs, const gmprime &rhs) {
+    return lhs._value < rhs._value;
+}
+
+bool operator>(const gmprime &lhs, const gmprime &rhs) {
+    return lhs._value > rhs._value;
+}
+
+} // GMPrime
 
 gmprime & gmprime::operator+=(const gmprime &other) {
     _value += other._value;
@@ -99,18 +139,6 @@ gmprime & gmprime::operator>>=(const size_t shift) {
     return *this;
 }
 
-gmprime gmprime::operator&(const gmprime &other) const {
-    return gmprime(*this) &= other;
-}
-
-gmprime gmprime::operator|(const gmprime &other) const {
-    return gmprime(*this) |= other;
-}
-
-gmprime gmprime::operator^(const gmprime &other) const {
-    return gmprime(*this) ^= other;
-}
-
 gmprime gmprime::operator<<(const size_t shift) const {
     return gmprime(*this) <<= shift;
 }
@@ -137,30 +165,6 @@ gmprime gmprime::operator-() const {
     return result;
 }
 
-bool gmprime::operator==(const gmprime &other) const {
-    return _value == other._value;
-}
-
-bool gmprime::operator!=(const gmprime &other) const {
-    return _value != other._value;
-}
-
-bool gmprime::operator<=(const gmprime &other) const {
-    return _value <= other._value;
-}
-
-bool gmprime::operator>=(const gmprime &other) const {
-    return _value >= other._value;
-}
-
-bool gmprime::operator<(const gmprime &other) const {
-    return _value < other._value;
-}
-
-bool gmprime::operator>(const gmprime &other) const {
-    return _value > other._value;
-}
-
 size_t gmprime::used_bits() const {
     if (_value == 0) return 0;
 
@@ -172,14 +176,27 @@ size_t gmprime::size_in_base(const int base) const {
 }
 
 bool gmprime::get_bit(const size_t pos) const {
-    return mpz_tstbit(_value.get_mpz_t(), pos) == 1;
+    // mpz_tstbit uses two's complement for negative values, read the magnitude instead
+    const auto limb = mpz_getlimbn(_value.get_mpz_t(), static_cast<mp_size_t>(pos / GMP_NUMB_BITS));
+    return (limb >> (pos % GMP_NUMB_BITS)) & 1;
 }
 
 gmprime & gmprime::set_bit(const size_t pos, const bool value) {
+    // mpz_setbit/mpz_clrbit use two's complement for negative values: work on the magnitude (mpz_neg is O(1))
+    const bool negative = mpz_sgn(_value.get_mpz_t()) < 0;
+
+    if (negative) {
+        mpz_neg(_value.get_mpz_t(), _value.get_mpz_t());
+    }
+
     if (value) {
         mpz_setbit(_value.get_mpz_t(), pos);
     } else {
         mpz_clrbit(_value.get_mpz_t(), pos);
+    }
+
+    if (negative) {
+        mpz_neg(_value.get_mpz_t(), _value.get_mpz_t());
     }
 
     return *this;
@@ -211,6 +228,7 @@ gmprime & gmprime::load_from_file(const std::string &file_path) {
 
     // Import the buffer into the mpz_t variable
     mpz_import(_value.get_mpz_t(), size / sizeof(char), -1, sizeof(char), 0, 0, buffer.data());
+    _byte_size = static_cast<size_t>(size);
 
     return *this;
 }
@@ -228,6 +246,11 @@ void gmprime::save_to_file(const std::string &file_path) const {
 
     // Write the data to the file
     file.write(static_cast<const char*>(data), static_cast<std::streamsize>(size));
+
+    if (_byte_size > size) {
+        const std::vector<char> padding(_byte_size - size, 0);
+        file.write(padding.data(), static_cast<std::streamsize>(padding.size()));
+    }
     file.close();
 
     // Free the allocated memory for export
