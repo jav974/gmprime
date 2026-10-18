@@ -15,6 +15,8 @@ endif()
 add_executable(tests main.cpp)
 target_link_libraries(tests PRIVATE gmprime Boost::ut)
 target_include_directories(tests PRIVATE src)
+# Absolute path to test data, independent of the build directory location
+target_compile_definitions(tests PRIVATE TEST_FILES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/files/")
 
 # Enable testing
 enable_testing()

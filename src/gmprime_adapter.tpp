@@ -6,8 +6,12 @@ public:
     using iterator_category = std::bidirectional_iterator_tag;
 
     word_iterator() = default;
-    word_iterator(const word_iterator& other) = default;
-    word_iterator(word_iterator&& other) = default;
+    // _current must keep pointing to our own _data, never to the source's one
+    word_iterator(const word_iterator& other) : _data(other._data), _index(other._index), _reverse(other._reverse) {
+    }
+
+    word_iterator(word_iterator&& other) noexcept : word_iterator(other) {
+    }
 
     explicit word_iterator(gmprime& value, const int64_t index, const bool reverse = false) {
         _data = value.operator[]<word_t>(std::max(static_cast<int64_t>(0), index));
