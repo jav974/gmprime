@@ -354,6 +354,19 @@ Without the checksum, sizes moved by at most 5 bytes (kennedy.xls 12,970 to 12,9
 
 ## Open ideas
 
+Direction, after the broad evaluation: gmz's text model is the PAQ family's context mixing, the state of the art,
+and adding to it would rebuild paq8px for a few percent. The results that broke ground came from recognizing the
+computation behind the bytes: decimals stored as doubles (sao, 47% below zpaq), pixels as numbers (x-ray, below
+paq8px), geometry found by folding the whole number. That is the axis now:
+
+- Numbers written in text (CSV, logs, JSON): parsed and predicted as numbers, not digit by digit.
+- Computed fields, which cost nothing once recognized: checksums (CRC of PNG chunks or zip entries), derived
+  columns, counters, timestamps.
+- Other computations to invert: floating point values from other operations than k * step, data already
+  compressed (deflate inside PNG, docx, PDF).
+
+Earlier ideas:
+
 - Several folds at once, for data with nested periods.
 - Records of variable length (osdb, where zpaq stays 0.4% ahead): resynchronizing on separators.
 - An exact formula for sao's residuals: about 2.5 bits per double are left on the table.
