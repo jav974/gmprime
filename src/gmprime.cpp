@@ -555,6 +555,79 @@ gmprime gmprime::factorial(const unsigned int n) {
     return result;
 }
 
+gmprime gmprime::binomial(const unsigned long n, const unsigned long k) {
+    gmprime result;
+    // GMP's C functions never throw (it aborts on allocation failure): no cleanup to plan for
+    [&]() noexcept {
+        mpz_bin_uiui(result._value.get_mpz_t(), n, k);
+    }();
+    return result;
+}
+
+gmprime gmprime::combination_rank(const size_t length) const {
+    const size_t end = used_bits();
+    if (end > length) {
+        throw std::invalid_argument("Bit set at " + std::to_string(end - 1) + ", beyond a length of " + std::to_string(length));
+    }
+
+    // Walks the positions up to the highest bit set, keeping current = C(p, i), i - 1 being the bits set below p:
+    // each step multiplies and exactly divides it by small numbers
+    gmprime rank;
+    mpz_class current = 0;
+    unsigned long i = 1;
+    for (unsigned long p = 0; p < end; ++p) {
+        if (get_bit(p)) {
+            rank._value += current;
+            // C(p + 1, i + 1) = C(p, i) (p + 1) / (i + 1)
+            mpz_mul_ui(current.get_mpz_t(), current.get_mpz_t(), p + 1);
+            mpz_divexact_ui(current.get_mpz_t(), current.get_mpz_t(), i + 1);
+            ++i;
+        } else if (p >= i) {
+            // C(p + 1, i) = C(p, i) (p + 1) / (p + 1 - i)
+            mpz_mul_ui(current.get_mpz_t(), current.get_mpz_t(), p + 1);
+            mpz_divexact_ui(current.get_mpz_t(), current.get_mpz_t(), p + 1 - i);
+        } else {
+            // p = i - 1, every position below set: C(p + 1, i) = C(i, i) = 1
+            current = 1;
+        }
+    }
+    return rank;
+}
+
+gmprime gmprime::from_combination_rank(const gmprime& rank, const size_t length, const size_t ones) {
+    const mpz_class count = binomial(length, ones)._value;
+    if (ones > length || sgn(rank._value) < 0 || rank._value >= count) {
+        throw std::invalid_argument("No arrangement of rank " + rank.to_string() + " for " + std::to_string(ones) + " bits set among "
+                                    + std::to_string(length));
+    }
+
+    // From the highest position down, with current = C(p, i), i the bits left to set: bit p is set when the rank
+    // left reaches C(p, i), the count of arrangements with all i bits below p
+    gmprime result;
+    mpz_class left = rank._value, current = 0;
+    if (length > 0) {
+        mpz_bin_uiui(current.get_mpz_t(), length - 1, ones);
+    }
+    unsigned long i = ones;
+    for (unsigned long p = length; p-- > 0 && i > 0;) {
+        if (current <= left) {
+            mpz_setbit(result._value.get_mpz_t(), p);
+            left -= current;
+            // C(p - 1, i - 1) = C(p, i) i / p, 0 once fewer positions than bits are left
+            if (current != 0) {
+                mpz_mul_ui(current.get_mpz_t(), current.get_mpz_t(), i);
+                mpz_divexact_ui(current.get_mpz_t(), current.get_mpz_t(), p);
+            }
+            --i;
+        } else {
+            // C(p - 1, i) = C(p, i) (p - i) / p
+            mpz_mul_ui(current.get_mpz_t(), current.get_mpz_t(), p - i);
+            mpz_divexact_ui(current.get_mpz_t(), current.get_mpz_t(), p);
+        }
+    }
+    return result;
+}
+
 gmprime GMPrime::abs(const gmprime &value) {
     gmprime result;
     mpz_abs(result.get_value().get_mpz_t(), value.get_value().get_mpz_t());

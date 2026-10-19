@@ -1,8 +1,17 @@
 # Compresses INPUT with GMZ into OUTPUT.gmz, decompresses it into OUTPUT, and checks OUTPUT equals INPUT.
 # OPTIONS: gmz options, as a CMake list, given to both commands
+# DECOMPRESS_OPTIONS: options given to the decompression instead, which must then fail without writing OUTPUT
 execute_process(COMMAND ${GMZ} ${OPTIONS} c ${INPUT} ${OUTPUT}.gmz RESULT_VARIABLE compress_result)
 if (NOT compress_result EQUAL 0)
     message(FATAL_ERROR "gmz c failed: ${compress_result}")
+endif ()
+if (DEFINED DECOMPRESS_OPTIONS)
+    file(REMOVE ${OUTPUT})
+    execute_process(COMMAND ${GMZ} ${DECOMPRESS_OPTIONS} d ${OUTPUT}.gmz ${OUTPUT} RESULT_VARIABLE decompress_result)
+    if (decompress_result EQUAL 0 OR EXISTS ${OUTPUT})
+        message(FATAL_ERROR "gmz d accepted data that does not match its checksum")
+    endif ()
+    return ()
 endif ()
 execute_process(COMMAND ${GMZ} ${OPTIONS} d ${OUTPUT}.gmz ${OUTPUT} RESULT_VARIABLE decompress_result)
 if (NOT decompress_result EQUAL 0)

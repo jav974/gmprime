@@ -6,9 +6,12 @@
 #include <sys/stat.h>
 #include <unordered_map>
 #include <unordered_set>
+#include <cstring>
+#include <ctime>
 #include <boost/ut.hpp>
 #include <gmprime.hpp>
 #include <gmprime_coding.hpp>
+#include <gmprime_records.hpp>
 
 using namespace boost::ut;
 using namespace GMPrime;
@@ -1174,6 +1177,12 @@ suite<"gmprime::context_analysis"> context_analysis = [] {
         const auto tiny = gmprime(5).analyze_folds();
         expect(tiny.width == 0 && !tiny.strong()) << "too short to search";
         expect(value.analyze_folds(100, 50).width == 0) << "no width to search";
+
+        // A sample of 40 rows finds the same fold; a sample larger than the data analyzes all of it
+        const auto sampled = gmprime::from_bytes(bitmap).analyze_folds(64, 8192, width * 40 / 8);
+        expect(sampled.width == width && sampled.strong());
+        const auto all = gmprime::from_bytes(bitmap).analyze_folds(64, 8192, bitmap.size() * 2);
+        expect(all.width == folds.width && all.score == folds.score && all.layer == folds.layer);
     };
 };
 
@@ -1181,23 +1190,42 @@ suite<"gmprime::coding"> coding_suite = [] {
     using namespace GMPrime::coding;
 
     "logistic_domain"_test = [] {
-        expect(std::fabs(stretch(0.5)) < 1e-12);
-        expect(std::fabs(squash(stretch(0.8)) - 0.8) < 1e-12);
-        expect(clamp_probability(0) == 1.0 / 4096 && clamp_probability(1) == 4095.0 / 4096);
-        expect(probability_12(0.5) == 2048 && probability_12(0) == 1 && probability_12(1) == 4095);
+        expect(squash(0) == 32768);
+        expect(squash(3072) == 65535 && squash(5000) == 65535 && squash(-3072) == 1 && squash(-5000) == 1) << "clamped beyond 12";
+
+        // Within what the 12-bit coder can tell apart of 65536 / (1 + e^(-d / 256))
+        double worst_squash = 0;
+        int worst_round_trip = 0;
+        for (int d = -3071; d <= 3071; ++d) {
+            worst_squash = std::max(worst_squash, std::fabs(squash(d) - 65536 / (1 + std::exp(-d / 256.0))));
+            if (d >= -1500 && d <= 1500) {
+                worst_round_trip = std::max(worst_round_trip, std::abs(stretch(squash(d)) - d));
+            }
+        }
+        expect(worst_squash < 16) << "squash error" << worst_squash;
+        expect(worst_round_trip <= 1) << "stretch inverts squash" << worst_round_trip;
+        expect(stretch(32768) == 0 && stretch(-5) == stretch(0) && stretch(70000) == stretch(65535));
+
+        expect(clamp_probability(0) == 16 && clamp_probability(65535) == 65520 && clamp_probability(1000) == 1000);
+        expect(probability_12(32768) == 2048 && probability_12(0) == 1 && probability_12(65535) == 4095);
+    };
+
+    "counter_rate"_test = [] {
+        // 65536 / (n + 1.5), by integer division
+        expect(counter_rate(0) == 43690 && counter_rate(1) == 26214 && counter_rate(1023) == 63);
     };
 
     "bit_counter"_test = [] {
         bit_counter counter;
-        expect(!counter.seen() && counter.p == 0.5f);
+        expect(!counter.seen() && counter.p16() == 32768);
 
         counter.update(1, 3);
-        expect(counter.seen() && counter.p > 0.8f) << "learns fast at first: rate 1 / 1.5";
+        expect(counter.seen() && counter.p16() > 52428) << "learns fast at first: rate 1 / 1.5";
         for (int i = 0; i < 10; ++i) {
             counter.update(1, 3);
         }
         expect(counter.n == 3) << "the count stops at the limit";
-        expect(counter.p > 0.95f);
+        expect(counter.p16() > 62259);
     };
 
     "bit_history"_test = [] {
@@ -1220,12 +1248,12 @@ suite<"gmprime::coding"> coding_suite = [] {
         history_map map;
         bit_history seen_one;
         seen_one.update(1);
-        expect(std::fabs(map.p(seen_one) - 0.75) < 1e-6) << "starts from the counts: (1 + 1/2) / (0 + 1 + 1)";
+        expect(std::abs(map.p(seen_one) - 49152) <= 1) << "starts from the counts: (1 + 1/2) / (0 + 1 + 1)";
 
         for (int i = 0; i < 50; ++i) {
             map.update(seen_one, 0);
         }
-        expect(map.p(seen_one) < 0.2) << "learns what follows that history in practice";
+        expect(map.p(seen_one) < 13107) << "learns what follows that history in practice";
     };
 
     "hashed_tables"_test = [] {
@@ -1253,13 +1281,29 @@ suite<"gmprime::coding"> coding_suite = [] {
         expect(!table.at(other).seen()) << "another context resets the slot instead of sharing it";
         expect(!table.at(0).seen()) << "and the newest context owns it";
     };
+    "checked_table_buckets"_test = [] {
+        checked_table<context_slot> table(10);
+        table.prefetch(42);
+        expect(!table.at(42).seen()) << "a prefetch changes nothing";
+
+        // The 16 offsets of one hash are distinct slots, all owned by that hash
+        for (size_t offset = 0; offset < 16; ++offset) {
+            table.at(7, offset).update(1, 30);
+            table.at(7, offset).n = static_cast<uint16_t>(offset + 1);
+        }
+        bool distinct = true;
+        for (size_t offset = 0; offset < 16; ++offset) {
+            distinct = distinct && table.at(7, offset).n == offset + 1;
+        }
+        expect(distinct);
+    };
 
     "context_slot"_test = [] {
         context_slot slot;
         expect(!slot.seen());
         slot.update(1, 30);
         slot.update(1, 30);
-        expect(slot.seen() && slot.n == 2 && slot.p > 0.9f);
+        expect(slot.seen() && slot.n == 2 && slot.p16() > 58900) << "1/2, then 5/6, then 9/10";
         expect(slot.history.ones() == 2 && slot.history.zeros() == 0);
         expect(sizeof(context_slot) == 8);
     };
@@ -1285,57 +1329,83 @@ suite<"gmprime::coding"> coding_suite = [] {
     };
 
     "logistic_mixer"_test = [] {
-        logistic_mixer mixer(2, 2, 0.05);
+        // Inputs in 1/256 units: 256 is 1, 77 about 0.3; rate 3277 is 0.05
+        logistic_mixer mixer(2, 2, 3277);
         for (int i = 0; i < 200; ++i) {
-            mixer.add(1);
-            mixer.add(0.3);
+            mixer.add(256);
+            mixer.add(77);
             mixer.mix(0);
             mixer.update(1);
         }
-        mixer.add(1);
-        mixer.add(0.3);
-        expect(mixer.mix(0) > 0.9) << "learns to trust an input that predicts well";
+        mixer.add(256);
+        mixer.add(77);
+        expect(mixer.mix(0) > 58982) << "learns to trust an input that predicts well";
         mixer.update(1);
 
-        mixer.add(1);
-        mixer.add(0.3);
-        expect(std::fabs(mixer.mix(1) - squash(0.39)) < 1e-9) << "other sets keep their initial weights";
+        mixer.add(256);
+        mixer.add(77);
+        // Initial weights 19661 / 65536, about 0.3, in 8.24
+        expect(mixer.mix(1) == squash(static_cast<int>((int64_t{19661} * 256 * (256 + 77)) >> 24))) << "other sets keep their initial weights";
         mixer.update(1);
 
         mixer.set_rate(0);
-        mixer.add(1);
-        mixer.add(0.3);
-        const double before = mixer.mix(1);
+        mixer.add(256);
+        mixer.add(77);
+        const int before = mixer.mix(1);
         mixer.update(0);
-        mixer.add(1);
-        mixer.add(0.3);
+        mixer.add(256);
+        mixer.add(77);
         expect(mixer.mix(1) == before) << "a zero rate freezes the weights";
         mixer.update(0);
 
-        logistic_mixer one_by_one(3, 1, 0.05), at_once(3, 1, 0.05);
-        const std::vector<double> inputs{0.5, -1, 2};
-        for (int i = 0; i < 20; ++i) {
-            for (const double x : inputs) {
-                one_by_one.add(x);
+        logistic_mixer saturated(1, 1, 3277, 65536 * 4);
+        saturated.add(3071);
+        const std::vector<int> negative{-3071};
+        expect(saturated.mix(0) == 65520 && saturated.mix(negative, 0) == 16) << "clamped for the coder";
+        saturated.update(0);
+    };
+
+    "logistic_mixer_shared_inputs"_test = [] {
+        // The same inputs given in place or added one by one mix and learn the same way
+        logistic_mixer shared(3, 2, 3277), added(3, 2, 3277);
+        const std::vector<int> inputs{128, -256, 512};
+        for (int i = 0; i < 30; ++i) {
+            for (const int x : inputs) {
+                added.add(x);
             }
-            at_once.add(inputs);
-            expect(one_by_one.mix(0) == at_once.mix(0)) << "adding inputs at once is the same as one by one";
-            one_by_one.update(i % 3 == 0);
-            at_once.update(i % 3 == 0);
+            const int p = shared.mix(inputs, i % 2);
+            expect(p == added.mix(i % 2));
+            shared.update(i % 3 == 0);
+            added.update(i % 3 == 0);
         }
+
+        // A copy of a mixer holding its own inputs learns from its copy of them
+        logistic_mixer original(2, 1, 3277);
+        original.add(256);
+        original.add(128);
+        const int before = original.mix(0);
+        logistic_mixer copy = original;
+        original.update(1);
+        copy.update(1);
+        original.add(256);
+        original.add(128);
+        copy.add(256);
+        copy.add(128);
+        expect(original.mix(0) == copy.mix(0) && copy.mix(0) > before);
     };
 
     "probability_map"_test = [] {
-        probability_map map(2, 0.1);
-        expect(std::fabs(map.refine(0.7, 0) - 0.7) < 0.02) << "starts close to the identity";
+        // 45875 is about 0.7; rate 6554 is 0.1
+        probability_map map(2, 6554);
+        expect(std::abs(map.refine(45875, 0) - 45875) < 1311) << "starts close to the identity";
 
         for (int i = 0; i < 200; ++i) {
-            map.refine(0.7, 0);
+            map.refine(45875, 0);
             map.update(0);
         }
-        expect(map.refine(0.7, 0) < 0.2) << "learns that 0.7 means 0 in context 0";
+        expect(map.refine(45875, 0) < 13107) << "learns that 0.7 means 0 in context 0";
         map.update(0);
-        expect(std::fabs(map.refine(0.7, 1) - 0.7) < 0.02) << "context 1 unchanged";
+        expect(std::abs(map.refine(45875, 1) - 45875) < 1311) << "context 1 unchanged";
         map.update(1);
     };
 
@@ -1370,7 +1440,7 @@ suite<"gmprime::coding"> coding_suite = [] {
                 uint32_t c0 = 1;
                 for (int i = 7; i >= 0; --i) {
                     auto& counter = counters.at(previous * 256u + c0);
-                    const int bit = code_bit(clamp_probability(counter.p), (static_cast<uint8_t>(text[n]) >> i) & 1);
+                    const int bit = code_bit(clamp_probability(counter.p16()), (static_cast<uint8_t>(text[n]) >> i) & 1);
                     counter.update(bit, 255);
                     c0 = (c0 << 1) | static_cast<uint32_t>(bit);
                 }
@@ -1381,11 +1451,11 @@ suite<"gmprime::coding"> coding_suite = [] {
         };
 
         arithmetic_encoder encoder;
-        code([&](const double p, const int bit) { encoder.encode(bit, p); return bit; });
+        code([&](const int p, const int bit) { encoder.encode(bit, p); return bit; });
         const gmprime compressed = encoder.finish();
 
         arithmetic_decoder decoder(compressed);
-        const auto decoded = code([&](const double p, int) { return decoder.decode(p); });
+        const auto decoded = code([&](const int p, int) { return decoder.decode(p); });
 
         expect(decoded == std::vector<uint8_t>(text.begin(), text.end())) << "decodes what was encoded";
         expect(compressed.bytes().size() < text.size() / 2) << "3 letters: under 2 bits each";
@@ -1394,7 +1464,7 @@ suite<"gmprime::coding"> coding_suite = [] {
         // Certain probabilities, right and wrong, and an empty message
         arithmetic_encoder encoder;
         const int bits[] = {1, 1, 0, 1, 0, 0, 1};
-        const double ps[] = {0.999, 0.001, 0.5, 1.0, 0.0, 0.9999, 0.5};
+        const int ps[] = {65470, 66, 32768, 65535, 0, 65530, 32768};
         for (int i = 0; i < 7; ++i) {
             encoder.encode(bits[i], ps[i]);
         }
@@ -1496,6 +1566,66 @@ suite<"gmprime::coding"> coding_suite = [] {
         expect(runs_at(bytes, 0, 8).left == 64) << "bits before the start count as 0";
     };
 
+    "stream_bits"_test = [] {
+        const std::vector<uint8_t> bytes{0b10110000, 0xFF};
+        expect(stream_bits(bytes, 0, 4) == 0b1011 && stream_bits(bytes, 2, 4) == 0b1100);
+        expect(stream_bits(bytes, -2, 4) == 0b0010) << "0 before the start";
+        expect(stream_bits(bytes, 12, 8) == 0b11110000) << "0 beyond the end";
+        expect(stream_bits(bytes, -9, 4) == 0 && stream_bits(bytes, 5, 57) >> 46 == 0b00011111111);
+        expect(reverse_bits(0b1101, 4) == 0b1011 && reverse_bits(0b1101, 6) == 0b101100);
+    };
+
+    "compiled_template"_test = [] {
+        std::string text;
+        random_text(300, 2, 7, text);
+        const std::vector<uint8_t> bytes(text.begin(), text.end());
+
+        // Single distances, runs both ways, a run longer than one word read, distances beyond the start
+        std::vector<size_t> long_run;
+        for (size_t d = 1; d <= 64; ++d) {
+            long_run.push_back(d);
+        }
+        const std::vector<std::vector<size_t>> templates{
+            {1, 2, 105, 104, 103, 208}, {5}, {9, 8, 7, 6, 3, 4, 5, 300, 301}, long_run, {2000, 1999, 3000}};
+        bool same = true;
+        for (const auto& distances : templates) {
+            const compiled_template compiled(distances);
+            for (size_t pos = 0; pos <= bytes.size() * 8; pos += 7) {
+                same = same && compiled.at(bytes, pos) == bit_template(bytes, pos, distances);
+            }
+        }
+        expect(same) << "the same contexts as bit_template";
+    };
+
+    "runs_at_words"_test = [] {
+        // Long runs, spanning several words, compared with a bit by bit count
+        std::vector<uint8_t> bytes(64, 0);
+        for (size_t i = 20; i < 40; ++i) {
+            bytes[i] = 0xFF;
+        }
+        bytes[45] = 0b00111100;
+        const auto bit = [&](const size_t pos, const size_t distance) {
+            return distance <= pos ? stream_bit(bytes, pos - distance) : 0;
+        };
+        bool same = true;
+        for (const size_t width : {2, 3, 64, 100, 200}) {
+            for (const size_t limit : {1, 64, 300}) {
+                for (size_t pos = 0; pos < bytes.size() * 8; pos += 3) {
+                    size_t left = 1, above = 0;
+                    while (left < limit && bit(pos, left) == bit(pos, left + 1)) {
+                        ++left;
+                    }
+                    while (above < limit && above + 2 < width && bit(pos, width - above) == bit(pos, width - above - 1)) {
+                        ++above;
+                    }
+                    const auto runs = runs_at(bytes, pos, width, limit);
+                    same = same && runs.left == left && runs.above == above;
+                }
+            }
+        }
+        expect(same);
+    };
+
     "table_bits"_test = [] {
         expect(table_bits(0) == 16) << "at least min_bits";
         expect(table_bits(3721) == 17) << "four slots per bit of data: 119,072 slots";
@@ -1504,15 +1634,883 @@ suite<"gmprime::coding"> coding_suite = [] {
         expect(table_bits(10'000'000, 24) == 24 && table_bits(100, 22, 10) == 12);
     };
 
+    "x86_branches"_test = [] {
+        // Two calls to the target 0x1000, from offsets 0 and 0x100: different relative operands, the same bytes once absolute
+        std::vector<uint8_t> code(0x110, 0x90);
+        const auto call = [&](const size_t at, const uint32_t relative) {
+            code[at] = 0xE8;
+            for (size_t k = 0; k < 4; ++k) {
+                code[at + 1 + k] = static_cast<uint8_t>(relative >> (8 * k));
+            }
+        };
+        call(0, 0x1000);
+        call(0x100, 0x1000 - 0x100);
+        code[0x80] = 0xE9;                     // JMP with a far target (top byte 12): left alone
+        code[0x84] = 0x12;
+        const auto original = code;
+        x86_branches(code, true);
+        expect(std::equal(code.begin() + 1, code.begin() + 5, code.begin() + 0x101)) << "the same target, the same bytes";
+        expect(code[0x81] == original[0x81] && code[0x84] == 0x12);
+        x86_branches(code, false);
+        expect(code == original);
+
+        // A conditional jump (0F 85, JNE rel32) changes only on request
+        code[0x40] = 0x0F;
+        code[0x41] = 0x85;
+        code[0x42] = 0x10;
+        code[0x43] = code[0x44] = code[0x45] = 0;
+        auto plain = code, with_jcc = code;
+        x86_branches(plain, true);
+        x86_branches(with_jcc, true, true);
+        expect(plain[0x42] == 0x10 && with_jcc[0x42] == 0x50) << "0x10 + 0x40";
+        x86_branches(with_jcc, false, true);
+        expect(with_jcc == code);
+
+        // Any data comes back, operands overlapping included; conditional jumps on request
+        std::string text;
+        random_text(3000, 26, 9, text);
+        std::vector<uint8_t> noise(text.begin(), text.end());
+        for (size_t i = 0; i < noise.size(); i += 7) {
+            noise[i] = i % 3 == 0 ? 0xE8 : i % 3 == 1 ? 0x0F : 0x85;
+            noise[(i * 31) % noise.size()] = i % 2 ? 0x00 : 0xFF;
+        }
+        for (const bool jcc : {false, true}) {
+            auto copy = noise;
+            x86_branches(copy, true, jcc);
+            expect(copy != noise);
+            x86_branches(copy, false, jcc);
+            expect(copy == noise) << "jcc" << jcc;
+        }
+        std::vector<uint8_t> tiny{0xE8, 0, 0, 0};
+        x86_branches(tiny, true);
+        expect(tiny == std::vector<uint8_t>{0xE8, 0, 0, 0}) << "shorter than a call";
+
+        expect(x86_branch_density(code) == 2 * 10000 / code.size()) << "two near calls, the far jump not counted";
+        expect(x86_branch_density(code, 0x50, 0x20) == 0 && x86_branch_density(code, 0x200) == 0);
+        expect(x86_branch_density(std::vector<uint8_t>(noise.begin(), noise.begin() + 100), 0, 0) == 0);
+    };
+
+    "x86_parser"_test = [] {
+        // Hand-assembled 32-bit instructions, one of each kind the decoder tells apart
+        const std::vector<std::vector<uint8_t>> instructions{
+            {0x90}, {0x01, 0xC8}, {0x04, 0x05}, {0x05, 1, 2, 3, 4}, {0x06}, {0x50}, {0x74, 0x10}, {0x89, 0x45, 0xFC},
+            {0x9A, 1, 2, 3, 4, 5, 6}, {0xA1, 1, 2, 3, 4}, {0xB0, 7}, {0xB8, 1, 2, 3, 4}, {0xD1, 0xE0}, {0xD9, 0xC0},
+            {0xE2, 0xFE}, {0x8D, 0x04, 0x24}, {0x8B, 0x04, 0x25, 1, 2, 3, 4}, {0x68, 1, 2, 3, 4}, {0x69, 0xC0, 1, 2, 3, 4},
+            {0x6A, 1}, {0x83, 0xC0, 1}, {0xC2, 8, 0}, {0xC8, 8, 0, 1}, {0xEA, 1, 2, 3, 4, 5, 6}, {0xF6, 0xC0, 1},
+            {0xF7, 0xC0, 1, 2, 3, 4}, {0xF7, 0xD0}, {0xC3}, {0x66, 0xB8, 1, 2}, {0x67, 0x8B, 0x46, 1}, {0x67, 0x8B, 0x06, 1, 2},
+            {0x0F, 0x05}, {0x0F, 0x84, 1, 2, 3, 4}, {0x0F, 0x70, 0xC0, 1}, {0x0F, 0xAF, 0xC1}, {0x0F, 0x38, 0x00, 0xC1},
+            {0x0F, 0x3A, 0x0F, 0xC1, 8}, {0x8B, 0x80, 1, 2, 3, 4}, {0x0F, 0x1F, 0x40, 0x00}, {0xE8, 1, 2, 3, 4},
+            {0x8B, 0x05, 1, 2, 3, 4}, {0xF0, 0x2E, 0x3E, 0x26, 0x36, 0x64, 0x65, 0xF2, 0xF3, 0x90}};
+        const uint32_t opcodes[] = {0x90, 0x01, 0x04, 0x05, 0x06, 0x50, 0x74, 0x89, 0x9A, 0xA1, 0xB0, 0xB8, 0xD1, 0xD9, 0xE2, 0x8D,
+                                    0x8B, 0x68, 0x69, 0x6A, 0x83, 0xC2, 0xC8, 0xEA, 0xF6, 0xF7, 0xF7, 0xC3, 0xB8, 0x8B, 0x8B, 0x105,
+                                    0x184, 0x170, 0x1AF, 0x200, 0x30F, 0x8B, 0x11F, 0xE8, 0x8B, 0x90};
+        x86_parser parser;
+        bool boundaries = true;
+        for (size_t i = 0; i < instructions.size(); ++i) {
+            for (const auto byte : instructions[i]) {
+                parser.byte_added(byte);
+            }
+            boundaries = boundaries && parser.next_field() == x86_parser::opcode && parser.length() == 0 && parser.previous(1) == opcodes[i];
+            expect(boundaries) << "instruction" << i;
+        }
+        expect(parser.previous(2) == 0x8B && parser.previous(4) == 0x11F);
+
+        // Within an instruction: MOV [EBP - 4], EAX
+        parser.byte_added(0x89);
+        expect(parser.next_field() == x86_parser::modrm && parser.current() == 0x89);
+        parser.byte_added(0x45);
+        expect(parser.next_field() == x86_parser::displacement && parser.index() == 0 && parser.modrm_byte() == 0x45);
+        parser.byte_added(0xFC);
+        expect(parser.previous_modrm() == 0x45);
+        parser.byte_added(0x66);
+        expect(parser.prefixes() == 0x66 && parser.length() == 1);
+
+        // 64-bit: REX prefixes, 8-byte immediates and addresses
+        x86_parser long_mode(true);
+        const std::vector<uint8_t> code64{0x48, 0xB8, 1, 2, 3, 4, 5, 6, 7, 8, 0x48, 0x8B, 0x05, 1, 2, 3, 4,
+                                          0xA1, 1, 2, 3, 4, 5, 6, 7, 8, 0x41, 0x50, 0x67, 0x8B, 0x06, 0xC3};
+        for (const auto byte : code64) {
+            long_mode.byte_added(byte);
+        }
+        expect(long_mode.next_field() == x86_parser::opcode && long_mode.previous(1) == 0xC3 && long_mode.previous(2) == 0x8B);
+        expect(long_mode.previous(3) == 0x50 && long_mode.previous(4) == 0xA1);
+    };
+
+    "machine_code_detection"_test = [] {
+        std::vector<uint8_t> code32, code64;
+        for (int i = 0; i < 200; ++i) {
+            for (const uint8_t b : {0x8B, 0x45, 0x08, 0x89, 0x04, 0x24, 0xE8, 0x10, 0x00, 0x00, 0x00}) {
+                code32.push_back(b);
+            }
+            for (const uint8_t b : {0x48, 0x8B, 0x45, 0x08, 0x48, 0x89, 0x04, 0x24, 0x4C, 0x8D, 0x05, 0x01}) {
+                code64.push_back(b);
+            }
+        }
+        expect(!x86_long_mode(code32) && x86_long_mode(code64));
+        expect(!x86_long_mode(std::vector<uint8_t>{}));
+
+        const std::string text = "Plain text, with\ttabs and\r\nnewlines.";
+        expect(control_density(std::vector<uint8_t>(text.begin(), text.end())) == 0);
+        expect(control_density(std::vector<uint8_t>{0, 'a', 0x1B, 0x7F}) == 7500 && control_density({}) == 0);
+        expect(control_density(std::vector<uint8_t>{'a', 'b', 0, 0}, 2) == 0) << "only the first count bytes";
+    };
+
+    "sparse_hash"_test = [] {
+        const std::vector<uint8_t> history{'a', 'b', 'c', 'd'};
+        expect(sparse_hash(history, 4, {2}) != sparse_hash(history, 4, {3}));
+        expect(sparse_hash(history, 4, {1, 2}) != sparse_hash(history, 4, {1, 2}, 0xF0));
+        expect(sparse_hash(history, 4, {2}) == sparse_hash(std::vector<uint8_t>{'x', 'y', 'c', 'z'}, 4, {2})) << "only the bytes asked for";
+        expect(sparse_hash(history, 1, {2}) == sparse_hash(std::vector<uint8_t>{0, 0}, 2, {2})) << "missing bytes count as 0";
+        expect(sparse_hash(history, 4, {1}, 0xF0) == sparse_hash(std::vector<uint8_t>{'a', 'b', 'c', 'o'}, 4, {1}, 0xF0)) << "masked";
+    };
+
+    "mixed_radix"_test = [] {
+        // (2 * 1 + 0) * 5 + 4
+        const std::vector<gmprime> digits{2, 0, 4}, radices{3, 1, 5};
+        const auto packed = mixed_radix_pack(digits, radices);
+        expect(packed.value == 14 && packed.radix == 15);
+        expect(mixed_radix_unpack(packed.value, radices) == digits);
+
+        const auto none = mixed_radix_pack({}, {});
+        expect(none.value == 0 && none.radix == 1 && mixed_radix_unpack(0, {}).empty());
+
+        std::vector<gmprime> many, bases;
+        for (unsigned i = 0; i < 37; ++i) {
+            bases.emplace_back(gmprime::binomial(40 + i, i % 9));
+            many.emplace_back((bases.back() - 1) * (i % 3) / 2);
+        }
+        expect(mixed_radix_unpack(mixed_radix_pack(many, bases).value, bases) == many);
+    };
+
+    "rank_blocks"_test = [] {
+        std::string text;
+        random_text(150, 5, 11, text);
+        const gmprime field = gmprime::from_bytes(std::vector<uint8_t>(text.begin(), text.end())) & ~gmprime(text.size() % 2);
+        const size_t length = text.size() * 8 + 3;
+
+        const auto blocks = rank_blocks(field, length, 64);
+        expect(blocks.ones.size() == (length + 63) / 64) << "the last block shorter";
+        size_t ones = 0;
+        gmprime radix = 1;
+        for (size_t b = 0; b < blocks.ones.size(); ++b) {
+            ones += blocks.ones[b];
+            radix *= gmprime::binomial(std::min<size_t>(64, length - b * 64), blocks.ones[b]);
+        }
+        expect(ones == field.popcount() && blocks.radix == radix && blocks.rank < radix);
+        expect(unrank_blocks(blocks.ones, blocks.rank, length, 64) == field);
+
+        expect(throws<std::invalid_argument>([&] { [[maybe_unused]] const auto r = rank_blocks(field, length, 0); }));
+        expect(throws<std::invalid_argument>([&] { [[maybe_unused]] const auto r = rank_blocks(field, 8, 4); }));
+    };
+
+    "multiset_rank"_test = [] {
+        const auto rank = [](const std::string& text) { return multiset_rank(std::vector<uint8_t>(text.begin(), text.end())); };
+        expect(rank("aab") == 0 && rank("aba") == 1 && rank("baa") == 2);
+        expect(rank("") == 0 && rank("zzz") == 0);
+
+        std::vector<size_t> counts(256);
+        counts['a'] = 2;
+        counts['b'] = 1;
+        expect(multiset_arrangements(counts) == 3);
+        const auto text = [&](const gmprime& r) {
+            const auto bytes = from_multiset_rank(r, counts);
+            return std::string(bytes.begin(), bytes.end());
+        };
+        expect(text(0) == "aab" && text(2) == "baa");
+        expect(from_multiset_rank(0, {}).empty()) << "no bytes, one arrangement";
+
+        std::string sentence;
+        random_text(200, 9, 3, sentence);
+        const std::vector<uint8_t> bytes(sentence.begin(), sentence.end());
+        std::vector<size_t> histogram(256);
+        for (const auto byte : bytes) {
+            ++histogram[byte];
+        }
+        const gmprime r = multiset_rank(bytes);
+        expect(r < multiset_arrangements(histogram) && from_multiset_rank(r, histogram) == bytes);
+
+        expect(throws<std::invalid_argument>([&] { [[maybe_unused]] const auto s = from_multiset_rank(3, counts); }));
+        expect(throws<std::invalid_argument>([&] { [[maybe_unused]] const auto s = from_multiset_rank(-1, counts); }));
+    };
+
+    "byte_set"_test = [] {
+        byte_set digits;
+        for (uint8_t d = '0'; d <= '9'; ++d) {
+            digits.add(d);
+        }
+        digits.finish();
+        expect(digits.has('5') && !digits.has('a'));
+        // 0x30 to 0x39: 0011 decided, then the low half open
+        expect(digits.decided(1) == 0 && digits.decided(2) == 0 && digits.decided(4) == 1 && digits.decided(9) == 1);
+        expect(digits.decided(19) == -1) << "the low half";
+        expect(digits.decided(0b10011100) == -1) << "no digit 1100: both bits impossible";
+
+        byte_set none;
+        none.finish();
+        expect(none.decided(1) == -1);
+    };
+
+    "crc32"_test = [] {
+        const std::string text = "123456789";
+        const std::vector<uint8_t> bytes(text.begin(), text.end());
+        expect(crc32(bytes) == 0xCBF43926u) << "the standard check value";
+        expect(crc32({}) == 0);
+
+        const std::vector<uint8_t> first(bytes.begin(), bytes.begin() + 4), rest(bytes.begin() + 4, bytes.end());
+        expect(crc32(rest, crc32(first)) == crc32(bytes)) << "continued over parts";
+    };
+
     "cost_profile"_test = [] {
         cost_profile cost;
         for (int i = 0; i < 8; ++i) {
-            cost.add(i % 2, 0.5);
+            cost.add(i % 2, 32768);
         }
-        cost.add(1, 0.25);
+        cost.add(1, 16384);
 
         expect(cost.per_byte().size() == 1 && std::fabs(cost.per_byte()[0] - 8) < 1e-12) << "1 bit at p = 1/2";
         expect(std::fabs(cost.total() - 10) < 1e-12) << "and the started byte: 2 bits at p = 1/4";
+    };
+};
+
+namespace {
+
+uint64_t double_bits(const double v) {
+    uint64_t b;
+    std::memcpy(&b, &v, 8);
+    return b;
+}
+
+uint64_t float_bits(const float v) {
+    uint32_t b;
+    std::memcpy(&b, &v, 4);
+    return b;
+}
+
+// Never throws in practice (small tests): noexcept spares its callers a cleanup path
+void put_field(std::vector<uint8_t>& out, const uint64_t bits, const int size, const bool big_endian) noexcept {
+    for (int i = 0; i < size; ++i) {
+        out.push_back(static_cast<uint8_t>(bits >> (8 * (big_endian ? size - 1 - i : i))));
+    }
+}
+
+// Records of 24 bytes: an identifier, a decimal double in little-endian (one in 50 off its lattice), one in
+// big-endian, an IBM single precision value (k / 64) and a float on a lattice of 0.25
+std::vector<uint8_t> lattice_records(const size_t count) {
+    std::vector<uint8_t> out;
+    uint32_t seed = 7;
+    int64_t a = 100000, b = -3000;
+    for (uint32_t r = 0; r < count; ++r) {
+        seed = seed * 1664525u + 1013904223u;
+        a += (seed >> 8) % 40;
+        b += static_cast<int64_t>((seed >> 16) % 9) - 4;
+        put_field(out, r, 4, false);
+        put_field(out, double_bits(r % 50 == 3 ? 1.0 / 3 : static_cast<double>(a) * 0.001), 8, false);
+        put_field(out, double_bits(static_cast<double>(b) * 0.01), 8, true);
+        put_field(out, *GMPrime::coding::ibm_lattice_bits(1 + (seed >> 4) % 3000, -6), 4, true);
+        put_field(out, float_bits(static_cast<float>((seed >> 12) % 200) * 0.25f), 4, false);
+    }
+    return out;
+}
+
+// 16-bit pixels of a smooth image, rows of width pixels
+std::vector<uint8_t> image16(const size_t width, const size_t height, const bool big_endian) {
+    std::vector<uint8_t> out;
+    uint32_t seed = 3;
+    for (size_t y = 0; y < height; ++y) {
+        for (size_t x = 0; x < width; ++x) {
+            seed = seed * 1664525u + 1013904223u;
+            put_field(out, 1000 + 3 * x + 5 * y + (x * y) % 7 + (seed >> 20) % 4, 2, big_endian);
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+suite<"gmprime::records"> records_suite = [] {
+    using namespace GMPrime::coding;
+
+    "record_width"_test = [] {
+        std::vector<uint8_t> data;
+        for (int i = 0; i < 700; ++i) {
+            for (const uint8_t b : {uint8_t(i), uint8_t(i >> 8), uint8_t{7}, uint8_t{0}, uint8_t{9}, uint8_t{1}, uint8_t{2}}) {
+                data.push_back(b);
+            }
+        }
+        const auto eq = byte_autocorrelation(data, 20);
+        expect(eq.size() == 21 && eq[7] > 0.7 && eq[14] > 0.7 && eq[1] < 0.3);
+        expect(byte_autocorrelation(data, 20, 1 << 20, 3)[7] == eq[7] || byte_autocorrelation(data, 20, 1 << 20, 3)[7] > 0.7) << "every third byte";
+        expect(byte_autocorrelation({1, 2, 3}, 10)[5] == 0) << "beyond the data";
+
+        const auto records = find_record_width(data, 64);
+        expect(records.width == 7 && records.score > records.median);
+        expect(find_record_width(data, 1).width == 0) << "too few distances";
+    };
+
+    "image16"_test = [] {
+        const auto little = find_image16(image16(300, 200, false));
+        expect(little.found && little.little_endian && little.start == 0 && little.row_bytes == 600 && little.row_score < 0.85);
+        const auto big = find_image16(image16(160, 300, true));
+        expect(big.found && !big.little_endian && big.start == 0 && big.row_bytes == 320);
+
+        // A slow ramp: samples, but no rows
+        std::vector<uint8_t> ramp;
+        for (size_t i = 0; i < 40000; ++i) {
+            put_field(ramp, 20000 + i / 16, 2, false);
+        }
+        const auto line = find_image16(ramp);
+        expect(line.found && line.row_bytes == 0);
+
+        std::string text;
+        random_text(40000, 26, 5, text);
+        expect(!find_image16(std::vector<uint8_t>(text.begin(), text.end())).found) << "no 16-bit samples";
+        expect(!find_image16(image16(10, 10, false)).found) << "too short";
+    };
+
+    "numeric_prediction"_test = [] {
+        // Learns that the value is twice the feature
+        lms_predictor lms(2, 3);
+        expect(lms.size() == 2);
+        int64_t last_error = 0;
+        for (int i = 0; i < 400; ++i) {
+            const int64_t x = 100 + (i * 37) % 900;
+            const int64_t features[] = {x, 1};
+            last_error = std::abs(lms.predict(features) - 2 * x);
+            lms.update(2 * x);
+        }
+        expect(last_error < 40) << last_error;
+
+        expect(quantize_difference(0) == 0 && quantize_difference(1) == 1 && quantize_difference(-1) == -1);
+        expect(quantize_difference(2) == 2 && quantize_difference(3) == 3 && quantize_difference(5) == 4 && quantize_difference(6) == 5);
+        expect(quantize_difference(8) == 6 && quantize_difference(-11) == -6);
+        expect(quantize_difference(std::numeric_limits<int64_t>::min()) == -126 && quantize_difference(std::numeric_limits<int64_t>::max()) == 125);
+
+        std::vector<uint8_t> pairs{1, 2, 3, 4, 5};
+        swap_pairs(pairs, 0);
+        expect(pairs == std::vector<uint8_t>{2, 1, 4, 3, 5});
+        swap_pairs(pairs, 1);
+        expect(pairs == std::vector<uint8_t>{2, 4, 1, 5, 3});
+
+        expect(bit_middle(0b1, 1, 4) == 12 && bit_middle(0, 0, 8) == 128);
+    };
+
+    "float_fields"_test = [] {
+        uint8_t bytes[] = {1, 2, 3, 4};
+        expect(read_field(bytes, {4, false, false}) == 0x04030201u && read_field(bytes, {4, true, false}) == 0x01020304u);
+        write_field(bytes, {4, true, false}, 0xA1B2C3D4u);
+        expect(bytes[0] == 0xA1 && bytes[3] == 0xD4);
+        write_field(bytes, {4, false, false}, 0xA1B2C3D4u);
+        expect(bytes[0] == 0xD4 && bytes[3] == 0xA1);
+
+        const float_format ibm{4, true, true}, single{4, false, false}, binary64{8, false, false};
+        expect(field_value(0x41100000, ibm) == 1.0 && field_value(0xC1100000, ibm) == -1.0);
+        expect(field_value(double_bits(2.5), binary64) == 2.5 && field_value(float_bits(0.75f), single) == 0.75);
+        expect(value_bits(2.5, binary64) == double_bits(2.5) && value_bits(0.75, single) == float_bits(0.75f));
+        expect(value_bits(1.0 / 64, ibm) == 0x3F400000) << "IBM steps: powers of 2";
+
+        expect(zigzag(0) == 0 && zigzag(-1) == 1 && zigzag(1) == 2 && unzigzag(zigzag(-12345)) == -12345);
+        expect(unzigzag(zigzag(std::numeric_limits<int64_t>::min())) == std::numeric_limits<int64_t>::min());
+    };
+
+    "ibm_lattice"_test = [] {
+        // 1 = 1/16 * 16^1, 1/64 = 1/4 * 16^-1: normalized, first hexadecimal digit not 0
+        expect(*ibm_lattice_bits(64, -6) == 0x41100000 && *ibm_lattice_bits(-64, -6) == 0xC1100000);
+        expect(*ibm_lattice_bits(1, -6) == 0x3F400000 && *ibm_lattice_bits(0, -6) == 0);
+        expect(!ibm_lattice_bits((1 << 25) + 1, 0)) << "more bits than the fraction holds";
+        expect(!ibm_lattice_bits(1, 300) && !ibm_lattice_bits(1, -300)) << "exponent out of range";
+
+        expect(*ibm_step_power(0x3F400000) == -6 && *ibm_step_power(0x41100000) == 0);
+        expect(!ibm_step_power(0x3F300000) && !ibm_step_power(0xBF400000) && !ibm_step_power(0x3F000000));
+    };
+
+    "lattice_bits"_test = [] {
+        const auto product = multiply_wide(~uint64_t{0}, ~uint64_t{0});
+        expect(product.high == ~uint64_t{1} && product.low == 1);
+
+        // k * step as the processor multiplies it, k exact in the format
+        const float_format binary64{8, false, false}, single{4, false, false};
+        uint32_t seed = 11;
+        bool same = true;
+        for (int i = 0; i < 20000; ++i) {
+            seed = seed * 1664525u + 1013904223u;
+            const int64_t k = static_cast<int64_t>(seed >> 4) * (i % 2 ? 1 : -1) * (i % 3 == 0 ? 1001 : 1);
+            const double step = std::ldexp(1.0 + (seed % 9973) / 9973.0, static_cast<int>(seed % 50) - 30);
+            same = same && *lattice_bits(k, double_bits(step), binary64) == double_bits(static_cast<double>(k) * step);
+            const auto small = static_cast<int64_t>(seed >> 12);
+            const float fstep = static_cast<float>(step);
+            same = same && *lattice_bits(small, float_bits(fstep), single) == float_bits(static_cast<float>(small) * fstep);
+        }
+        expect(same);
+
+        expect(*lattice_bits(0, double_bits(0.01), binary64) == 0);
+        expect(*lattice_bits(1, double_bits(1.0), binary64) == double_bits(1.0)) << "no rounding";
+        // (2^53 + 1) (2 - 2^-52) = 2^54 - 2^-52: the significand rounds up to 2^53, the exponent grows
+        expect(*lattice_bits((int64_t{1} << 53) + 1, double_bits(std::nextafter(2.0, 0.0)), binary64) == double_bits(std::ldexp(1.0, 54)));
+        expect(*lattice_bits(int64_t{1} << 60, 1, binary64) == double_bits(std::ldexp(1.0, -1014))) << "subnormal step";
+        expect(!lattice_bits(3, 1, binary64)) << "subnormal result";
+        expect(!lattice_bits(int64_t{1} << 40, double_bits(1e300), binary64)) << "overflow";
+        expect(!lattice_bits(1, double_bits(std::numeric_limits<double>::infinity()), binary64) && !lattice_bits(1, 0, binary64));
+        expect(*lattice_bits(64, 0x3F400000, {4, true, true}) == 0x41100000 && !lattice_bits(1, 0x3F300000, {4, true, true})) << "IBM";
+    };
+
+    "lattice_points"_test = [] {
+        lattice_field field;
+        field.step_bits = double_bits(0.01);
+        field.residual_bits = 3;
+        const auto exact = to_lattice(double_bits(1234 * 0.01), field, 0.01);
+        expect(exact && exact->k == 1234 && exact->residual == 0);
+        const auto near = to_lattice(double_bits(1234 * 0.01) + 2, field, 0.01);
+        expect(near && near->k == 1234 && near->residual == 2);
+        expect(!to_lattice(double_bits(1234 * 0.01) + 9, field, 0.01)) << "residual beyond 3 bits";
+        expect(!to_lattice(double_bits(std::nan("")), field, 0.01) && !to_lattice(double_bits(1e300), field, 0.01));
+        expect(!to_lattice(double_bits(-0.0), field, 0.01)) << "-0 is not k = 0";
+        lattice_field broken = field;
+        broken.step_bits = 0;
+        expect(!to_lattice(double_bits(0.5), broken, 0.01));
+        field.residual_bits = 0;
+        expect(!to_lattice(double_bits(1234 * 0.01) + 1, field, 0.01) && to_lattice(double_bits(1234 * 0.01), field, 0.01));
+
+        field.residual_bits = 4;
+        for (const bool offset_binary : {false, true}) {
+            field.offset_binary = offset_binary;
+            for (const int64_t k : {int64_t{0}, int64_t{-5}, int64_t{123456}}) {
+                const auto packed = pack_point(field, k, -3);
+                expect(packed && unpack_point(field, *packed).k == k && unpack_point(field, *packed).residual == -3);
+            }
+            expect(!pack_point(field, int64_t{1} << 62, 0)) << "k beyond the field";
+            expect(!pack_point(field, -(int64_t{1} << 62), 0));
+        }
+        field.residual_bits = 0;
+        const int64_t extremes[] = {77, std::numeric_limits<int64_t>::min(), std::numeric_limits<int64_t>::max()};
+        bool whole = true;
+        for (const auto k : extremes) {
+            whole = whole && unpack_point(field, *pack_point(field, k, 0)).k == k;
+        }
+        expect(whole) << "64 bits for k, offset binary";
+    };
+
+    "lattice_step"_test = [] {
+        std::vector<double> values;
+        for (int i = 1; i <= 300; ++i) {
+            values.push_back(((i * 7919) % 1000) * 0.25 + 1);
+        }
+        const auto step = find_lattice_step(values);
+        expect(step && std::fabs(*step - 0.25) < 1e-9);
+        expect(!find_lattice_step(std::vector<double>(10, 1.5))) << "too few values";
+        expect(!find_lattice_step(std::vector<double>(100, 1.5))) << "a single value";
+        std::vector<double> scattered;
+        for (int i = 1; i <= 300; ++i) {
+            scattered.push_back(std::sqrt(static_cast<double>(i * 7919 % 10007)) * 1.234567);
+        }
+        expect(!find_lattice_step(scattered)) << "no lattice";
+    };
+
+    "decimal_steps"_test = [] {
+        const float_format binary64{8, false, false};
+        std::vector<uint64_t> values;
+        uint32_t seed = 21;
+        for (int i = 0; i < 400; ++i) {
+            seed = seed * 1664525u + 1013904223u;
+            // One in five off the lattice
+            values.push_back(double_bits(i % 5 == 4 ? std::sqrt(static_cast<double>(seed % 1000) + 2) : static_cast<double>(seed % 100000) * 0.01));
+        }
+        const auto step = find_decimal_step(values, binary64);
+        expect(step && *step == 0.01);
+        expect(!find_decimal_step(std::vector<uint64_t>(values.begin(), values.begin() + 30), binary64)) << "too few values";
+        expect(!find_decimal_step(values, {4, true, true})) << "IBM steps are powers of 2";
+        std::vector<uint64_t> scattered;
+        for (int i = 1; i <= 300; ++i) {
+            scattered.push_back(double_bits(std::sqrt(static_cast<double>(i * 7919 % 10007)) * 1.234567));
+        }
+        expect(!find_decimal_step(scattered, binary64));
+
+        std::vector<uint8_t> records(8 * 300, 7);
+        for (size_t r = 0; r < 300; ++r) {
+            seed = seed * 1664525u + 1013904223u;
+            records[r * 8 + 3] = static_cast<uint8_t>(seed >> 24);
+        }
+        expect(raw_field_cost(records, 8, 0, 2, 300) < 300 && raw_field_cost(records, 8, 3, 1, 300) > 300 * 6) << "constant bytes cost little";
+    };
+
+    "lattice_window"_test = [] {
+        // A header of 1000 bytes that is not records, then records of 16 bytes: two decimal doubles
+        std::vector<uint8_t> data;
+        uint32_t seed = 5;
+        for (int i = 0; i < 1000; ++i) {
+            seed = seed * 1664525u + 1013904223u;
+            data.push_back(static_cast<uint8_t>(seed >> 24));
+        }
+        const size_t header = data.size();
+        for (int r = 0; r < 1500; ++r) {
+            seed = seed * 1664525u + 1013904223u;
+            put_field(data, double_bits(static_cast<double>(100000 + r * 37 + seed % 30) * 1e-7), 8, false);
+            put_field(data, double_bits(static_cast<double>(seed % 900000) * 1e-6), 8, false);
+        }
+        const std::vector<uint8_t> records(data.begin() + static_cast<std::ptrdiff_t>(header), data.end());
+        const auto fields = find_lattice_fields_window(data, 16);
+        expect(fields.size() == 2 && fields[0].offset == 0 && fields[1].offset == 8 && header % 16 == 8) << "the records' doubles, out of phase";
+        expect(find_lattice_fields_window(records, 16).size() == 2 && find_lattice_fields_window(records, 16)[0].offset == 0);
+        expect(find_lattice_fields_window(records, 3).empty() && find_lattice_fields_window(lattice_records(200), 24).empty());
+
+        // Two floats side by side are not one double; more than 8 fields take more flag bytes
+        std::vector<uint8_t> wide;
+        for (int r = 0; r < 600; ++r) {
+            for (int j = 0; j < 12; ++j) {
+                put_field(wide, float_bits(static_cast<float>((r * (j + 3) * 31) % 500) * 0.5f), 4, false);
+            }
+        }
+        const auto twelve = find_lattice_fields_window(wide, 48);
+        bool floats = twelve.size() == 12;
+        for (const auto& f : twelve) {
+            floats = floats && f.format.size == 4;
+        }
+        expect(floats) << twelve.size();
+        expect(find_lattice_fields_window(wide, 48, 20000, 10).size() == 10) << "at most max_fields";
+
+        // Floats of slow walks on 0.01: two of them side by side also read as a double, dropped
+        std::vector<uint8_t> walks;
+        int columns[10] = {};
+        uint32_t walk_seed = 3;
+        for (int r = 0; r < 300; ++r) {
+            for (int j = 0; j < 10; ++j) {
+                walk_seed = walk_seed * 1664525u + 1013904223u;
+                columns[j] += static_cast<int>((walk_seed >> 8) % 41) - 20;
+                put_field(walks, float_bits(static_cast<float>(1000 * (j + 1) + columns[j]) * 0.01f), 4, false);
+            }
+        }
+        const auto walk_fields = find_lattice_fields_window(walks, 40);
+        bool all_floats = !walk_fields.empty();
+        for (const auto& f : walk_fields) {
+            all_floats = all_floats && f.format.size == 4;
+        }
+        expect(all_floats) << walk_fields.size();
+        expect(lattice_flag_bytes(12) == 2 && lattice_flag_bytes(8) == 1 && lattice_flag_bytes(0) == 0);
+        const auto encoded = lattice_encode(wide, 48, twelve);
+        expect(encoded.size() == wide.size() + 600 * 2 && lattice_decode(encoded, 48, twelve) == std::optional(wide));
+    };
+
+    "scan_transform"_test = [] {
+        // Decimal doubles at any place, among other bytes, the marker among them
+        std::vector<uint8_t> data;
+        uint32_t seed = 9;
+        double x = 2.0, y = 48.0;
+        for (int i = 0; i < 800; ++i) {
+            seed = seed * 1664525u + 1013904223u;
+            const int junk = static_cast<int>(seed % 5);
+            for (int j = 0; j < junk; ++j) {
+                data.push_back(static_cast<uint8_t>(seed >> (8 * j)));
+            }
+            x += static_cast<double>(static_cast<int>(seed % 2001) - 1000) * 1e-6;
+            y += static_cast<double>(static_cast<int>((seed >> 11) % 2001) - 1000) * 1e-6;
+            put_field(data, double_bits(std::round(x * 1e6) / 1e6), 8, false);
+            put_field(data, double_bits(std::round(y * 1e6) / 1e6), 8, false);
+        }
+        const auto cfg = find_scan_config(data);
+        expect(!cfg.kinds.empty() && cfg.kinds[0].format.size == 8 && field_value(cfg.kinds[0].step_bits, cfg.kinds[0].format) == 1e-6);
+        bool lagged = false;
+        for (const auto& k : cfg.kinds) {
+            lagged = lagged || k.lag == 2;
+        }
+        expect(lagged) << "x and y alternate: each against the one two values before";
+
+        for (const bool in_place : {false, true}) {
+            auto c = cfg;
+            c.in_place = in_place;
+            const auto encoded = scan_any_encode(data, c);
+            expect(scan_any_decode(encoded, c) == std::optional(data)) << "in place" << in_place;
+        }
+        // A residual of 40 bits leaves no room for large codes: those values stay as they are
+        auto roomy = cfg;
+        for (auto& k : roomy.kinds) {
+            k.residual_bits = 40;
+        }
+        expect(scan_decode(scan_encode(data, roomy), roomy) == std::optional(data) && scan_place_decode(scan_place_encode(data, roomy), roomy) == std::optional(data));
+
+        // Every kind of lag
+        for (const int lag : {0, 1, 2}) {
+            auto c = cfg;
+            for (auto& k : c.kinds) {
+                k.lag = lag;
+            }
+            expect(scan_decode(scan_encode(data, c), c) == std::optional(data) && scan_place_decode(scan_place_encode(data, c), c) == std::optional(data));
+        }
+
+        std::string text;
+        random_text(4000, 26, 3, text);
+        expect(find_scan_config(std::vector<uint8_t>(text.begin(), text.end())).kinds.empty()) << "no doubles in text";
+        expect(find_scan_config(std::vector<uint8_t>(data.begin(), data.begin() + 500)).kinds.empty()) << "too short";
+
+        // Invalid streams
+        const uint8_t m = cfg.marker;
+        expect(!scan_decode({1, m}, cfg) && !scan_decode({m, 0x0F}, cfg) && !scan_decode({m, 0x71, 1}, cfg)) << "cut, bad kind, cut code";
+        expect(scan_decode({m, 0}, cfg) == std::optional(std::vector<uint8_t>{m})) << "the marker itself";
+        auto broken = cfg;
+        broken.kinds[0].step_bits = 0;
+        expect(!scan_decode({m, 0x01, 2}, broken)) << "no value for the kind";
+        const auto place = [&](std::vector<uint8_t> side) {
+            std::vector<uint8_t> e(32, 0);
+            e.insert(e.end(), side.begin(), side.end());
+            for (int b = 3; b >= 0; --b) {
+                e.push_back(static_cast<uint8_t>(side.size() >> (8 * b)));
+            }
+            return scan_place_decode(e, cfg);
+        };
+        expect(!scan_place_decode({1, 2}, cfg) && !scan_place_decode({0, 0, 0, 9}, cfg)) << "no length, side too long";
+        expect(!place({0x80}) && !place({0}) && !place({0, 9, 1}) && !place({0, 1, 0x80})) << "gap cut, kind missing, bad kind, count cut";
+        expect(!place({0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 1, 1})) << "a gap beyond the data";
+        expect(!place({30, 1, 1}) && !place({0, 1, 5})) << "values beyond the data";
+        auto broken_place = cfg;
+        broken_place.kinds[0].step_bits = 0;
+        std::vector<uint8_t> e(32, 0);
+        e[7] = 4;
+        for (const uint8_t b : {uint8_t{0}, uint8_t{1}, uint8_t{1}, uint8_t{0}, uint8_t{0}, uint8_t{0}, uint8_t{3}}) {
+            e.push_back(b);
+        }
+        expect(!scan_place_decode(e, broken_place));
+    };
+
+    "numeric_text"_test = [] {
+        const auto bytes = [](const std::string& t) { return std::vector<uint8_t>(t.begin(), t.end()); };
+        const std::string text = "x=-12.50, ip 192.168.0.1 v2.3.4 on 2005.06.03: 1e-5 +3 -0 007 .5 a-5 x-7 9.-1 "
+                                 "1234567890123456789012 3.14159265358979323846 12345678.1234567 1.1234567 5. -";
+        const auto marker = numeric_text_marker(bytes(text));
+        expect(marker && *marker == 0x1A);
+        const auto encoded = numeric_text_encode(bytes(text), *marker);
+        expect(numeric_text_decode(encoded, *marker) == std::optional(bytes(text)));
+
+        // -12.50: the marker, sign | (2 * 18 + 2 - 1), then the digits 1, 2, 5, 0 in their code
+        const std::vector<uint8_t> first{0x1A, 0x80 | 37, digit_code(1), digit_code(2), digit_code(5), digit_code(0)};
+        expect(std::equal(first.begin(), first.end(), encoded.begin() + 2)) << "after x=";
+
+        // Random texts of digits, signs, points and letters come back
+        bool all = true;
+        uint32_t seed = 5;
+        for (int t = 0; t < 300; ++t) {
+            std::string random;
+            for (int i = 0; i < 60; ++i) {
+                seed = seed * 1664525u + 1013904223u;
+                random += "0123456789.-+e,a \n"[(seed >> 16) % 18];
+            }
+            const auto e = numeric_text_encode(bytes(random), 0x1A);
+            all = all && numeric_text_decode(e, 0x1A) == std::optional(bytes(random));
+        }
+        expect(all);
+
+        // Invalid streams: a marker at the end, layout 126, a missing long layout, no integer digit, digits missing
+        // or not digits
+        const auto invalid = [](std::vector<uint8_t> e) { return !numeric_text_decode(e, 0x1A); };
+        expect(invalid({'a', 0x1A}) && invalid({0x1A, 126}) && invalid({0x1A, 127, 2}) && invalid({0x1A, 127, 0, 1, digit_code(1)}));
+        expect(invalid({0x1A, 1, digit_code(1)}) && invalid({0x1A, 0, 'x'}) && invalid({0x1A, 127, 10, 10}));
+
+        std::vector<uint8_t> every(256);
+        for (int b = 0; b < 256; ++b) {
+            every[static_cast<size_t>(b)] = static_cast<uint8_t>(b);
+        }
+        expect(!numeric_text_marker(every)) << "no free byte";
+        every.erase(every.begin() + 0x80);
+        std::vector<uint8_t> controls(every.begin(), every.begin() + 0x80);
+        expect(numeric_text_marker(controls) == std::optional<uint8_t>(0x80)) << "after the control bytes, the high ones";
+
+        expect(digit_density(bytes("ab12")) == 5000 && digit_density({}) == 0 && digit_density(bytes("12ab"), 2) == 10000);
+        bool codes = true;
+        for (int d = 0; d < 10; ++d) {
+            codes = codes && code_digit(digit_code(d)) == d;
+        }
+        expect(codes && code_digit(0x31) == -1 && code_digit('a') == -1);
+        expect(split_at(1).low == 0 && split_at(1).split == 5 && split_at(1).high == 9);
+        expect(split_at(2).high == 4 && split_at(2).split == 2 && split_at(3).low == 5 && split_at(3).split == 7);
+        expect(power10(0) == 1 && power10(19) == 10000000000000000000ull);
+    };
+
+    "number_relations"_test = [] {
+        // 12.5 + 3.25 = 15.75; 12.5 - 3.25; 3.25 - 12.5; 12.5 * 3.25 = 40.625, at 2 decimals 40.63 (half away)
+        expect(apply_relation(1, 125, 1, 325, 2, 2) == std::optional<int64_t>(1575) && apply_relation(2, 125, 1, 325, 2, 2) == std::optional<int64_t>(925));
+        expect(apply_relation(3, 125, 1, 325, 2, 2) == std::optional<int64_t>(-925) && apply_relation(4, 125, 1, 325, 2, 2) == std::optional<int64_t>(4063));
+        expect(apply_relation(4, -125, 1, 325, 2, 3) == std::optional<int64_t>(-40625) && apply_relation(4, 125, 1, 325, 2, 5) == std::optional<int64_t>(4062500));
+        const int64_t big = 999999999999999999;
+        expect(!apply_relation(1, big, 0, big, 0, 0) && !apply_relation(4, big, 0, big, 0, 0) && !apply_relation(4, big, 0, 10, 0, 1));
+        expect(!apply_relation(4, big, 0, 999999999, 0, 18)) << "a product beyond 64 bits";
+        expect(apply_relation(4, big, 17, big, 17, 2) == std::optional<int64_t>(10000)) << "divided by 10^32";
+        expect(!apply_relation(4, big, 0, big, 0, 0)) << "beyond 10^18";
+        expect(!apply_relation(4, big, 1, big, 0, 0) && !apply_relation(4, big, 1, 20, 0, 0)) << "divided, still beyond 64 bits or 10^18";
+
+        expect(relation_operands(5, 0, 7, 1) && !relation_operands(0, 0, 7, 0) && !relation_operands(100, 2, 7, 0) && !relation_operands(7, 0, -10, 1));
+
+        expect(smooth_extrapolation(9, 4, 1) == 16 && cubic_extrapolation(27, 8, 1, 0) == 64) << "squares, cubes";
+        const int64_t e = 1000000000000000000;
+        expect(cubic_extrapolation(e, -e, -e, e) == int64_t{1} << 62 && cubic_extrapolation(-e, e, e, -e) == -(int64_t{1} << 62));
+        expect(smooth_extrapolation(e, -e, e) == int64_t{1} << 62);
+        expect(GMPrime::coding::detail::saturated_add(std::numeric_limits<int64_t>::max(), 5) == std::numeric_limits<int64_t>::max());
+        expect(GMPrime::coding::detail::saturated_add(std::numeric_limits<int64_t>::min(), -5) == std::numeric_limits<int64_t>::min());
+    };
+
+    "numeric_text_rules"_test = [] {
+        const std::string text = "id=CMwJl820SlYyy434c8 crc 0xFF blk_42 YAL069W 0xg 10x5 a0x7 e3b0c442 len 15";
+        const std::vector<uint8_t> bytes(text.begin(), text.end());
+        const auto plain = numeric_text_encode(bytes, 0x1A), ruled = numeric_text_encode(bytes, 0x1A, keep_random | keep_hex);
+        expect(numeric_text_decode(ruled, 0x1A) == std::optional(bytes) && numeric_text_decode(plain, 0x1A) == std::optional(bytes));
+        const auto tokens = [](const std::vector<uint8_t>& e) { return std::count(e.begin(), e.end(), uint8_t{0x1A}); };
+        // Plain: 820, 434, 8, 0, 42, 069, 0, 10, 5, 0, 7, 3, 0, 442, 15; ruled: the random names and 0xFF stay text
+        expect(tokens(plain) == 15 && tokens(ruled) == 8) << tokens(plain) << tokens(ruled);
+        expect(numeric_text_encode(bytes, 0x1A, keep_hex) != ruled && numeric_text_encode(bytes, 0x1A, keep_random) != ruled);
+    };
+
+    "decimal_prediction"_test = [] {
+        expect(rescale_decimal(1234, 2, 4) == 123400 && rescale_decimal(1235, 3, 1) == 12 && rescale_decimal(1250, 3, 1) == 13);
+        expect(rescale_decimal(-1250, 3, 1) == -13) << "half away from zero";
+        expect(rescale_decimal(int64_t{100000000000000000}, 0, 5) == int64_t{1000000000000000000}) << "within 10^18";
+        expect(decimal_position(5, 100, 10) == 68 && decimal_position(260, 100, 10) == 83) << "below, above";
+        expect(decimal_position(137, 100, 10) == 14 && decimal_position(5, 0, 1) == 20) << "digit 3, its third quarter";
+    };
+
+    "float32_print"_test = [] {
+        // 127.49f prints 127.489998 with 6 decimals, 127.49 with 2
+        expect(float32_print(127489998, 6) == std::optional<uint64_t>(127489998) && float32_print(12749, 2) == std::optional<uint64_t>(12749));
+        expect(float32_print(127490000, 6) == std::optional<uint64_t>(127489998)) << "what the float near it prints";
+        const auto one = nearest_float32(1, 18);
+        expect(one.m == 9671407 && one.e == -83) << "10^-18";
+        const auto tie = nearest_float32(167772155, 1);
+        expect(tie.m == (1u << 23) && tie.e == 1) << "16777215.5 rounds to 2^24";
+        expect(nearest_float32(0, 3).m == 0);
+
+        // Against the C library's printing of random floats
+        bool same = true;
+        uint32_t seed = 9;
+        char buffer[64];
+        for (int i = 0; i < 20000; ++i) {
+            seed = seed * 1664525u + 1013904223u;
+            const uint32_t bits = (seed & 0x807FFFFF) | ((90 + (seed >> 23) % 70) << 23);
+            float x;
+            std::memcpy(&x, &bits, 4);
+            const int f = static_cast<int>(seed % 10);
+            std::snprintf(buffer, sizeof buffer, "%.*f", f, static_cast<double>(std::fabs(x)));
+            std::string digits;
+            for (const char* c = buffer; *c; ++c) {
+                if (*c != '.') {
+                    digits += *c;
+                }
+            }
+            const uint64_t n = std::stoull(digits);
+            const auto x32 = nearest_float32(n, f);
+            // The print of the float nearest to the printed value is the print; with 9 digits or more, that float is x
+            same = same && (n < 100000000 || std::ldexp(static_cast<double>(x32.m), x32.e) == static_cast<double>(std::fabs(x)))
+                   && float32_print(n, f) == std::optional<uint64_t>(n);
+        }
+        expect(same);
+
+        expect(!render_decimal({1u << 23, 0}, 13) && !render_decimal({1u << 23, 50}, 0)) << "beyond 64 bits";
+        expect(!render_decimal({9094948, 40}, 0) && render_decimal({9094947, 40}, 0) == std::optional<uint64_t>(9999999980506447872ull)) << "10^19 or more";
+        expect(render_decimal({1, -200}, 0) == std::optional<uint64_t>(0) && render_decimal({3, -1}, 0) == std::optional<uint64_t>(2));
+        expect(!render_decimal({(1u << 24) - 1, -1}, 18) && !render_decimal({(1u << 24) - 1, -10}, 15));
+        expect(render_decimal({(1u << 24) - 1, -70}, 18) == std::optional<uint64_t>(14211)) << "(2^24 - 1) 2^-70, 18 decimals";
+    };
+
+    "wide_division"_test = [] {
+        bool same = true;
+        uint64_t seed = 77;
+        for (int i = 0; i < 20000; ++i) {
+            seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+            const uint64_t d = (seed >> (i % 60)) | 1;
+            seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+            const uint64_t high = seed % d, low = seed * 31 + static_cast<uint64_t>(i);
+            const auto [q, r] = GMPrime::coding::detail::divide_wide(high, low, d);
+            const gmprime num = (gmprime(high) << 64) + gmprime(low);
+            same = same && gmprime(q) == num / gmprime(d) && gmprime(r) == num % gmprime(d);
+        }
+        expect(same);
+    };
+
+    "civil_time"_test = [] {
+        const auto epoch = civil_from_seconds(0);
+        expect(epoch.year == 1970 && epoch.month == 1 && epoch.day == 1 && epoch.hour == 0);
+        const auto leap = civil_from_seconds(951782400);
+        expect(leap.year == 2000 && leap.month == 2 && leap.day == 29);
+        const auto before = civil_from_seconds(-1);
+        expect(before.year == 1969 && before.month == 12 && before.day == 31 && before.hour == 23 && before.minute == 59 && before.second == 59);
+        bool same = true;
+        uint64_t seed = 3;
+        for (int i = 0; i < 5000; ++i) {
+            seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+            const auto t = static_cast<std::time_t>((seed >> 32) % 4000000000u);
+            const std::tm* g = std::gmtime(&t);
+            const auto c = civil_from_seconds(static_cast<int64_t>(t));
+            same = same && c.year == g->tm_year + 1900 && c.month == g->tm_mon + 1 && c.day == g->tm_mday && c.hour == g->tm_hour
+                   && c.minute == g->tm_min && c.second == g->tm_sec;
+        }
+        expect(same);
+    };
+
+    "numeric_text_reader"_test = [] {
+        const std::string text = "a -12.5b 1.1234567 ";
+        const auto encoded = numeric_text_encode(std::vector<uint8_t>(text.begin(), text.end()), 0x1A);
+        numeric_text_reader reader(0x1A);
+        expect(reader.state() == numeric_text_reader::text);
+        std::vector<int> states;
+        int completed = 0;
+        bool checked = false;
+        for (const auto b : encoded) {
+            if (reader.state() == numeric_text_reader::value && reader.value_index() == 2 && !checked) {
+                checked = reader.value_digits() == 3 && reader.value_prefix() == 12;
+            }
+            if (reader.byte_added(b)) {
+                ++completed;
+                if (completed == 1) {
+                    const auto& n = reader.number();
+                    checked = checked && n.negative && n.int_digits == 2 && n.frac_digits == 1 && n.mantissa == 125;
+                }
+            }
+            states.push_back(reader.state());
+        }
+        expect(checked && completed == 2 && reader.number().frac_digits == 7 && reader.number().mantissa == 11234567);
+        expect(std::count(states.begin(), states.end(), numeric_text_reader::layout_f) == 1) << "the long layout";
+
+        // Any bytes are read: layout 126 and out of range lengths are kept within bounds
+        numeric_text_reader odd(0x1A), any(0x1A);
+        odd.byte_added(0x1A);
+        odd.byte_added(126);
+        expect(odd.state() == numeric_text_reader::value && odd.number().int_digits == 1 && odd.number().frac_digits == 7);
+        for (const uint8_t b : {uint8_t{0x1A}, uint8_t{127}, uint8_t{40}, uint8_t{40}}) {
+            any.byte_added(b);
+        }
+        expect(any.state() == numeric_text_reader::value && any.number().int_digits == 18 && any.number().frac_digits == 0);
+    };
+
+    "lattice_transform"_test = [] {
+        auto data = lattice_records(600);
+        data.push_back(42);                     // a byte after the last record
+        const auto fields = find_lattice_fields(data, 28);
+        expect(fields.size() == 4) << fields.size();
+        bool formats = fields.size() == 4;
+        if (formats) {
+            formats = fields[0].offset == 4 && fields[0].format.size == 8 && !fields[0].format.big_endian
+                      && fields[1].offset == 12 && fields[1].format.big_endian && fields[2].offset == 20 && fields[2].format.ibm
+                      && fields[3].offset == 24 && fields[3].format.size == 4 && !fields[3].format.ibm;
+        }
+        expect(formats);
+
+        size_t escapes = 0;
+        expect(lattice_cost(data, 28, fields[0], 600, &escapes) < 600 * 64 && escapes == 12) << "1 in 50 off the lattice";
+
+        const auto encoded = lattice_encode(data, 28, fields);
+        expect(encoded.size() == data.size() + 600);
+        const auto decoded = lattice_decode(encoded, 28, fields);
+        expect(decoded && *decoded == data);
+
+        auto broken = fields;
+        broken[1].step_bits = 0;
+        expect(!lattice_decode(encoded, 28, broken)) << "no value for these fields";
+        expect(broken != fields && broken[0] == fields[0] && !(broken[1] == fields[1]));
+
+        expect(find_lattice_fields(data, 3).empty() && find_lattice_fields(lattice_records(100), 28).empty());
+
+        // Nine float fields: at most eight, one flag bit each
+        std::vector<uint8_t> wide;
+        for (int r = 0; r < 400; ++r) {
+            for (int j = 0; j < 9; ++j) {
+                put_field(wide, float_bits(static_cast<float>((r * (j + 3) * 31) % 500) * 0.5f), 4, false);
+            }
+        }
+        expect(find_lattice_fields(wide, 36).size() == 8);
     };
 };
 
@@ -2053,6 +3051,48 @@ suite<"gmprime::math"> math = [] {
     };
     "factorial"_test = [] {
         expect(gmprime::factorial(5) == 120);
+    };
+    "binomial"_test = [] {
+        expect(gmprime::binomial(5, 2) == 10 && gmprime::binomial(0, 0) == 1 && gmprime::binomial(3, 5) == 0);
+        expect(gmprime::binomial(100, 50) == gmprime("100891344545564193334812497256"));
+    };
+    "combination_rank"_test = [] {
+        // The i-th bit set adds C(position, i): 0b1100 is the last of the C(4, 2) = 6 arrangements
+        expect(gmprime(0b1).combination_rank(4) == 0 && gmprime(0b1000).combination_rank(4) == 3);
+        expect(gmprime(0b0011).combination_rank(4) == 0 && gmprime(0b1100).combination_rank(4) == 5);
+        expect(gmprime(0).combination_rank(10) == 0 && gmprime(0).combination_rank(0) == 0);
+
+        // Every field of 7 bits: the ranks of each count of ones are 0 to C(7, ones) - 1, and come back
+        bool exact = true;
+        std::vector<std::vector<bool>> seen(8);
+        for (size_t ones = 0; ones <= 7; ++ones) {
+            seen[ones].resize(gmprime::binomial(7, ones).to_primitive<size_t>());
+        }
+        for (unsigned v = 0; v < 128; ++v) {
+            const gmprime field(v);
+            const gmprime rank = field.combination_rank(7);
+            const size_t ones = field.popcount();
+            exact = exact && rank < gmprime::binomial(7, ones) && !seen[ones][rank.to_primitive<size_t>()];
+            seen[ones][rank.to_primitive<size_t>()] = true;
+            exact = exact && gmprime::from_combination_rank(rank, 7, ones) == field;
+        }
+        expect(exact);
+
+        // A long sparse field, with leading zeros kept by the length
+        gmprime sparse;
+        for (size_t p = 3; p < 2000; p += 37 + p % 11) {
+            sparse.get_value() |= mpz_class(1) << static_cast<mp_bitcnt_t>(p);
+        }
+        const gmprime rank = sparse.combination_rank(2500);
+        expect(rank < gmprime::binomial(2500, sparse.popcount()));
+        expect(gmprime::from_combination_rank(rank, 2500, sparse.popcount()) == sparse);
+        expect(gmprime::from_combination_rank(0, 0, 0) == 0 && gmprime::from_combination_rank(0, 5, 0) == 0);
+        expect(gmprime::from_combination_rank(0, 3, 3) == 0b111) << "the only arrangement";
+
+        expect(throws<std::invalid_argument>([] { [[maybe_unused]] const auto r = gmprime(0b10000).combination_rank(4); }));
+        expect(throws<std::invalid_argument>([] { [[maybe_unused]] const auto f = gmprime::from_combination_rank(6, 4, 2); }));
+        expect(throws<std::invalid_argument>([] { [[maybe_unused]] const auto f = gmprime::from_combination_rank(0, 4, 5); }));
+        expect(throws<std::invalid_argument>([] { [[maybe_unused]] const auto f = gmprime::from_combination_rank(-1, 4, 2); }));
     };
     "next_prime_number"_test = [] {
         const gmprime v(42);

@@ -322,7 +322,13 @@ gmprime gmprime::stream_order() const {
     return from_bytes(data);
 }
 
-gmprime::fold_analysis gmprime::analyze_folds(const size_t min_width, const size_t max_width) const {
+gmprime::fold_analysis gmprime::analyze_folds(const size_t min_width, const size_t max_width, const size_t sample_bytes) const {
+    if (sample_bytes > 0 && analyzed_bits() > sample_bytes * CHAR_BIT) {
+        auto sample = bytes();
+        sample.resize(sample_bytes);
+        return from_bytes(sample).analyze_folds(min_width, max_width);
+    }
+
     fold_analysis result;
     const size_t n = analyzed_bits();
     if (n < 4 * min_width) {

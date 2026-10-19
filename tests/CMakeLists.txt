@@ -29,6 +29,8 @@ add_test(NAME tests
         COMMAND ${CMAKE_CURRENT_BINARY_DIR}/tests
         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 # A slow run fails instead of holding up the others
-set_tests_properties(tests PROPERTIES TIMEOUT 120)
+# ASan's stack-use-after-return detection allocates a fake stack frame on most calls: about 200 times slower with
+# GCC on ARM64
+set_tests_properties(tests PROPERTIES TIMEOUT 120 ENVIRONMENT "ASAN_OPTIONS=detect_stack_use_after_return=0")
 
 include(CTest)

@@ -165,7 +165,8 @@ auto self = data.autocorrelation(4096);
 `analyze_folds` does the search for you, in stream order (each byte from its highest bit, the order of a bitmap's pixels, which `stream_order()` gives to any number), and scores each width against independent bits:
 
 ```cpp
-auto folds = data.analyze_folds();  // widths from 64 to 8192 bits
+auto folds = data.analyze_folds();  // widths from 64 to 8192 bits; analyze_folds(64, 8192, 131072)
+                                    // looks at the first 128 KB only, much sooner on large data
 if (folds.strong()) {               // the best width stands out: bitmap rows, fixed-size records
     folds.width;                    // bits per row
     folds.layer;                    // rows per layer, for a 3D view (0: none)
@@ -173,6 +174,19 @@ if (folds.strong()) {               // the best width stands out: bitmap rows, f
 ```
 
 To build a compressor from these measurements, see the [coding toolkit](#coding-toolkit).
+
+### Enumerative coding
+
+A bit field of `n` bits with `k` of them set is one of `C(n, k)` arrangements. Its rank among them is a number below `C(n, k)`: `log2 C(n, k)` bits, exactly the information left once `n` and `k` are known.
+
+```cpp
+gmprime mask = ...;                                       // 10,000 bits, 100 of them set
+gmprime rank = mask.combination_rank(10'000);             // 804 bits, where the positions take 1,400
+gmprime same = gmprime::from_combination_rank(rank, 10'000, 100);
+gmprime count = gmprime::binomial(10'000, 100);           // the number of arrangements
+```
+
+The length is given because leading zeros are part of the field. Ranking takes time quadratic in the length: for long fields, `rank_blocks` in the [coding toolkit](#enumerative-coding-1) ranks blocks and packs their ranks into one number. The rank is the shortest code for bits whose only regularity is their count, such as a random sparse mask. Data with more structure, like text or images, is better served by context models.
 
 ### Integer behavior
 
@@ -195,17 +209,17 @@ The differences are deliberate:
 ### Principles
 
 - **Bit by bit.** Each byte is coded from its highest bit. While coding a byte, `c0` holds the bits coded so far behind a leading 1 (1 at the start of the byte, up to 255), and `bit_count` how many there are. Contexts usually combine the previous bytes with `c0`.
-- **A probability per bit.** A model gives the probability `p` that the next bit is 1. The coder spends about `-log2(p)` bits on a 1 and `-log2(1 - p)` on a 0, so good predictions mean a small message. `clamp_probability` keeps `p` within what the coder handles.
+- **A probability per bit.** A model gives the probability `p` that the next bit is 1, on 16 bits (0 to 65535 for 0 to 1). The coder spends about `-log2(p)` bits on a 1 and `-log2(1 - p)` on a 0, so good predictions mean a small message. `clamp_probability` keeps `p` within what the coder handles.
 - **Causal models, identical on both sides.** For every bit: ask the model for `p`, code (or decode) the bit, then let the model learn it. Models only use what precedes the bit, so the decoder, running the same code on the bits it has decoded, makes the same predictions.
-- **Same build, same platform.** Models compute in floating point (`std::log`, `std::exp`): a message is guaranteed to decode with a decoder built like the encoder, on the same platform.
+- **Integers only.** Models compute in fixed point, without floating point: the same model gives the same predictions with any compiler on any platform, so a message coded on one decodes on all the others. Floating point does not guarantee it (fused multiply-add, for example, changes the last bits of a result, and a single different prediction corrupts the rest of the message).
 
 ### Probabilities
 
 | Tool | Role |
 |---|---|
-| `stretch(p)`, `squash(x)` | the logistic domain, `ln(p / (1 - p))` and its inverse, where predictions are mixed |
+| `stretch(p)`, `squash(x)` | the logistic domain, where predictions are mixed: `stretch` is `ln(p / (1 - p))` in 1/256 units (-3071 to 3071), `squash` its inverse, interpolated from a table and clamped beyond ±12 |
 | `clamp_probability(p)`, `probability_12(p)` | keep `p` within the coder's 12 bits |
-| `bit_counter` | adaptive probability: `update(bit, limit)` moves `p` toward the bit at rate `1 / (n + 1.5)`, fast at first, then more slowly as `n` grows up to `limit` (high for stable data, low to follow changes); `seen()` tells whether it learned anything |
+| `bit_counter` | adaptive probability: `update(bit, limit)` moves it toward the bit at rate `1 / (n + 1.5)`, fast at first, then more slowly as `n` grows up to `limit` (high for stable data, low to follow changes); `p16()` gives it on 16 bits (it keeps 22, so that slow rates still move it); `seen()` tells whether it learned anything |
 | `bit_history` | the counts of 0s and 1s seen in a context in one byte (`zeros()`, `ones()`, up to 15), recent bits weighing more |
 | `history_map` | indirect modeling: `p(history)` is the probability learned, across every context, for contexts with that history; `update(history, bit)` after coding. Rare contexts know little alone, their history generalizes |
 
@@ -215,7 +229,7 @@ The differences are deliberate:
 |---|---|
 | `context_hash(history, pos, order)` | hash of the `order` bytes before `pos`, distinct per order |
 | `hashed_table<T>(bits)` | `2^bits` slots of type `T`; `at(hash)` returns the slot of a context, colliding contexts sharing it; `hashed_counters` holds `bit_counter`s |
-| `checked_table<T>(bits)` | the same with an 8-bit checksum in each slot: a context landing on another's slot resets it rather than sharing its statistics (`T` needs a `check` field) |
+| `checked_table<T>(bits)` | the same with an 8-bit checksum in each slot: a context landing on another's slot resets it rather than sharing its statistics (`T` needs a `check` field). Created from zeroed memory, so only touched pages are used. `prefetch(hash)` brings a slot into cache ahead of time, e.g. both possible slots of the next bit; `at(hash, offset)` addresses 16 adjacent slots per hash, e.g. the nodes of a nibble |
 | `context_slot` | 8 bytes per context: a probability (as `bit_counter`), its `bit_history` and the checksum; `update(bit, limit)` updates both |
 | `last_byte_slot` | the byte that followed the context last time and how many times in a row (`update(byte)`); `expected_bit(c0, bit_count)` predicts its next bit, or -1 if the byte coded so far disagrees |
 
@@ -225,8 +239,8 @@ A table takes `2^bits` times the slot size: 32 MB for `checked_table<context_slo
 
 | Tool | Role |
 |---|---|
-| `logistic_mixer(inputs, sets, rate)` | combines predictions: `add(x)` each input (usually `stretch(p)`, 0 for "no idea"), `mix(set)` returns `p`, `update(bit)` learns the weights. Each set has its own weights, chosen by a small context (e.g. `c0`), so the mixer learns whom to trust when; `set_rate` changes the learning rate, e.g. decreasing over time |
-| `probability_map(contexts, rate)` | refines a probability given a context: `refine(p, context)`, then `update(bit)`. Averaged with its input, it corrects what the mixer systematically gets wrong |
+| `logistic_mixer(inputs, sets, rate)` | combines predictions: `add(x)` each input (usually `stretch(p)`, 0 for "no idea"), `mix(set)` returns `p`, `update(bit)` learns the weights. Each set has its own weights, chosen by a small context (e.g. `c0`), so the mixer learns whom to trust when. Rates are scaled by 65536 (197 for 0.003); `set_rate` changes it, e.g. decreasing over time. `mix(inputs, set)` reads a `std::vector<int>` kept by the caller instead: several mixers can share the same inputs without copying them |
+| `probability_map(contexts, rate)` | refines a probability given a context: `refine(p, context)`, then `update(bit)`; rate scaled by 65536 (1311 for 0.02). Averaged with its input, it corrects what the mixer systematically gets wrong |
 | `match_model(min_length)` | finds the last earlier occurrence of the last `min_length` bytes and predicts that what followed comes again: `byte_added(history)` after each byte, `expected_bit(history, c0, bit_count)`, `length()` of the match, `miss()` when a prediction fails |
 
 ### Text and bit geometry
@@ -238,7 +252,54 @@ A table takes `2^bits` times the slot size: 32 MB for `checked_table<context_slo
 | `capitals_encode(text)`, `capitals_decode(encoded)` | reversible lowercasing: a capitalized word is lowercased behind `0x01`, an all-capitals word behind `0x02`, so that "The" and "the" share statistics; `capitals_encode` returns nothing if the text holds those bytes |
 | `stream_bit(bytes, p)` | bit `p` of bytes read as a stream, each byte from its highest bit, the order of a bitmap's pixels |
 | `bit_template(bytes, pos, distances)` | the stream bits at `pos - d` for each distance `d`, packed into a context. With the fold width `L` found by `gmprime::analyze_folds`, distances such as 1, 2, `L - 1`, `L`, `L + 1` form a 2D neighbourhood, and `L * H` reaches the layer behind in 3D |
+| `stream_bits(bytes, first, count)` | up to 57 consecutive stream bits in one word read, the first one highest; bits before the start (`first` may be negative) and beyond the end are 0 |
+| `compiled_template(distances)` | `bit_template` prepared once: `at(bytes, pos)` gives the same context, reading each run of consecutive distances (`L + 1, L, L - 1`...) as one word. For templates used at every bit |
 | `runs_at(bytes, pos, width)` | pixel runs of a bitmap folded at `width` bits: `left`, the run of equal bits ending before `pos`, and `above`, how far the bit above stays the same to the right |
+
+### Machine code and binary data
+
+| Tool | Role |
+|---|---|
+| `x86_branches(bytes, encode)` | the reversible E8/E9 transform of x86 code (as zpaq and xz's BCJ filter): the relative targets of CALL and JMP become absolute, so that the calls to one function, scattered through the code, become the same bytes. `encode = false` undoes it; any data comes back, code or not |
+| `x86_branch_density(bytes)`, `x86_long_mode(bytes)` | how much bytes look like x86 code (near CALL and JMP per 10,000 bytes: 150 to 350 for compiled code, none for text), and whether it is 64-bit (frequent REX.W prefixes) |
+| `x86_parser(long_mode)` | a light instruction decoder fed a byte at a time (`byte_added`): `next_field()` tells where the next byte stands (opcode, ModRM, SIB, displacement, immediate) and `index()` where in it, `current()` the opcode, `previous(k)` the opcodes before, `modrm_byte()`, `prefixes()`. Contexts keyed by these predict an opcode from the previous instructions across their operands. Any bytes are accepted: on code, a wrong guess resynchronizes within a few instructions |
+| `control_density(bytes)` | control bytes per 10,000 (neither text nor whitespace): none in text, 5% to 90% in executables, tables and images |
+| `sparse_hash(history, pos, distances, mask)` | a context of the bytes at the given distances, each masked: bytes 2 or 3 back alone, 4 and 8 back for 32-bit columns, high nibbles only. For binary data, where the nearest bytes are not the most telling |
+
+### Numeric data
+
+`#include <gmprime_records.hpp>` adds tools for records, floating point fields and images. Encoders analyze in floating point; everything a decoder runs is integer arithmetic.
+
+| Tool | Role |
+|---|---|
+| `byte_autocorrelation(data, max_distance)`, `find_record_width(data)` | the share of bytes equal to the byte d before, for each d, and the record width it reveals: byte granularity, where `analyze_folds` sees bits |
+| `find_image16(data)` | 16-bit samples, their byte order and the row width of an image (`found`, `little_endian`, `start`, `row_bytes`) |
+| `lms_predictor(features)` | adaptive linear prediction in fixed point (normalized LMS): `predict(features)`, then `update(actual)`, the same on every platform |
+| `quantize_difference(e)`, `bit_middle(prefix, known, bits)`, `swap_pairs(data, first)` | a prediction error on a logarithmic scale; the middle of the values a sample can still take once its first bits are known, where a prediction stands against it being what predicts the next bit; 16-bit values put high byte first |
+| `float_format`, `read_field`, `write_field`, `field_value` | IEEE binary64 and binary32 of either byte order, and IBM single precision (seismic data) |
+| `lattice_bits(k, step, format)`, `ibm_lattice_bits(k, p)` | `k * step` rounded to nearest, ties to even, as the format's bits: what the processor's multiplication gives, computed with integers |
+| `find_lattice_fields(data, width)`, `lattice_encode`, `lattice_decode` | the decimal lattice transform: floating point fields that hold decimal values (`k * 0.01` stored as a double) are replaced by `k` and a residual of a few units in the last place, so that the numbers themselves, not their binary expansions, are what gets modeled. Values off the lattice are kept as they are, flagged per record |
+| `to_lattice`, `pack_point`, `unpack_point`, `find_lattice_step`, `zigzag` | the pieces of the transform, for other layouts |
+| `find_decimal_step(values, format)`, `find_lattice_fields_window(data, width)` | decimal steps (powers of 10) that hold most values, even with some off the lattice; the fields searched on records away from the start, where a header would mislead the search, up to 24 fields (one flag byte per 8) |
+| `find_scan_config(data)`, `scan_encode`, `scan_decode`, `scan_place_encode`, `scan_place_decode` | decimal values stored as doubles or floats anywhere, without records: shapes of varying length, database pages, columns. Each value on a decimal lattice becomes its k (or its difference with the value one or two before, for coordinates that alternate), as a token, or in place with the positions in a side stream so that rows keep their alignment |
+| `numeric_text_encode(text, marker, rules)`, `numeric_text_decode`, `numeric_text_marker(text)` | numbers written in a text as tokens: a marker byte absent from the text, the number's layout (sign, digits before and after the point, leading zeros included) and its digits, so that a model knows the weight of each digit; every way of writing comes back exactly. IP addresses, versions and dotted dates stay integers; `keep_random` and `keep_hex` leave random identifiers and hexadecimal as text |
+| `numeric_text_reader(marker)` | reads that stream causally (`byte_added`): where the next byte stands (text, layout, a digit and its index), each number once complete |
+| `rescale_decimal(v, from, to)`, `decimal_position(prediction, low, unit)`, `split_at(node)` | decimal predictions brought to a number's precision; where a prediction stands against the digits still possible, the decimal counterpart of `bit_middle`; the value each coded bit of a digit splits |
+| `float32_print(n, decimals)`, `nearest_float32`, `render_decimal` | binary floats printed in decimal: `127.489998` is the float32 nearest to 127.49 printed with 6 decimals, digits that a model can compute rather than learn. Integers only |
+| `civil_from_seconds(seconds)` | the date and time of a count of seconds since 1970, to predict a date written next to the count |
+| `apply_relation(op, a, fa, b, fb, f)`, `relation_operands` | a number computed from two others: their sum, difference or product (a total, a price times a quantity), exactly at the precision it is written with |
+| `smooth_extrapolation`, `cubic_extrapolation` | the next value of a smooth series from its last three or four values |
+| `digit_density(text)` | the share of digits, to decide whether numbers are worth modeling |
+
+`byte_set` (in `gmprime_coding.hpp`) holds the bytes possible at some place and tells which bits of a byte they decide, so that a model does not code them.
+
+### Enumerative coding
+
+| Tool | Role |
+|---|---|
+| `rank_blocks(bits, length, block_bits)`, `unrank_blocks(ones, rank, length, block_bits)` | a bit field ranked by blocks: the bits set in each block (`ones`, for a model to code) and the blocks' combination ranks packed into one number below `radix`, the product of their binomials. Linear time, and the counts per block follow the density where it changes |
+| `mixed_radix_pack(digits, radices)`, `mixed_radix_unpack(value, radices)` | numbers in different bases, each below its own radix, as one number: no fraction of a bit lost per number. Over a product tree, so packing many is fast |
+| `multiset_rank(bytes)`, `from_multiset_rank(rank, counts)`, `multiset_arrangements(counts)` | the same for bytes: once the count of each byte value is known, the rank of their order among the `n! / (product of count!)` arrangements |
 
 ### Coding and measuring
 
@@ -247,6 +308,7 @@ A table takes `2^bits` times the slot size: 32 MB for `checked_table<context_slo
 | `arithmetic_encoder` | `encode(bit, p)` for each bit, then `finish()` returns the message as a `gmprime` |
 | `arithmetic_decoder(code)` | `decode(p)` returns each bit, given the same `p` as the encoder. The decoder must know when to stop: store the length in the message |
 | `cost_profile` | `add(bit, p)` alongside the coder: `per_byte()` gives the bits each byte cost, `total()` the size, to see where a model pays |
+| `crc32(bytes)` | the CRC-32 of bytes (as zip and png): stored with a message, it tells whether decoding gave back the original data |
 | `table_bits(data_bytes)` | a context table size for the data: about four slots per bit, from 16 to 22 bits, so small inputs take little memory; compressor and decompressor derive it from the stored length |
 
 ### A complete compressor
@@ -261,26 +323,26 @@ using namespace GMPrime::coding;
 
 class model {
 public:
-    model(): _mixer(2 * 4 + 2 + 1, 256, 0.005), _map(256 * 256, 0.02), _match(6) {
+    model(): _mixer(2 * 4 + 2 + 1, 256, 328), _map(256 * 256, 1311), _match(6) {
         for (int i = 0; i < 4; ++i) {
             _tables.emplace_back(22);
         }
     }
 
-    // Probability that the next bit is 1
-    double p() {
+    // Probability that the next bit is 1, on 16 bits
+    int p() {
         for (size_t i = 0; i < _tables.size(); ++i) {
             _slots[i] = &_tables[i].at(context_hash(_history, _history.size(), i + 1) * 256 + _c0);
-            _mixer.add(_slots[i]->seen() ? stretch(clamp_probability(_slots[i]->p)) : 0.0);
+            _mixer.add(_slots[i]->seen() ? stretch(clamp_probability(_slots[i]->p16())) : 0);
             _mixer.add(stretch(clamp_probability(_maps[i].p(_slots[i]->history))));
         }
         _expected = _match.expected_bit(_history, _c0, _bit_count);
-        const double sign = _expected == 1 ? 1.0 : -1.0;
-        _mixer.add(_expected < 0 ? 0.0 : sign * std::min(_match.length(), 32u) / 4.0);
-        _mixer.add(_expected < 0 ? 0.0 : sign);
-        _mixer.add(0.3);  // bias
+        const int sign = _expected == 1 ? 1 : -1;
+        _mixer.add(_expected < 0 ? 0 : sign * static_cast<int>(std::min(_match.length(), 32u)) * 64);
+        _mixer.add(_expected < 0 ? 0 : sign * 256);
+        _mixer.add(77);  // bias
 
-        const double mixed = _mixer.mix(_c0);
+        const int mixed = _mixer.mix(_c0);
         const uint8_t previous = _history.empty() ? 0 : _history.back();
         return clamp_probability((mixed + 3 * _map.refine(mixed, previous * 256u + _c0)) / 4);
     }
@@ -320,7 +382,7 @@ private:
 gmprime compress(const std::vector<uint8_t>& data) {
     arithmetic_encoder encoder;
     for (int i = 31; i >= 0; --i) {
-        encoder.encode(static_cast<int>(data.size() >> i) & 1, 0.5);  // the length, for the decoder
+        encoder.encode(static_cast<int>(data.size() >> i) & 1, 32768);  // the length, for the decoder
     }
     model m;
     for (const uint8_t byte : data) {
@@ -337,7 +399,7 @@ std::vector<uint8_t> decompress(const gmprime& code) {
     arithmetic_decoder decoder(code);
     size_t size = 0;
     for (int i = 0; i < 32; ++i) {
-        size = (size << 1) | static_cast<size_t>(decoder.decode(0.5));
+        size = (size << 1) | static_cast<size_t>(decoder.decode(32768));
     }
     model m;
     std::vector<uint8_t> data;
@@ -366,7 +428,7 @@ code.load_from_file("alice29.gmc");
 std::vector<uint8_t> data = decompress(code);
 ```
 
-This model compresses `alice29.txt` (152,089 bytes, from the Canterbury corpus) to 38,869 bytes, where bzip2 -9 gives 43,202 and xz -9e 48,536. A research compressor adding the text tools, more orders and a second mixer reaches 1.95 bits per character on it, and folding at the width found by `autocorrelation` halves what xz achieves on a fax image.
+This model compresses `alice29.txt` (152,089 bytes, from the Canterbury corpus) to 38,871 bytes, where bzip2 -9 gives 43,202 and xz -9e 48,536. A research compressor adding the text tools, more orders and a second mixer reaches 1.95 bits per character on it, and folding at the width found by `autocorrelation` halves what xz achieves on a fax image.
 
 ### Going further
 
@@ -384,24 +446,48 @@ This model compresses `alice29.txt` (152,089 bytes, from the Canterbury corpus) 
 gmz c data.txt data.gmz    # compress
 gmz d data.gmz data.txt    # decompress
 gmz t data.txt             # compress, decompress, check, report
+gmz -1 c data.txt data.gmz # faster, a little larger (-2: a little more of both)
 ```
 
-It analyzes the file first with `analyze_folds`. Data that folds is coded with bit and byte templates across the fold, in 2D and 3D, and pixel runs; anything else with the text model: orders 0 to 8, words, line structure, last occurrences, indirect modeling, four mixers selected by the partial byte, the highest order seen, the previous byte and its class, and chained probability maps. It tries the capitals transform on text, and a bitmap variant on folded data, and keeps the smaller message. Options: `-m` forces a mode, `-C` the capitals transform, `-T` a table size.
+It analyzes the file first with `analyze_folds`. Data that folds is coded with bit and byte templates across the fold, in 2D and 3D, and pixel runs; anything else with the text model: orders 0 to 8, words, line structure, last occurrences, indirect modeling, four mixers selected by the partial byte, the highest order seen, the previous byte and its class, and chained probability maps. Binary data (10% of control bytes) adds sparse contexts, and is analyzed for structure: each way the analysis suggests compresses the first 64 KB and the smallest message decides between the text model, the fold, fixed-size records (with contexts by column), their floating point fields on a decimal lattice, a 4-byte field as a signal, and images of 16-bit samples (pixels predicted from their neighbours and by integer LMS, coded high byte first with contexts on where each prediction stands). x86 code, recognized by its frequent near calls, has its branch targets made absolute and gets instruction contexts from `x86_parser`, with mixers and a map selected by the instruction state, in place of the text contexts. Text with numbers (1% of digits) is also tried with its numbers as tokens: each number is predicted from its role (the same column or JSON key a line above, its trend, the number it copies in the line, the sum, difference or product of two numbers before it, a date computed from a count of seconds, the print of the nearest float32), and its digits are coded with where each prediction stands. It tries the capitals transform on text, and a bitmap variant on folded data, and keeps the smaller message. The two ways are compared on the first 64 KB, then the data is compressed once. A CRC-32 of the original ends the message: decompressing anything else (a corrupted file, another table size than the compression's) fails instead of writing wrong data. Options: `-1` and `-2` choose a faster level (below), `-m` forces a mode, `-x` the machine code models (`off`, `bin`, `32`, `64`), `-N` the numbers in text (`on`, `off`), `-C` the capitals transform, `-S` the sample (0 compresses the data both ways, slower and sometimes a little smaller), `-T` a table size.
 
 On the Canterbury corpus, sizes in bytes:
 
 | File | Size | gzip -9 | bzip2 -9 | xz -9e | gmz | Mode found |
 |---|---|---|---|---|---|---|
-| alice29.txt | 152,089 | 54,194 | 43,202 | 48,536 | **35,562** | text + capitals |
-| asyoulik.txt | 125,179 | 48,803 | 39,569 | 44,600 | **33,542** | text + capitals |
-| lcet10.txt | 426,754 | 144,462 | 107,706 | 119,496 | **86,054** | text |
-| plrabn12.txt | 481,861 | 194,357 | 145,577 | 165,464 | **123,305** | text |
-| ptt5 (fax image) | 513,216 | 52,238 | 49,759 | 39,868 | **21,860** | fold of 1728 bits |
-| kennedy.xls | 1,029,744 | 207,053 | 130,280 | 51,876 | **12,968** | fold of 104 bits, layers of 4 |
-| cp.html | 24,603 | 7,960 | 7,624 | 7,660 | **6,173** | text + capitals |
-| fields.c | 11,150 | 3,136 | 3,039 | 3,040 | **2,319** | text + capitals |
-| grammar.lsp | 3,721 | 1,246 | 1,283 | 1,300 | **990** | text |
-| sum | 38,240 | 12,854 | 12,909 | 9,508 | **9,408** | text |
-| xargs.1 | 4,227 | 1,756 | 1,762 | 1,820 | **1,440** | text + capitals |
+| alice29.txt | 152,089 | 54,194 | 43,202 | 48,536 | **35,567** | text + capitals |
+| asyoulik.txt | 125,179 | 48,803 | 39,569 | 44,600 | **33,546** | text + capitals |
+| lcet10.txt | 426,754 | 144,462 | 107,706 | 119,496 | **86,153** | text + capitals |
+| plrabn12.txt | 481,861 | 194,357 | 145,577 | 165,464 | **123,387** | text + capitals |
+| ptt5 (fax image) | 513,216 | 52,238 | 49,759 | 39,868 | **21,864** | fold of 1728 bits |
+| kennedy.xls | 1,029,744 | 207,053 | 130,280 | 51,876 | **12,923** | fold of 104 bits, layers of 4, binary |
+| cp.html | 24,603 | 7,960 | 7,624 | 7,660 | **6,177** | text + capitals |
+| fields.c | 11,150 | 3,136 | 3,039 | 3,040 | **2,323** | text + capitals |
+| grammar.lsp | 3,721 | 1,246 | 1,283 | 1,300 | **994** | text |
+| sum | 38,240 | 12,854 | 12,909 | 9,508 | **8,574** | text, binary |
+| xargs.1 | 4,227 | 1,756 | 1,762 | 1,820 | **1,444** | text + capitals |
 
-The price is speed, as for every context-mixing compressor: about 0.9 s to decompress `alice29.txt` and 1.9 s to compress it (two tries, with and without capitals), against hundredths of a second for the others, and up to about 800 MB of memory for large inputs (tables are sized for the data, so small files take much less). Decompression is a single pass of the same model, so it takes about as long as one compression try.
+The price is speed, as for every context-mixing compressor. On Apple Silicon:
+
+| File | gmz compress | gmz decompress | xz -9e compress | xz decompress |
+|---|---|---|---|---|
+| alice29.txt | 1.1 s | 0.5 s | 0.05 s | 0.01 s |
+| lcet10.txt | 1.9 s | 1.2 s | 0.08 s | 0.01 s |
+| ptt5 | 1.3 s | 0.8 s | 0.15 s | 0.01 s |
+| kennedy.xls | 5.2 s | 4.6 s | 0.40 s | 0.02 s |
+
+The faster levels trade a little size for speed (compress / decompress):
+
+| Level | Canterbury total | alice29.txt | lcet10.txt | kennedy.xls |
+|---|---|---|---|---|
+| default | 332,952 bytes | 1.1 s / 0.5 s | 1.9 s / 1.2 s | 5.2 s / 4.6 s |
+| `-1` | 337,494 bytes (+1.4%) | 0.4 s / 0.3 s | 0.9 s / 0.8 s | 3.2 s / 2.9 s |
+| `-2` | 339,839 bytes (+2.1%) | 0.4 s / 0.2 s | 0.9 s / 0.7 s | 3.0 s / 2.6 s |
+
+For text they keep fewer contexts and mixers, group the slots of each half byte, use smaller tables and skip the capitals comparison; folded data, whose time goes to the fold templates, only loses its text contexts. Binary data loses its sparse contexts, and x86 code keeps only the branch transform. `-2` also drops the chained maps. The level is stored in the message.
+
+On larger corpora (Calgary, Silesia, the first 10 MB of enwik8), gmz is smaller than gzip, bzip2, xz, zstd and brotli on every file, ahead of zpaq -m5 on text, and 13% to 17% larger than paq8px, which is 8 to 10 times slower. The x86 models take ooffice (Silesia) from 2,151,593 to 1,542,295 bytes, 13% below zpaq; the decimal lattice takes sao, a star catalog, from 4,399,334 to 2,047,265 bytes, 45% below paq8px (3,727,085, in 22 minutes against 54 s), and GIS coordinates (shapefiles, GeoPackage) 33% to 43% below paq8px; the 16-bit image model takes mr (an MRI scan) 22% below zpaq, and x-ray 1.6% below paq8px. On numeric text (logs, CSV, JSON, sensor and stock data, over 40 real files), modeling the numbers as numbers takes gmz 15% to 17% below its text model and 5% above paq8px overall, about 10 times faster; where a column is computed from others it goes well below: trades where the total is the price times the quantity 34% below paq8px, census tables of sums and differences 22% below. Details in [docs/RESEARCH.md](docs/RESEARCH.md).
+
+Messages are portable: the same file gives the same message with GCC and Clang, on x86_64 and ARM64, Linux and macOS, and each decodes the others'.
+
+Memory reaches about 800 MB for large inputs (tables are sized for the data, so small files take much less). Decompression runs the same model once, so it takes about as long as compressing does after the comparison. How these times were reached, 2.5 to 6 times faster than the first version, is told in [docs/RESEARCH.md](docs/RESEARCH.md).
