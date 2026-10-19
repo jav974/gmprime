@@ -2166,6 +2166,24 @@ suite<"gmprime::records"> records_suite = [] {
         }
         expect(floats) << twelve.size();
         expect(find_lattice_fields_window(wide, 48, 20000, 10).size() == 10) << "at most max_fields";
+
+        // Floats of slow walks on 0.01: two of them side by side also read as a double, dropped
+        std::vector<uint8_t> walks;
+        int columns[10] = {};
+        uint32_t walk_seed = 3;
+        for (int r = 0; r < 300; ++r) {
+            for (int j = 0; j < 10; ++j) {
+                walk_seed = walk_seed * 1664525u + 1013904223u;
+                columns[j] += static_cast<int>((walk_seed >> 8) % 41) - 20;
+                put_field(walks, float_bits(static_cast<float>(1000 * (j + 1) + columns[j]) * 0.01f), 4, false);
+            }
+        }
+        const auto walk_fields = find_lattice_fields_window(walks, 40);
+        bool all_floats = !walk_fields.empty();
+        for (const auto& f : walk_fields) {
+            all_floats = all_floats && f.format.size == 4;
+        }
+        expect(all_floats) << walk_fields.size();
         expect(lattice_flag_bytes(12) == 2 && lattice_flag_bytes(8) == 1 && lattice_flag_bytes(0) == 0);
         const auto encoded = lattice_encode(wide, 48, twelve);
         expect(encoded.size() == wide.size() + 600 * 2 && lattice_decode(encoded, 48, twelve) == std::optional(wide));
