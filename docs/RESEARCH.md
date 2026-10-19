@@ -204,9 +204,11 @@ Full Silesia files:
 
 | File | gmz before | gmz | zpaq -m5 | paq8px -8 |
 |---|---|---|---|---|
-| sao | 4,399,334 | **2,047,265** | 3,899,367 | (over 20 minutes) |
+| sao | 4,399,334 | **2,047,265** | 3,899,367 | 3,727,085 |
 | mr | 2,192,035 | **1,708,413** | 2,181,419 | |
 | x-ray | 3,651,981 | **3,472,470** | 3,669,812 | 3,530,564 |
+
+On sao, paq8px takes 22 minutes and 2.4 GB for a message 82% larger than gmz's, made in 54 s.
 
 geo goes from 45,525 to 41,082 bytes (paq8px 41,988), sum -5.9%, obj2 -2.1%; Calgary and Canterbury together
 -0.64%, no file worse by more than a byte. osdb, nci and kennedy.xls do not move. Compressing a structured file

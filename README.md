@@ -474,7 +474,7 @@ The faster levels trade a little size for speed (compress / decompress):
 
 For text they keep fewer contexts and mixers, group the slots of each half byte, use smaller tables and skip the capitals comparison; folded data, whose time goes to the fold templates, only loses its text contexts. Binary data loses its sparse contexts, and x86 code keeps only the branch transform. `-2` also drops the chained maps. The level is stored in the message.
 
-On larger corpora (Calgary, Silesia, the first 10 MB of enwik8), gmz is smaller than gzip, bzip2, xz, zstd and brotli on every file, ahead of zpaq -m5 on text, and 13% to 17% larger than paq8px, which is 8 to 10 times slower. The x86 models take ooffice (Silesia) from 2,151,593 to 1,542,295 bytes, 13% below zpaq; the decimal lattice takes sao, a star catalog, from 4,399,334 to 2,047,265 bytes, 47% below zpaq; the 16-bit image model takes mr (an MRI scan) 22% below zpaq, and x-ray 1.6% below paq8px. Details in [docs/RESEARCH.md](docs/RESEARCH.md).
+On larger corpora (Calgary, Silesia, the first 10 MB of enwik8), gmz is smaller than gzip, bzip2, xz, zstd and brotli on every file, ahead of zpaq -m5 on text, and 13% to 17% larger than paq8px, which is 8 to 10 times slower. The x86 models take ooffice (Silesia) from 2,151,593 to 1,542,295 bytes, 13% below zpaq; the decimal lattice takes sao, a star catalog, from 4,399,334 to 2,047,265 bytes, 45% below paq8px (3,727,085, in 22 minutes against 54 s); the 16-bit image model takes mr (an MRI scan) 22% below zpaq, and x-ray 1.6% below paq8px. Details in [docs/RESEARCH.md](docs/RESEARCH.md).
 
 Messages are portable: the same file gives the same message with GCC and Clang, on x86_64 and ARM64, Linux and macOS, and each decodes the others'.
 
