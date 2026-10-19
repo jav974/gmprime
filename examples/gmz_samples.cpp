@@ -3,10 +3,17 @@
 //                 single precision value and a float, with a few values off their lattice
 //   image_le.bin  a smooth image of 16-bit little-endian pixels, rows of 72 pixels
 //   image_be.bin  the same in big-endian, rows of 60 pixels
+//   numbers.csv   a time series: a count of seconds, the same time as a local date (UTC-7), a price printed from a
+//                 float32 with 6 decimals, a temperature, a counter, the time in milliseconds
+//   numbers.json  records as JSON, keyed numbers of various precisions, a title repeating one of them
+//   numbers.log   log lines with dates, addresses and counters
+//   crowded.txt   numbers, and every byte that could mark them, so that none can
 // Each just large enough for gmz to find its structure, so that the tests stay short
 //   gmz_samples DIRECTORY
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -70,6 +77,68 @@ std::vector<uint8_t> image(const size_t width, const size_t height, const bool b
     return out;
 }
 
+std::vector<uint8_t> text(const std::string& s) {
+    return {s.begin(), s.end()};
+}
+
+std::string time_series() {
+    std::string out = "epoch,local,price,temperature,count,millis\n";
+    int64_t seconds = 1128000000;
+    float price = 127.49f;
+    int temperature = 215, count = 1000;
+    char line[160];
+    for (int i = 0; i < 160; ++i) {
+        seconds += 60 + next() % 3;
+        const std::time_t local = static_cast<std::time_t>(seconds - 7 * 3600);
+        const std::tm* t = std::gmtime(&local);
+        price += static_cast<float>(static_cast<int>(next() % 21) - 10) / 100;
+        temperature += static_cast<int>(next() % 5) - 2;
+        count += 1 + static_cast<int>(next() % 3);
+        const auto millis = static_cast<long long>(seconds) * 1000 + next() % 1000;
+        std::snprintf(line, sizeof line, "%lld,%04d-%02d-%02d %02d:%02d:%02d,%.6f,%d.%d,%d,%lld\n", static_cast<long long>(seconds),
+                      t->tm_year + 1900, t->tm_mon + 1, t->tm_mday, t->tm_hour, t->tm_min, t->tm_sec, static_cast<double>(price),
+                      temperature / 10, temperature % 10, count, millis);
+        // Now and then a missing count of seconds
+        out += i % 37 == 20 ? "NA" + std::string(std::strchr(line, ',')) : std::string(line);
+    }
+    return out;
+}
+
+std::string json_records() {
+    std::string out = "[\n";
+    char line[200];
+    double lon = -122.123456, depth = 10.5;
+    for (int i = 0; i < 90; ++i) {
+        lon += static_cast<double>(static_cast<int>(next() % 2001) - 1000) / 1e6;
+        depth = static_cast<double>(next() % 300) / 10;
+        const double mag = static_cast<double>(next() % 500) / 100;
+        const double lat = 37.1234567 + static_cast<double>(next() % 100000) / 1e7;
+        std::snprintf(line, sizeof line, "\"mag\":%.2f,\"lon\":%.6f,\"lat\":%.7f,\"depth\":%.1f,\"title\":\"M %.2f\"},\n", mag, lon,
+                      lat, depth, mag);
+        // Now and then a field more at the start, which moves the place of every number after it
+        out += "{\"id\":" + std::to_string(7000 + i * 3) + (i % 7 == 3 ? ",\"rank\":" + std::to_string(i % 5) : std::string()) + "," + line;
+    }
+    return out + "]\n";
+}
+
+std::string log_lines() {
+    std::string out;
+    char line[200];
+    int minute = 0, second = 0, bytes = 1000;
+    for (int i = 0; i < 120; ++i) {
+        second += 1 + static_cast<int>(next() % 20);
+        minute += second / 60;
+        second %= 60;
+        bytes += static_cast<int>(next() % 4000);
+        // One call per statement: the order of evaluation of arguments differs between compilers
+        const uint32_t subnet = next() % 4, host = next() % 256, item = next() % 100, delta = next() % 9;
+        std::snprintf(line, sizeof line, "2005.06.03 22:%02d:%02d 192.168.%u.%u GET /item/%u %d -%u.5\n", minute % 60, second, subnet,
+                      host, item, bytes, delta);
+        out += line;
+    }
+    return out;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -92,5 +161,17 @@ int main(int argc, char** argv) {
     save(dir + "records.bin", records);
     save(dir + "image_le.bin", image(72, 64, false));
     save(dir + "image_be.bin", image(60, 80, true));
+    save(dir + "numbers.csv", text(time_series()));
+    save(dir + "numbers.json", text(json_records()));
+    save(dir + "numbers.log", text(log_lines()));
+
+    // Every byte a marker could be, among numbers
+    std::vector<uint8_t> crowded = text(log_lines());
+    for (int b = 0; b < 256; ++b) {
+        if (b != '\n') {
+            crowded.push_back(static_cast<uint8_t>(b));
+        }
+    }
+    save(dir + "crowded.txt", crowded);
     return 0;
 }

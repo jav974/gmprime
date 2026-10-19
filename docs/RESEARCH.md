@@ -226,6 +226,67 @@ Integrating it found two bugs that macOS release builds hid:
 
 AddressSanitizer on Linux caught the first; the unit tests the second.
 
+### Numbers in text
+
+Logs, CSV, JSON and tables spend most of gmz's bits on digits: 61% to 98% of the coded bits for 15% to 74% of the
+bytes. Every general compressor, paq8px included, codes them digit by digit as text.
+
+**The transform.** Each number becomes a marker byte (absent from the file), its layout (sign, digits before and
+after the point, leading zeros included) and its digits in a balanced 4-bit code, whose first bit splits 0-4 from
+5-9 as a binary number's bits halve its values. IP addresses, versions and dotted dates stay integers; anything
+unusual ('+', exponents, thousands separators, more than 18 digits) stays text around numbers, so that every way
+of writing comes back exactly. Knowing the layout first, the model knows each digit's weight.
+
+**Predicting each number from its role.** Slots remember the last values of a number by its place: the k-th
+number of its line after the same text, the same JSON key, the same column of separators, the same local template.
+Predictions: last value, trend, step, the line above, the number before it in the line and the same offset from
+it, adaptive linear predictors, a median, a number of the line it copies (the title "M 1.2" copies the magnitude,
+learned per slot). Each digit is coded with where each prediction stands against the digits still possible,
+and each bit of its code against the value it splits, in eighths of the digit's weight.
+
+**Computed numbers.** Programs print binary floats with more digits than they hold: Apple's prices are float32
+printed with 6 decimals (`127.489998` is 127.49f), USGS coordinates float32 printed with 14 or 15 digits;
+predicting the print of the nearest float32 saves 2% to 4%. A count of seconds since 1970 is often written again
+as a date and a time in the same line: computed (the time zone learned by a vote that follows the change to winter
+time), they become copies (bgl.log -12%). Bits that the bytes possible at a place decide are not coded.
+
+| File | xz -9e | zpaq -m5 | paq8px -8 | gmz before | gmz |
+|---|---|---|---|---|---|
+| aapl.csv (stock prices) | 17,776 | 14,708 | 10,989 | 13,146 | **10,627** |
+| intel.txt (sensor readings) | 164,824 | 116,944 | 74,290 | 91,849 | **73,072** |
+| co2.txt (Mauna Loa) | 28,356 | 20,219 | 12,908 | 13,800 | 12,984 |
+| meteo.csv (hourly weather) | 167,308 | 117,631 | 76,327 | 91,399 | 77,656 |
+| bgl.log | 39,324 | 27,866 | 21,504 | 25,945 | 21,910 |
+| hdfs.log | 42,348 | 35,425 | 25,783 | 30,447 | 26,896 |
+| quakes.csv (USGS) | 235,796 | 176,454 | 134,938 | 174,751 | 144,678 |
+| quakes.json (USGS) | 83,432 | 59,289 | 36,774 | 55,049 | 42,895 |
+| openssh.log | 9,740 | 6,588 | 3,100 | 4,744 | 4,107 |
+| apache.log | 6,744 | 4,742 | 2,488 | 3,145 | 3,046 |
+| nci (33 MB, chemical structures) | | 1,251,218 | | 1,166,039 | **1,027,935** |
+
+Over the ten files gmz goes from 504,275 to 417,871 bytes (-17.1%). It beats paq8px on two and comes within 2% on
+three, about 10 times faster; prose does not change. What paq8px still wins on is the text around the numbers:
+with every number replaced by #, quakes.json costs gmz 13,347 bytes against 7,075 for paq8px, place names
+taking 41% of them.
+
+Tried and dropped:
+- residuals as sign and magnitude against a column prediction: worse everywhere but co2 (meteo +6.8%,
+  quakes.json +15%);
+- the value in binary rather than decimal digits: decimal wins on aapl (-17%), quakes and most logs, binary only
+  on meteo;
+- the text history without the digits: +0.1% to +0.9%;
+- long copies from old lines (co2's "a year ago" column is not the value 52 lines above).
+
+Several predictions are near the floor: the microseconds of bgl, the block identifiers of hdfs and the times of
+earthquakes are essentially random.
+
+The cost is speed: numeric text compresses 1.5 to 2.5 times slower than gmz's text model, and text just above 3%
+of digits pays the comparison of two more plans for little (bib -1%, trans 0%).
+
+Integrating it found that decoding a corrupted message could crash: a digit's first bits, coded as near certain,
+came out otherwise, and a shift went negative. 126 decodings of corrupted messages under AddressSanitizer now all
+end in a clean refusal.
+
 ### A million random digits
 
 The file of Mark Nelson's challenge (AMillionRandomDigits.bin, 415,241 bytes, unbeaten since 2002) is the digits
@@ -361,7 +422,7 @@ and adding to it would rebuild paq8px for a few percent. The results that broke 
 computation behind the bytes: decimals stored as doubles (sao, 47% below zpaq), pixels as numbers (x-ray, below
 paq8px), geometry found by folding the whole number. That is the axis now:
 
-- Numbers written in text (CSV, logs, JSON): parsed and predicted as numbers, not digit by digit.
+- Numbers written in text: done above. The structure text around them (names, messages) is where paq8px leads.
 - Computed fields, which cost nothing once recognized: checksums (CRC of PNG chunks or zip entries), derived
   columns, counters, timestamps.
 - Other computations to invert: floating point values from other operations than k * step, data already

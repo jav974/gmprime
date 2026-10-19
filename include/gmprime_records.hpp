@@ -7,11 +7,14 @@
 // Encoders analyze in floating point, but everything a decoder runs is integer arithmetic.
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <optional>
+#include <tuple>
+#include <utility>
 #include <vector>
 #include <gmprime_coding.hpp>
 
@@ -734,6 +737,517 @@ inline std::optional<std::vector<uint8_t>> lattice_decode(const std::vector<uint
     out.insert(out.end(), encoded.begin() + static_cast<std::ptrdiff_t>(tail), encoded.end());
     return out;
 }
+
+// NUMBERS IN TEXT. A reversible transform replaces each decimal number of a text by a token: a marker byte (absent
+// from the text), its layout, its digits in a balanced 4-bit code; numeric_text_reader reads that stream causally,
+// for the models that code it. A model then predicts each number as a number: rescale_decimal brings predictions
+// to its precision, decimal_position tells where they stand against the digits still possible (the decimal
+// counterpart of bit_middle), split_at what each coded bit of a digit splits. Programs print binary floats with
+// more digits than they hold, and dates computed from counts of seconds: float32_print and civil_from_seconds
+// compute those, with integers only.
+//
+// A number is a run of 1 to 18 digits, with a '-' sign when the '-' does not follow a letter, a digit or a '.',
+// and a fraction ('.' and digits, 18 digits in all) unless it belongs to a dotted sequence (an IP address, a
+// version, a date like 2005.06.03): its layout is the sign, the count of integer digits L (leading zeros
+// included) and of fraction digits F, its value the integer m of its L + F digits. The layout byte holds
+// sign << 7 | (F * 18 + L - 1) for F up to 6, else sign << 7 | 127 followed by L and F; then come the L + F
+// digits, without the sign and the point. Every quirk of writing (leading zeros, trailing zeros) is in the layout,
+// so that the text comes back exactly. Knowing the layout first, a model knows the weight of every digit. Anything
+// else stays text between numbers ('+', the 'e-' of 1e-5, the ',' of 1,234, the '.' of .5); a run of more than
+// 18 digits is cut in numbers of 18.
+
+struct text_number {
+    bool negative = false;
+    int int_digits = 1;      // L, leading zeros included, 1 to 18
+    int frac_digits = 0;     // F, 0 to 17
+    uint64_t mantissa = 0;   // the L + F digits as one integer
+};
+
+inline uint64_t power10(const int n) {
+    static const auto table = [] {
+        std::array<uint64_t, 20> t{};
+        t[0] = 1;
+        for (size_t i = 1; i < t.size(); ++i) {
+            t[i] = t[i - 1] * 10;
+        }
+        return t;
+    }();
+    return table[static_cast<size_t>(n)];
+}
+
+// A byte absent from the text, for the marker: control bytes first
+inline std::optional<uint8_t> numeric_text_marker(const std::vector<uint8_t>& text) {
+    std::array<bool, 256> seen{};
+    for (const auto b : text) {
+        seen[b] = true;
+    }
+    static const uint8_t preferred[] = {0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x03, 0x04, 0x05, 0x06, 0x07, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13,
+                                        0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x7F, 0x08, 0x0B, 0x0C};
+    for (const auto b : preferred) {
+        if (!seen[b]) {
+            return b;
+        }
+    }
+    for (int b = 0x80; b < 0x100; ++b) {
+        if (!seen[static_cast<size_t>(b)]) {
+            return static_cast<uint8_t>(b);
+        }
+    }
+    return std::nullopt;
+}
+
+namespace detail {
+
+inline bool is_digit(const uint8_t c) {
+    return c >= '0' && c <= '9';
+}
+
+inline bool is_alnum(const uint8_t c) {
+    return is_digit(c) || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+} // namespace detail
+
+// Digits in the stream: 0x30 | a 4-bit code, monotone, whose binary tree splits the digits evenly (0-4 | 5-9, then
+// 0-1 | 2-4 and 5-6 | 7-9, ...): each coded bit halves the values left, as the bits of a binary number do
+inline uint8_t digit_code(const int d) {
+    static const uint8_t codes[10] = {0, 2, 4, 6, 7, 8, 10, 12, 14, 15};
+    return static_cast<uint8_t>(0x30 | codes[d]);
+}
+
+// The digit of a code, or -1
+inline int code_digit(const uint8_t b) {
+    static const int8_t digits[16] = {0, -1, 1, -1, 2, -1, 3, 4, 5, -1, 6, -1, 7, -1, 8, 9};
+    return (b & 0xF0) == 0x30 ? digits[b & 15] : -1;
+}
+
+// At a node of a digit's code (its known low bits after a leading 1, 1 to 15): the digits left, from low to high,
+// and the first one of them whose next bit is 1 (split > high when none is)
+struct digit_split {
+    int low = 0, split = 0, high = 9;
+};
+
+inline digit_split split_at(const uint32_t node) {
+    static const auto table = [] {
+        std::array<digit_split, 16> t{};
+        for (uint32_t n = 1; n < 16; ++n) {
+            const int known = n >= 8 ? 3 : n >= 4 ? 2 : n >= 2 ? 1 : 0;
+            const uint32_t prefix = n & ((1u << known) - 1);
+            digit_split s{10, 10, -1};
+            for (int d = 0; d < 10; ++d) {
+                const uint32_t c = digit_code(d) & 15u;
+                if ((c >> (4 - known)) != prefix) {
+                    continue;
+                }
+                s.low = std::min(s.low, d);
+                s.high = std::max(s.high, d);
+                if (((c >> (3 - known)) & 1) && d < s.split) {
+                    s.split = d;
+                }
+            }
+            t[n] = s;
+        }
+        return t;
+    }();
+    return table[node & 15];
+}
+
+// Layout bytes of a number
+inline void put_layout(std::vector<uint8_t>& out, const text_number& n) {
+    const int sign = n.negative ? 0x80 : 0;
+    if (n.frac_digits <= 6) {
+        out.push_back(static_cast<uint8_t>(sign | (n.frac_digits * 18 + n.int_digits - 1)));
+    } else {
+        out.push_back(static_cast<uint8_t>(sign | 127));
+        out.push_back(static_cast<uint8_t>(n.int_digits));
+        out.push_back(static_cast<uint8_t>(n.frac_digits));
+    }
+}
+
+inline std::vector<uint8_t> numeric_text_encode(const std::vector<uint8_t>& text, const uint8_t marker) {
+    std::vector<uint8_t> out;
+    const size_t n = text.size();
+    // Allocation failures abort: no cleanup to plan for
+    [&]() noexcept {
+        out.reserve(n + n / 4);
+        size_t i = 0;
+        while (i < n) {
+            const uint8_t c = text[i];
+            const bool sign = c == '-' && i + 1 < n && detail::is_digit(text[i + 1]) && (i == 0 || (!detail::is_alnum(text[i - 1]) && text[i - 1] != '.'));
+            if (!detail::is_digit(c) && !sign) {
+                out.push_back(c);
+                ++i;
+                continue;
+            }
+            text_number num;
+            size_t p = sign ? i + 1 : i;
+            num.negative = sign;
+            const size_t start = p;
+            uint64_t m = 0;
+            int digits = 0;
+            while (p < n && detail::is_digit(text[p]) && digits < 18) {
+                m = m * 10 + (text[p] - '0');
+                ++digits;
+                ++p;
+            }
+            num.int_digits = digits;
+            // A fraction, unless the number is part of a dotted sequence
+            const bool dotted_before = start >= 2 && text[start - 1] == '.' && detail::is_digit(text[start - 2]);
+            if (!dotted_before && digits < 18 && p + 1 < n && text[p] == '.' && detail::is_digit(text[p + 1])) {
+                size_t q = p + 1;
+                while (q < n && detail::is_digit(text[q])) {
+                    ++q;
+                }
+                const int frac = static_cast<int>(q - p - 1);
+                const bool dotted_after = q + 1 < n && text[q] == '.' && detail::is_digit(text[q + 1]);
+                if (!dotted_after && digits + frac <= 18) {
+                    for (size_t k = p + 1; k < q; ++k) {
+                        m = m * 10 + (text[k] - '0');
+                    }
+                    num.frac_digits = frac;
+                    p = q;
+                }
+            }
+            num.mantissa = m;
+            out.push_back(marker);
+            put_layout(out, num);
+            for (size_t k = start; k < p; ++k) {
+                if (text[k] != '.') {
+                    out.push_back(digit_code(text[k] - '0'));
+                }
+            }
+            i = p;
+        }
+    }();
+    return out;
+}
+
+// The text, or nothing if the stream is not a valid transform
+inline std::optional<std::vector<uint8_t>> numeric_text_decode(const std::vector<uint8_t>& encoded, const uint8_t marker) {
+    std::vector<uint8_t> out;
+    out.reserve(encoded.size() + encoded.size() / 2);
+    const size_t n = encoded.size();
+    size_t i = 0;
+    while (i < n) {
+        if (encoded[i] != marker) {
+            out.push_back(encoded[i++]);
+            continue;
+        }
+        if (++i >= n) {
+            return std::nullopt;
+        }
+        text_number num;
+        const uint8_t layout = encoded[i++];
+        num.negative = (layout & 0x80) != 0;
+        const int code = layout & 0x7F;
+        if (code == 127) {
+            if (i + 2 > n) {
+                return std::nullopt;
+            }
+            num.int_digits = encoded[i++];
+            num.frac_digits = encoded[i++];
+        } else if (code < 126) {
+            num.int_digits = code % 18 + 1;
+            num.frac_digits = code / 18;
+        } else {
+            return std::nullopt;
+        }
+        const int digits = num.int_digits + num.frac_digits;
+        if (num.int_digits < 1 || digits > 18) {
+            return std::nullopt;
+        }
+        if (i + static_cast<size_t>(digits) > n) {
+            return std::nullopt;
+        }
+        if (num.negative) {
+            out.push_back('-');
+        }
+        for (int d = 0; d < digits; ++d) {
+            const int digit = code_digit(encoded[i++]);
+            if (digit < 0) {
+                return std::nullopt;
+            }
+            if (d == num.int_digits) {
+                out.push_back('.');
+            }
+            out.push_back(static_cast<uint8_t>('0' + digit));
+        }
+    }
+    return out;
+}
+
+// Share of digits in the text, in 1/10000
+inline size_t digit_density(const std::vector<uint8_t>& text, const size_t sample = 65536) {
+    const size_t n = std::min(text.size(), sample);
+    size_t digits = 0;
+    for (size_t i = 0; i < n; ++i) {
+        digits += detail::is_digit(text[i]);
+    }
+    return n ? digits * 10000 / n : 0;
+}
+
+// DECIMAL PREDICTION. A value v with f fraction digits brought to t fraction digits (rounded half away from zero
+// when digits are dropped), within +-10^18
+inline int64_t rescale_decimal(const int64_t v, const int from, const int to) {
+    if (to >= from) {
+        const auto p = static_cast<int64_t>(power10(std::min(to - from, 18)));
+        const int64_t limit = static_cast<int64_t>(power10(18)) / p;
+        return std::max(-limit, std::min(limit, v)) * p;
+    }
+    const auto p = static_cast<int64_t>(power10(std::min(from - to, 18)));
+    return v >= 0 ? (v + p / 2) / p : -((-v + p / 2) / p);
+}
+
+// The decimal counterpart of bit_middle and quantize_difference, as a context: where a prediction of a value of
+// digits stands once its first digits are known (low: their value followed by zeros, unit: the weight of the next
+// digit). Below or above the values left (64 + or 80 + the distance in units, on a log scale), or the digit it
+// falls in, times 4, plus its quarter of that digit, so that carries are seen coming (0 to 39)
+inline uint64_t decimal_position(const int64_t prediction, const int64_t low, const int64_t unit) {
+    const int64_t rel = prediction - low;
+    const auto lg = [](const int64_t d) { return static_cast<uint64_t>(std::min(15, 64 - leading_zeros(static_cast<uint64_t>(d)))); };
+    if (rel < 0) {
+        return 64 + lg((-rel + unit - 1) / unit);
+    }
+    if (rel >= 10 * unit) {
+        return 80 + lg((rel - 10 * unit) / unit + 1);
+    }
+    const int64_t digit = rel / unit;
+    const int64_t quarter = unit >= 4 ? (rel % unit) * 4 / unit : 0;
+    return static_cast<uint64_t>(digit * 4 + quarter);
+}
+
+// BINARY FLOATS WRITTEN IN DECIMAL. Programs print binary floats: a float32 printed with more digits than it
+// holds (127.49f as 127.489998, 35.99583f as 35.995834350586) leaves digits that its value computes. Integers
+// only (128-bit products), so that a decoder predicts exactly the same
+
+// m * 2^e, m below 2^24 (a float32 magnitude)
+struct binary_float {
+    uint64_t m = 0;
+    int e = 0;
+};
+
+namespace detail {
+
+inline int bit_length(const uint64_t v) {
+    return v == 0 ? 0 : 64 - leading_zeros(v);
+}
+
+// (high, low) / d for high < d, so that the quotient fits 64 bits: the quotient and the remainder (long division
+// by 32-bit digits, as in Hacker's Delight)
+inline std::pair<uint64_t, uint64_t> divide_wide(const uint64_t high, const uint64_t low, uint64_t d) {
+    constexpr uint64_t base = uint64_t{1} << 32;
+    const int s = leading_zeros(d);
+    d <<= s;
+    const uint64_t d1 = d >> 32, d0 = d & 0xFFFFFFFF;
+    const uint64_t n32 = s == 0 ? high : high << s | low >> (64 - s);
+    const uint64_t n10 = low << s, n1 = n10 >> 32, n0 = n10 & 0xFFFFFFFF;
+    uint64_t q1 = n32 / d1, r = n32 - q1 * d1;
+    while (q1 >= base || q1 * d0 > (r << 32 | n1)) {
+        --q1;
+        r += d1;
+        if (r >= base) {
+            break;
+        }
+    }
+    const uint64_t n21 = (n32 << 32 | n1) - q1 * d;
+    uint64_t q0 = n21 / d1;
+    r = n21 - q0 * d1;
+    while (q0 >= base || q0 * d0 > (r << 32 | n0)) {
+        --q0;
+        r += d1;
+        if (r >= base) {
+            break;
+        }
+    }
+    return {q1 << 32 | q0, ((n21 << 32 | n0) - q0 * d) >> s};
+}
+
+// The quotient q of (high, low) / d rounded half to even, given the remainder
+inline uint64_t round_quotient(const uint64_t q, const uint64_t remainder, const uint64_t d) {
+    const uint64_t half = d - remainder;   // remainder * 2 against d, without overflow
+    return remainder > half || (remainder == half && (q & 1)) ? q + 1 : q;
+}
+
+} // namespace detail
+
+// The float32 nearest to n / 10^f, f from 0 to 18: always a normal float32, n / 10^f being between 10^-18 and
+// 2^64. The exponent is estimated from the bit lengths (within 2), then corrected
+inline binary_float nearest_float32(const uint64_t n, const int f) {
+    if (n == 0) {
+        return {};
+    }
+    const int nb = detail::bit_length(n);
+    const uint64_t p = power10(f);
+    // 3402 / 1024 is above log2(10): the estimate is never too low, the quotient starts below 2^24
+    int e = nb - 24 - ((f * 3402) >> 10);
+    while (true) {
+        // m = round(n * 2^-e / 10^f) in [2^23, 2^24); the quotient stays below 2^26, within 64 bits
+        uint64_t q, remainder, d = p;
+        if (e <= 0) {
+            const int shift = -e;
+            const uint64_t high = shift == 0 ? 0 : shift >= 64 ? n << (shift - 64) : n >> (64 - shift);
+            const uint64_t low = shift >= 64 ? 0 : n << shift;
+            std::tie(q, remainder) = detail::divide_wide(high, low, p);
+        } else {
+            d = p << e;
+            q = n / d;
+            remainder = n % d;
+        }
+        if (q < (1u << 23)) {
+            --e;
+        } else {
+            binary_float r{detail::round_quotient(q, remainder, d), e};
+            if (r.m == (1u << 24)) {
+                r.m >>= 1;
+                ++r.e;
+            }
+            return r;
+        }
+    }
+}
+
+// m * 2^e written with f decimals, as an integer of digits (round half to even), if below 10^19
+inline std::optional<uint64_t> render_decimal(const binary_float x, const int f) {
+    const auto scaled = multiply_wide(x.m, power10(f));
+    if (x.e >= 0) {
+        // Shifted left, it must stay below 10^19, so within 64 bits
+        if (scaled.high != 0 || detail::bit_length(scaled.low) + x.e > 64) {
+            return std::nullopt;
+        }
+        const uint64_t v = scaled.low << x.e;
+        return v < power10(19) ? std::optional<uint64_t>(v) : std::nullopt;
+    }
+    // Shifted right by s, rounded half to even: the bits shifted out decide, against half of 2^s
+    const int s = -x.e;
+    if (s >= 128) {
+        return uint64_t{0};
+    }
+    const auto bit = [&](const int i) { return i >= 64 ? (scaled.high >> (i - 64)) & 1 : (scaled.low >> i) & 1; };
+    const auto below = [&](const int n) {   // any of bits [0, n) set
+        return n <= 0 ? false : n >= 64 ? scaled.low != 0 || (n > 64 && (scaled.high & ((n >= 128 ? 0 : uint64_t{1} << (n - 64)) - 1)) != 0)
+                                        : (scaled.low & ((uint64_t{1} << n) - 1)) != 0;
+    };
+    if (s < 64 && scaled.high >> s != 0) {
+        return std::nullopt;    // 64 bits or more
+    }
+    uint64_t v = s >= 64 ? scaled.high >> (s - 64) : scaled.low >> s | (s == 0 ? 0 : scaled.high << (64 - s));
+    if (bit(s - 1) && (below(s - 1) || (v & 1))) {
+        ++v;
+    }
+    return v < power10(19) ? std::optional<uint64_t>(v) : std::nullopt;
+}
+
+// What a float32 near n / 10^f prints with f decimals (f from 0 to 18): n itself if n is such a print
+inline std::optional<uint64_t> float32_print(const uint64_t n, const int f) {
+    return render_decimal(nearest_float32(n, f), f);
+}
+
+// TIMES. A count of seconds since 1970 written in a text is often written again as a date and a time: the civil
+// date of a day count (proleptic Gregorian calendar, integers only)
+struct civil_time {
+    int64_t year = 1970;
+    int month = 1, day = 1, hour = 0, minute = 0, second = 0;
+};
+
+inline civil_time civil_from_seconds(const int64_t seconds) {
+    const int64_t days = seconds >= 0 ? seconds / 86400 : -((-seconds + 86399) / 86400);
+    const int64_t rest = seconds - days * 86400;
+    const int64_t z = days + 719468;
+    const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    const int64_t doe = z - era * 146097;
+    const int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const int64_t mp = (5 * doy + 2) / 153;
+    civil_time t;
+    t.day = static_cast<int>(doy - (153 * mp + 2) / 5 + 1);
+    t.month = static_cast<int>(mp < 10 ? mp + 3 : mp - 9);
+    t.year = yoe + era * 400 + (t.month <= 2);
+    t.hour = static_cast<int>(rest / 3600);
+    t.minute = static_cast<int>(rest / 60 % 60);
+    t.second = static_cast<int>(rest % 60);
+    return t;
+}
+
+// The causal reader: fed the transformed stream byte by byte, it says where the next byte stands (text, layout,
+// or a byte of a number's value) and gives each number once its last byte is known
+class numeric_text_reader {
+public:
+    enum state_kind { text, layout, layout_l, layout_f, value };
+
+    explicit numeric_text_reader(const uint8_t marker): _marker(marker) {
+    }
+
+    [[nodiscard]] state_kind state() const {
+        return _state;
+    }
+    [[nodiscard]] const text_number& number() const {
+        return _number;
+    }
+    // While in a value: its digits, the index of the next one, the value of the digits before it
+    [[nodiscard]] int value_digits() const {
+        return _bytes;
+    }
+    [[nodiscard]] int value_index() const {
+        return _index;
+    }
+    [[nodiscard]] uint64_t value_prefix() const {
+        return _prefix;
+    }
+
+    // Returns true when the byte completed a number
+    bool byte_added(const uint8_t byte) {
+        switch (_state) {
+        case text:
+            if (byte == _marker) {
+                _state = layout;
+                _number = text_number{};
+            }
+            return false;
+        case layout: {
+            _number.negative = (byte & 0x80) != 0;
+            const int code = byte & 0x7F;
+            if (code == 127) {
+                _state = layout_l;
+                return false;
+            }
+            _number.int_digits = code % 18 + 1;
+            _number.frac_digits = std::min(code / 18, 17);
+            start_value();
+            return false;
+        }
+        case layout_l:
+            _number.int_digits = std::max(1, std::min<int>(byte, 18));
+            _state = layout_f;
+            return false;
+        case layout_f:
+            _number.frac_digits = std::max(0, std::min<int>(byte, 18 - _number.int_digits));
+            start_value();
+            return false;
+        default:    // value
+            _prefix = _prefix * 10 + static_cast<uint64_t>(std::max(0, code_digit(byte)));
+            if (++_index == _bytes) {
+                _number.mantissa = _prefix;
+                _state = text;
+                return true;
+            }
+            return false;
+        }
+    }
+
+private:
+    void start_value() {
+        _bytes = _number.int_digits + _number.frac_digits;
+        _index = 0;
+        _prefix = 0;
+        _state = value;
+    }
+
+    uint8_t _marker;
+    state_kind _state = text;
+    text_number _number;
+    int _bytes = 0, _index = 0;
+    uint64_t _prefix = 0;
+};
 
 } // GMPrime::coding
 

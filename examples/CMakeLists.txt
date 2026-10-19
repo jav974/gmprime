@@ -58,15 +58,30 @@ if (BUILD_TESTING AND (PROJECT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR))
     add_test(NAME gmz_records_checksum COMMAND ${CMAKE_COMMAND} -DGMZ=$<TARGET_FILE:gmz> -DINPUT=${GMZ_SAMPLES}/records.bin
              -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/records_mismatch -DOPTIONS=-T\;18 -DDECOMPRESS_OPTIONS=-T\;17
              -P ${CMAKE_CURRENT_SOURCE_DIR}/round_trip.cmake)
+    # Numbers in text: a time series, JSON, a log, and a text where no byte is free to mark numbers
+    add_test(NAME gmz_numbers_csv COMMAND gmz t ${GMZ_SAMPLES}/numbers.csv)
+    add_test(NAME gmz_numbers_json COMMAND gmz -1 t ${GMZ_SAMPLES}/numbers.json)
+    add_test(NAME gmz_numbers_log COMMAND gmz -S 2048 t ${GMZ_SAMPLES}/numbers.log)
+    add_test(NAME gmz_numbers_only COMMAND gmz -2 -N on t ${GMZ_SAMPLES}/numbers.log)
+    add_test(NAME gmz_numbers_off COMMAND gmz -N off t ${GMZ_SAMPLES}/numbers.csv)
+    add_test(NAME gmz_numbers_crowded COMMAND gmz -N on t ${GMZ_SAMPLES}/crowded.txt)
+    add_test(NAME gmz_numbers_files COMMAND ${CMAKE_COMMAND} -DGMZ=$<TARGET_FILE:gmz> -DINPUT=${GMZ_SAMPLES}/numbers.csv
+             -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/numbers -DOPTIONS=-T\;18 -P ${CMAKE_CURRENT_SOURCE_DIR}/round_trip.cmake)
+    add_test(NAME gmz_numbers_checksum COMMAND ${CMAKE_COMMAND} -DGMZ=$<TARGET_FILE:gmz> -DINPUT=${GMZ_SAMPLES}/numbers.csv
+             -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/numbers_mismatch -DOPTIONS=-T\;18 -DDECOMPRESS_OPTIONS=-T\;17
+             -P ${CMAKE_CURRENT_SOURCE_DIR}/round_trip.cmake)
     set_tests_properties(gmz_records gmz_records_level1 gmz_image_little_endian gmz_image_big_endian gmz_records_files
-                         gmz_records_checksum PROPERTIES FIXTURES_REQUIRED gmz_samples)
+                         gmz_records_checksum gmz_numbers_checksum gmz_numbers_csv gmz_numbers_json gmz_numbers_log gmz_numbers_only gmz_numbers_off
+                         gmz_numbers_crowded gmz_numbers_files PROPERTIES FIXTURES_REQUIRED gmz_samples)
 
     # Invalid command lines
     add_test(NAME gmz_unknown_option COMMAND gmz -q t ${GMZ_SAMPLE})
     add_test(NAME gmz_missing_command COMMAND gmz -m text)
     add_test(NAME gmz_unknown_command COMMAND gmz x ${GMZ_SAMPLE})
     add_test(NAME gmz_unknown_code_mode COMMAND gmz -x 16 t ${GMZ_SAMPLE})
-    set_tests_properties(gmz_unknown_option gmz_missing_command gmz_unknown_command gmz_unknown_code_mode PROPERTIES WILL_FAIL TRUE)
+    add_test(NAME gmz_unknown_numbers_mode COMMAND gmz -N maybe t ${GMZ_SAMPLE})
+    set_tests_properties(gmz_unknown_option gmz_missing_command gmz_unknown_command gmz_unknown_code_mode gmz_unknown_numbers_mode
+                         PROPERTIES WILL_FAIL TRUE)
 endif ()
 
 if (BUILD_TESTING AND (PROJECT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR))

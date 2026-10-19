@@ -16,6 +16,7 @@
 //             smaller tables, no capitals comparison; folded data only loses its text contexts; -2 also drops the
 //             chained maps. The level is stored in the message for the decompressor
 //   -x MODE   machine code: auto (default), off, bin (sparse contexts for binary data), 32 or 64 (x86 code)
+//   -N MODE   numbers in text: auto (default: tried when digits are 3% of the first 64 KB), on (only), off
 //
 // The file is first analyzed with gmprime::analyze_folds. Data that folds (bitmap rows, fixed-size records)
 // is coded with bit and byte templates across the fold, in 2D and 3D; anything else with the text model:
@@ -29,9 +30,19 @@
 // (k * step stored as k and a residual of a few units in the last place; a 4-byte field also as a signal,
 // predicted from the records before), and images of 16-bit samples (byte order and row width found, pixels
 // coded high byte first, with numeric contexts: where predictions stand from the values the known bits allow).
+// Text with numbers (3% of digits) is also tried with its numbers as tokens (numeric_text_encode: a marker, the
+// layout, the digits): each number fills slots (its place in the line after the same text, the text before it,
+// its column of separators, the local template of the last texts), and is predicted from them (last values,
+// trend, step, the line above, the number before it, its offset from it, adaptive linear predictors, the number
+// of the line it copies or a date and time computed from a count of seconds earlier in the line, a number of an
+// earlier line, the print of the nearest float32); each digit is coded with where each prediction stands against
+// the digits still possible, and each bit of its balanced code with where they stand against the value it splits.
+// Bits that the bytes possible at a place decide are not coded.
 // The compressed message is a gmprime: the arithmetic coder's output, saved and loaded like any number.
 #include <chrono>
 #include <cstdio>
+#include <cmath>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <string>
@@ -62,6 +73,9 @@ struct config {
     int table_bits = 0;     // context tables of 2^table_bits slots
     bool binary = false;    // sparse contexts, for data with control bytes
     int x86 = 0;            // x86 code, branch transform and instruction contexts: 0 none, 1 32-bit, 2 64-bit
+    bool numeric = false;   // numbers of a text as tokens (numeric_text_encode), with numeric contexts
+    uint8_t marker = 0;     // their marker byte
+    byte_set text_bytes, layout_bytes;   // the bytes of the text and of the first layout byte in the stream
 };
 
 // Context tables for the data and the level: one bit smaller for the faster levels
@@ -145,7 +159,18 @@ public:
                 }
             }
         }
-        _contexts = _byte_contexts + _bit_templates.size() + (cfg.fold ? 1 : 0) + _byte_templates + _image_bit_contexts;
+        if (cfg.numeric) {
+            _numeric = numeric_count;
+            _reader.emplace(cfg.marker);
+            _th = &_text_history;
+            _slot_table.resize(size_t{1} << 17);
+            for (size_t i = 0; i < 256; ++i) {
+                _num_lms.emplace_back(lms_features, 2);
+                _num_lms.emplace_back(lms_features, 5);
+            }
+        }
+        _contexts = _byte_contexts + _bit_templates.size() + (cfg.fold ? 1 : 0) + _byte_templates + _image_bit_contexts + _numeric;
+        _num_first = _contexts - _numeric;
 
         for (size_t t = 0; t < _contexts; ++t) {
             _tables.emplace_back(cfg.table_bits);
@@ -188,6 +213,16 @@ public:
             _mixers.emplace_back(inputs, 33 * 32, 197);
             _set_kinds.push_back(9);
         }
+        if (_numeric > 0) {
+            _mixers.emplace_back(inputs, 22 * 96, 197);
+            _set_kinds.push_back(10);
+            _mixers.emplace_back(inputs, 1280, 197);
+            _set_kinds.push_back(11);
+            _mixers.emplace_back(inputs, 800, 197);
+            _set_kinds.push_back(12);
+            _mixers.emplace_back(inputs, 16 * 33 + 2, 197);
+            _set_kinds.push_back(13);
+        }
         // Code: weights selected by the instruction field with the partial byte, and by the opcode with the bit
         // position
         if (_code > 0) {
@@ -204,6 +239,14 @@ public:
 
     // Probability that the next bit is 1
     int p() {
+        // Bits that the bytes possible at this place decide (the high half of a digit, 0011)
+        if (_numeric > 0) {
+            const int bit = decided_bit();
+            _forced = bit >= 0;
+            if (_forced) {
+                return bit ? 65520 : 16;
+            }
+        }
         // Mixers learn faster at the start
         const auto rate = 197 + static_cast<int>(uint64_t{197} * 6 * 65536 / (65536 + _bits));
         for (auto& mixer : _mixers) {
@@ -217,6 +260,9 @@ public:
         if (_image_bit_contexts > 0) {
             sample_contexts();
         }
+        if (_numeric > 0) {
+            numeric_contexts();
+        }
 
         // Each context: its probability, its history's probability across contexts, and a deterministic input
         // when only one bit value was ever seen
@@ -226,15 +272,19 @@ public:
         size_t highest_seen = 0;
         // Nibble buckets: a byte context's slot in a bucket of 16 for each half byte, at the node of the bits
         // coded in that half, instead of a slot anywhere for each bit
-        if (_buckets && (_bit_count == 0 || _bit_count == 4)) {
-            const uint64_t first = _bit_count == 4 ? _c0 : 0;
-            for (size_t t = 0; t < _byte_contexts; ++t) {
-                _nibble_hashes[t] = _hashes[t] + first * 0x9E3779B97F4A7C15ull;
-            }
+        if (_buckets && (_bit_count == 0 || _bit_count == 4) && _numeric == 0) {
+            refresh_buckets();
         }
         const int half = _bit_count & 3;
         const size_t node = (static_cast<size_t>(_c0) & ((size_t{1} << half) - 1)) | (size_t{1} << half);
         for (size_t t = 0; t < _contexts; ++t) {
+            if (t >= _num_first + _num_active) {
+                // Numeric contexts left out in text
+                input(0);
+                input(0);
+                input(0);
+                continue;
+            }
             const uint64_t key = t < _byte_contexts ? _hashes[t] ^ (static_cast<uint64_t>(_c0) * 0x9E3779B97F4A7C15ull) : _hashes[t];
             auto& slot = _buckets && t < _byte_contexts ? _tables[t].at(_nibble_hashes[t], node) : _tables[t].at(key);
             _slots[t] = &slot;
@@ -273,6 +323,10 @@ public:
             _column_set * 8 + static_cast<size_t>(_bit_count),
             _image_j * 16 + _activity,
             _image_j * 32 + _image_error,
+            _num_set1,
+            _num_set2,
+            _num_set3,
+            _num_set4,
         };
         // Every mixer reads the same inputs, without copying them
         for (size_t i = 0; i < _mixers.size(); ++i) {
@@ -292,6 +346,12 @@ public:
             const int p3 = _image_apm.refine(_mixed, _apm_context);
             return clamp_probability((_mixed + p1 + p2 + p3) / 4);
         }
+        if (_numeric > 0 && _in_value) {
+            // A number's value: a third map, on the bits left and where the adaptive prediction stands
+            const int p3 = _num_apm.refine(_mixed, _num_apm_context);
+            const int p4 = _num_bit_apm_map.refine(_mixed, _num_bit_apm);
+            return clamp_probability((_mixed + p1 + p2 + p3 + 2 * p4) / 6);
+        }
         if (_code == 0) {
             return clamp_probability((_mixed + p1 + 2 * p2) / 4);
         }
@@ -302,11 +362,22 @@ public:
 
     // Learns the bit, after it was coded or decoded
     void update(const int bit) {
+        if (_forced) {
+            ++_bits;
+            _c0 = (_c0 << 1) | static_cast<uint32_t>(bit);
+            if (++_bit_count == 8) {
+                byte_done(static_cast<uint8_t>(_c0 & 0xFF));
+            } else if (_bit_count == 4 && _buckets) {
+                refresh_buckets();
+            }
+            return;
+        }
         for (auto& mixer : _mixers) {
             mixer.update(bit);
         }
         _final.update(bit);
-        for (size_t t = 0; t < _contexts; ++t) {
+        const size_t active = _num_first + _num_active;
+        for (size_t t = 0; t < active; ++t) {
             _maps[t].update(_slots[t]->history, bit);
             _slots[t]->update(bit, _limits[t]);
         }
@@ -322,6 +393,10 @@ public:
             if (_image_bit_contexts > 0) {
                 _image_apm.update(bit);
             }
+            if (_numeric > 0 && _in_value) {
+                _num_apm.update(bit);
+                _num_bit_apm_map.update(bit);
+            }
             if (_code > 0) {
                 _map3.update(bit);
             }
@@ -332,6 +407,8 @@ public:
         _c0 = (_c0 << 1) | static_cast<uint32_t>(bit);
         if (++_bit_count == 8) {
             byte_done(static_cast<uint8_t>(_c0 & 0xFF));
+        } else if (_bit_count == 4 && _buckets && _numeric > 0) {
+            refresh_buckets();
         }
     }
 
@@ -510,9 +587,15 @@ private:
         _stream.push_back(0);
         _history.push_back(byte);
         _last = byte;
-        _lines.byte_added(_history);
+        // Numbers: the history of the text contexts holds their tokens without the sign and point (a measured
+        // choice: without the digits, it lost 0.1% to 0.9%); their tokens stay out of the words
+        const int kind = _numeric > 0 ? numeric_byte_done(byte) : 0;
+        if (_numeric > 0) {
+            _text_history.push_back(byte);
+        }
+        _lines.byte_added(*_th);
         // Capitals escapes neither extend nor end a word
-        if (byte != 0x01 && byte != 0x02) {
+        if (kind == 0 && byte != 0x01 && byte != 0x02) {
             if (std::isalpha(byte)) {
                 _word = hash_mix(_word ^ static_cast<uint64_t>(std::tolower(byte)) * 0x2545F4914F6CDD1Dull);
             } else if (_word != 0) {
@@ -533,6 +616,541 @@ private:
             _three_slot->update(byte);
         }
         new_byte();
+    }
+
+    // NUMBERS IN TEXT. Each number fills slots: the k-th number of its line after the same text (S1), any number
+    // after the same text (S2), the number after the same count of field separators and byte (S3). Its layout
+    // is predicted from the layouts of its slots, its value from their last values (trend, step, the same
+    // number a line above, the number before it in the line, adaptive linear predictors), all brought to its
+    // count of fraction digits
+    static constexpr size_t numeric_count = 29, byte_numeric = 22, lms_features = 8, line_max = 64, predictions = 16, ring = 1024;
+
+    struct slot_record {
+        uint32_t check = 0, count = 0;
+        int64_t v[4] = {};
+        int64_t step = 0;
+        int64_t pil = 0;      // the number before in the line, when the slot was last filled
+        int8_t f[4] = {};
+        int8_t step_f = 0, pil_f = 0;
+        uint8_t has_pil = 0;
+        uint8_t src = 0;      // the number of the line it last copied, counted back from it (0: none)
+        uint8_t src_hits = 0; // how many times in a row it copied it
+        uint8_t lag_k = 0, lag_hits = 0;
+        uint32_t lag = 0;     // a number of an earlier line that it copied: lines back, and its place in its line
+        uint8_t layout = 0, layout2 = 0;
+    };
+
+    slot_record& slot(const uint64_t key) {
+        const uint64_t h = hash_mix(key);
+        auto& r = _slot_table[h & (_slot_table.size() - 1)];
+        const auto check = static_cast<uint32_t>(h >> 40) | 1;
+        if (r.check != check) {
+            r = slot_record{};
+            r.check = check;
+        }
+        return r;
+    }
+
+    void push_value(slot_record& r, const int64_t a, const int f) {
+        if (r.count > 0) {
+            const int64_t d = a - rescale_decimal(r.v[0], r.f[0], f);
+            if (d != 0) {
+                r.step = d;
+                r.step_f = static_cast<int8_t>(f);
+            }
+        }
+        for (size_t i = 3; i > 0; --i) {
+            r.v[i] = r.v[i - 1];
+            r.f[i] = r.f[i - 1];
+        }
+        r.v[0] = a;
+        r.f[0] = static_cast<int8_t>(f);
+        r.layout2 = r.layout;
+        r.layout = _cur_layout;
+        r.has_pil = _k > 0;
+        if (_lag > 0 && _lag == r.lag && _lag_k == r.lag_k) {
+            r.lag_hits = static_cast<uint8_t>(std::min(255, r.lag_hits + 1));
+        } else {
+            r.lag_hits = 0;
+            if (_lag > 0) {
+                r.lag = _lag;
+                r.lag_k = _lag_k;
+            }
+        }
+        if (_src > 0 && _src == r.src) {
+            r.src_hits = static_cast<uint8_t>(std::min(255, r.src_hits + 1));
+        } else {
+            r.src_hits = 0;
+            if (_src > 0) {
+                r.src = _src;
+            }
+        }
+        r.pil = _k > 0 ? _line_v[_k - 1] : 0;
+        r.pil_f = _k > 0 ? _line_f[_k - 1] : 0;
+        r.count = std::min<uint32_t>(r.count + 1, 1u << 30);
+    }
+
+    // 0 for a byte of text, 1 for a number's marker or layout, 2 for a byte of its value
+    int numeric_byte_done(const uint8_t byte) {
+        using R = numeric_text_reader;
+        const auto before = _reader->state();
+        const bool done = _reader->byte_added(byte);
+        if (before == R::text) {
+            if (byte != _cfg.marker) {
+                text_byte(byte);
+                return 0;
+            }
+            number_start();
+            return 1;
+        }
+        if (before == R::value) {
+            if (done) {
+                number_done();
+            }
+            return 2;
+        }
+        if (before == R::layout) {
+            _cur_layout = byte;
+        }
+        if (_reader->state() == R::value) {
+            number_layout_known();
+        }
+        return 1;
+    }
+
+    void text_byte(const uint8_t byte) {
+        const size_t pos = _text_history.size();   // where the byte goes
+        if (_sep_len == 0) {
+            _sep_start[std::min(_line_k, line_max - 1)] = pos;
+        }
+        if (byte == '\n') {
+            _sep_length[std::min(_line_k, line_max - 1)] = pos - _sep_start[std::min(_line_k, line_max - 1)];
+            for (size_t i = 0; i < line_max; ++i) {
+                _prev_sep_start[i] = _sep_start[i];
+                _prev_sep_length[i] = _sep_length[i];
+            }
+            _prev_seps = std::min(_line_k + 1, line_max);
+            for (size_t i = 0; i < line_max; ++i) {
+                _prev_v[i] = _line_v[i];
+                _prev_f[i] = _line_f[i];
+                _prev_layout[i] = _line_layout[i];
+            }
+            _prev_n = _line_k;
+            _hist_n[_line_no & (ring - 1)] = std::min(_line_k, line_max);
+            ++_line_no;
+            _line_k = 0;
+            _derived_valid = false;
+            _seps[0] = _seps[1] = _seps[2] = 0;
+            _commas = 0;
+            _sep_len = 0;
+            return;
+        }
+        ++_sep_len;
+        _sep_text = (_sep_text + byte + 1) * 0x9E3779B97F4A7C15ull;
+        if (byte == ',' || byte == ';' || byte == '\t' || byte == '|') {
+            ++_commas;
+        }
+    }
+
+    void number_start() {
+        const auto& th = _text_history;
+        const size_t n = th.size();
+        if (_sep_len == 0) {
+            _sep_start[std::min(_line_k, line_max - 1)] = n;
+        }
+        _sep_length[std::min(_line_k, line_max - 1)] = n - _sep_start[std::min(_line_k, line_max - 1)];
+        const size_t len = std::min<size_t>(_sep_len, 12);
+        uint64_t sep = 0x51 + len;
+        for (size_t i = n - len; i < n; ++i) {
+            sep = (sep + th[i] + 1) * 0x9E3779B97F4A7C15ull;
+        }
+        _k = std::min(_line_k, line_max - 1);
+        _s1 = hash_mix(sep * 31 + _k * 0x2545F4914F6CDD1Dull + 1);
+        _s2 = hash_mix(sep + 2);
+        _s3 = hash_mix((_commas * 257 + (n > 0 ? th[n - 1] : 0u)) * 0x9E3779B97F4A7C15ull + 3);
+        // The local template: the texts before this number and the two before it in the line
+        _seps[2] = _seps[1];
+        _seps[1] = _seps[0];
+        _seps[0] = sep;
+        _s4 = hash_mix((_seps[0] * 31 + _seps[1]) * 31 + _seps[2] + 4);
+        _r1 = slot(_s1);
+        _r2 = slot(_s2);
+        _r3 = slot(_s3);
+        _r4 = slot(_s4);
+        // Layout contexts
+        const bool above = _k < _prev_n;
+        uint64_t trend_digits = 0;
+        if (_r1.count >= 2) {
+            const int64_t trend = 2 * _r1.v[0] - rescale_decimal(_r1.v[1], _r1.f[1], _r1.f[0]);
+            uint64_t ip = static_cast<uint64_t>(std::abs(trend)) / power10(_r1.f[0]);
+            for (; ip > 0; ip /= 10) {
+                ++trend_digits;
+            }
+            trend_digits = trend_digits << 1 | (trend < 0);
+        }
+        const uint64_t prev_layout = _k > 0 ? _line_layout[_k - 1] : 256;
+        // How the last value stands against powers of 10: its digit count, leading digit and sign
+        uint64_t shape = 0;
+        if (_r1.count > 0) {
+            uint64_t v = static_cast<uint64_t>(std::abs(_r1.v[0])), n = 0;
+            for (; v >= 10; v /= 10) {
+                ++n;
+            }
+            shape = (n << 4 | v) << 1 | (_r1.v[0] < 0);
+        }
+        _num_base[0] = _s1 + 11;
+        _num_base[1] = hash_mix(uint64_t{2} << 40 | uint64_t{_r1.layout} << 16 | uint64_t{_r1.layout2} << 8 | (_r1.count > 0));
+        _num_base[2] = _s2 + 13;
+        _num_base[3] = hash_mix(_s3 + _r3.layout * 0x2545F4914F6CDD1Dull + 4);
+        _num_base[4] = hash_mix(uint64_t{5} << 40 | (above ? _prev_layout[_k] : 256u) << 8 | _k);
+        _num_base[5] = hash_mix(uint64_t{6} << 40 | uint64_t{_r1.layout} << 16 | trend_digits);
+        _num_base[6] = hash_mix(uint64_t{7} << 40 | uint64_t{_r2.layout} << 16 | _r1.layout);
+        _num_base[7] = hash_mix(uint64_t{8} << 40 | prev_layout << 16 | _k);
+        _num_base[8] = hash_mix(uint64_t{9} << 40 | uint64_t{_r1.layout} << 16 | shape);
+    }
+
+    void number_layout_known() {
+        const auto& num = _reader->number();
+        const int f = num.frac_digits;
+        const int digits = num.int_digits + f;
+        const auto top = static_cast<int64_t>(power10(digits) - 1);
+        const auto sc = [&](const int64_t v, const int from) { return rescale_decimal(v, from, f); };
+        const auto& r1 = _r1;
+        const int64_t prev_in_line = _k > 0 ? sc(_line_v[_k - 1], _line_f[_k - 1]) : 0;
+        int64_t* P = _pv;
+        P[0] = r1.count > 0 ? sc(r1.v[0], r1.f[0]) : prev_in_line;
+        P[1] = r1.count > 1 ? 2 * P[0] - sc(r1.v[1], r1.f[1]) : P[0];
+        P[2] = r1.count > 1 ? sc(r1.v[1], r1.f[1]) : P[0];
+        P[3] = r1.count > 0 ? P[0] + sc(r1.step, r1.step_f) : P[0];
+        P[4] = _k < _prev_n ? sc(_prev_v[_k], _prev_f[_k]) : P[0];
+        P[5] = _r2.count > 0 ? sc(_r2.v[0], _r2.f[0]) : P[0];
+        P[6] = _r3.count > 0 ? sc(_r3.v[0], _r3.f[0]) : P[0];
+        P[7] = _k > 0 ? prev_in_line : P[0];
+        // The same offset from the number before in the line as last time
+        P[12] = _k > 0 && r1.count > 0 && r1.has_pil ? prev_in_line + P[0] - sc(r1.pil, r1.pil_f) : P[7];
+        // The number of the line that this slot copied last time
+        P[13] = P[7];
+        const uint8_t src = r1.src > 0 && r1.src_hits >= _r4.src_hits ? r1.src : _r4.src;
+        if (src > 0 && src <= _k) {
+            P[13] = sc(_line_v[_k - src], _line_f[_k - src]);
+        } else if (src >= derived_base && _derived_valid) {
+            P[13] = sc(_derived_v[src - derived_base], _derived_f[src - derived_base]);
+        }
+        P[14] = _r4.count > 0 ? sc(_r4.v[0], _r4.f[0]) : P[0];
+        // A number of an earlier line, that this slot copied last time
+        P[15] = P[0];
+        if (const auto v = lagged(r1.lag, r1.lag_k)) {
+            P[15] = sc(v->first, v->second);
+        }
+        // The value that followed the same previous number in this slot
+        _cond_key = _s1 * 7 + (_k > 0 ? static_cast<uint64_t>(_line_v[_k - 1]) * 977 + static_cast<uint64_t>(_line_f[_k - 1]) : ~uint64_t{0}) * 0x2545F4914F6CDD1Dull + 0x1234;
+        const slot_record cond = slot(_cond_key);
+        P[10] = cond.count > 0 ? sc(cond.v[0], cond.f[0]) : P[0];
+        if (r1.count > 2) {
+            const int64_t a = P[0], b = P[2], c = sc(r1.v[2], r1.f[2]);
+            P[11] = std::max(std::min(a, b), std::min(std::max(a, b), c));
+        } else {
+            P[11] = P[0];
+        }
+        // Adaptive linear predictors of the difference from P0, one pair per bank of slots
+        const auto limit = [](const int64_t v) { return std::max<int64_t>(-(int64_t{1} << 24), std::min<int64_t>(int64_t{1} << 24, v)); };
+        const int64_t comove = _k > 0 ? sc(_line_delta[_k - 1], _line_f[_k - 1]) : 0;
+        int64_t features[lms_features] = {limit(P[1] - P[0]), limit(P[2] - P[0]), limit(P[3] - P[0]), limit(P[4] - P[0]),
+                                          limit(P[5] - P[0]), limit(P[6] - P[0]), limit(P[7] - P[0]), limit(comove)};
+        _bank = static_cast<size_t>((_s1 >> 20) & 255);
+        _lms_base_value = P[0];
+        P[8] = P[0] + _num_lms[2 * _bank].predict(features);
+        P[9] = P[0] + _num_lms[2 * _bank + 1].predict(features);
+        for (size_t i = 0; i < predictions; ++i) {
+            _pm[i] = std::max<int64_t>(0, std::min<int64_t>(top, num.negative ? -P[i] : P[i]));
+        }
+        // A carry: how the number before in the line moved from the line above (a minute that went up restarts
+        // the seconds)
+        _carry = 3;
+        if (_k > 0 && _k - 1 < _prev_n) {
+            const int64_t before = _line_v[_k - 1], above = rescale_decimal(_prev_v[_k - 1], _prev_f[_k - 1], _line_f[_k - 1]);
+            _carry = before > above ? 2 : before < above ? 0 : 1;
+        }
+        const int64_t move = r1.count > 1 ? std::abs(P[0] - P[2]) : 0;
+        _num_act = static_cast<size_t>(std::min(15, 64 - (move == 0 ? 64 : leading_zeros(static_cast<uint64_t>(move)))));
+    }
+
+    void number_done() {
+        const auto& num = _reader->number();
+        const int f = num.frac_digits;
+        const int64_t a = num.negative ? -static_cast<int64_t>(num.mantissa) : static_cast<int64_t>(num.mantissa);
+        // What it copies: a value derived from a time earlier in the line, or the nearest number before it in the
+        // line with the same value at its precision; the source of last time first
+        _src = 0;
+        const auto source = [&](const uint8_t src) -> std::optional<int64_t> {
+            if (src > 0 && src <= _k) {
+                return rescale_decimal(_line_v[_k - src], _line_f[_k - src], f);
+            }
+            if (src >= derived_base && src < derived_base + derived_count && _derived_valid) {
+                return rescale_decimal(_derived_v[src - derived_base], _derived_f[src - derived_base], f);
+            }
+            return std::nullopt;
+        };
+        if (_r1.src > 0 && source(_r1.src) == a) {
+            _src = _r1.src;
+        }
+        if (_r4.src > 0 && source(_r4.src) == a && (_src == 0 || _r4.src_hits > _r1.src_hits)) {
+            _src = _r4.src;
+        }
+        for (size_t i = 0; _src == 0 && _derived_valid && i < derived_count; ++i) {
+            if (source(static_cast<uint8_t>(derived_base + i)) == a) {
+                _src = static_cast<uint8_t>(derived_base + i);
+            }
+        }
+        for (size_t j = _k; _src == 0 && j-- > 0;) {
+            if (rescale_decimal(_line_v[j], _line_f[j], f) == a) {
+                _src = static_cast<uint8_t>(_k - j);
+            }
+        }
+        time_done(a, num);
+        // Earlier lines: the last line and place where this value appeared
+        _lag = 0;
+        _lag_k = 0;
+        if (const auto v = lagged(_r1.lag, _r1.lag_k); v && rescale_decimal(v->first, v->second, f) == a) {
+            _lag = _r1.lag;
+            _lag_k = _r1.lag_k;
+        } else if (std::abs(a) >= 100) {
+            auto& e = _values[hash_mix(static_cast<uint64_t>(a) * 31 + static_cast<uint64_t>(f)) & (_values.size() - 1)];
+            const auto check = static_cast<uint32_t>(hash_mix(static_cast<uint64_t>(a) * 37 + static_cast<uint64_t>(f) + 5) >> 32) | 1;
+            if (e.check == check && e.line < _line_no && _line_no - e.line < ring) {
+                _lag = _line_no - e.line;
+                _lag_k = e.k;
+            }
+            e.check = check;
+            e.line = _line_no;
+            e.k = static_cast<uint8_t>(_k);
+        }
+        auto& h = _hist[(_line_no & (ring - 1)) * line_max + _k];
+        h.first = a;
+        h.second = f;
+        _num_lms[2 * _bank].update(a - _lms_base_value);
+        _num_lms[2 * _bank + 1].update(a - _lms_base_value);
+        push_value(slot(_s1), a, f);
+        push_value(slot(_s2), a, f);
+        push_value(slot(_s3), a, f);
+        push_value(slot(_s4), a, f);
+        push_value(slot(_cond_key), a, f);
+        _line_v[_k] = a;
+        _line_f[_k] = static_cast<int8_t>(f);
+        _line_layout[_k] = _cur_layout;
+        _line_delta[_k] = _r1.count > 0 ? a - _pv[0] : 0;
+        ++_line_k;
+        _last_s1 = _s1;
+        _last_move = a > _pv[0] ? 2 : a < _pv[0] ? 0 : 1;
+        _sep_len = 0;
+    }
+
+    // A count of seconds (10 digits) or milliseconds (13 digits) since 1970: its date and time, in the time zone
+    // that the hours and minutes after such counts vote for, become sources for the numbers after it in the line
+    static constexpr size_t derived_base = 128, derived_count = 8;
+
+    void time_done(const int64_t a, const text_number& num) {
+        const int digits = num.int_digits + num.frac_digits;
+        if (_derived_valid && _k > 1 && a == _derived_utc_second && _line_f[_k - 1] == 0 && _line_f[_k - 2] == 0 && _line_v[_k - 1] >= 0
+            && _line_v[_k - 1] < 60 && _line_v[_k - 2] >= 0 && _line_v[_k - 2] < 24) {
+            // An hour, a minute and the second of the count: the time zone they suggest, in quarters of an hour
+            const int64_t local = _line_v[_k - 2] * 60 + _line_v[_k - 1];
+            const int64_t utc = _derived_utc_minutes;
+            const int64_t delta = ((local - utc) % 1440 + 1440) % 1440;
+            if (delta % 15 == 0) {
+                const auto q = static_cast<size_t>(delta / 15);
+                _tz_votes[q] += 64;
+                if (_tz_votes[q] > _tz_votes[_tz]) {
+                    _tz = q;
+                }
+            }
+        }
+        if (num.frac_digits != 0 || num.negative) {
+            return;
+        }
+        int64_t seconds = -1, millis = 0;
+        if (digits == 10 && a >= 900000000 && a < 2200000000) {
+            seconds = a;
+        } else if (digits == 13 && a >= 900000000000 && a < 2200000000000) {
+            seconds = a / 1000;
+            millis = a % 1000;
+        }
+        if (seconds < 0) {
+            return;
+        }
+        // Votes fade, so that a change of time zone (daylight saving) is followed
+        for (auto& v : _tz_votes) {
+            v -= v >> 4;
+        }
+        const int64_t zone = static_cast<int64_t>(_tz) * 900;
+        const auto t = civil_from_seconds(seconds + (zone >= 43200 ? zone - 86400 : zone));
+        const auto u = civil_from_seconds(seconds);
+        _derived_utc_minutes = u.hour * 60 + u.minute;
+        _derived_utc_second = u.second;
+        const int64_t values[derived_count] = {t.year, t.month, t.day, t.hour, t.minute, t.second, t.second * 1000 + millis, t.year % 100};
+        const int8_t fractions[derived_count] = {0, 0, 0, 0, 0, 0, 3, 0};
+        for (size_t i = 0; i < derived_count; ++i) {
+            _derived_v[i] = values[i];
+            _derived_f[i] = fractions[i];
+        }
+        _derived_valid = true;
+    }
+
+    // Number k of the line lag lines back, if still kept
+    std::optional<std::pair<int64_t, int>> lagged(const uint32_t lag, const uint8_t k) const {
+        if (lag == 0 || lag >= ring || lag > _line_no || k >= _hist_n[(_line_no - lag) & (ring - 1)]) {
+            return std::nullopt;
+        }
+        const auto& h = _hist[((_line_no - lag) & (ring - 1)) * line_max + k];
+        return std::make_pair(h.first, h.second);
+    }
+
+    int decided_bit() const {
+        switch (_reader->state()) {
+        case numeric_text_reader::text:
+            return _cfg.text_bytes.decided(_c0);
+        case numeric_text_reader::layout:
+            return _cfg.layout_bytes.decided(_c0);
+        case numeric_text_reader::value:
+            return _digit_bytes.decided(_c0);
+        default:
+            return -1;
+        }
+    }
+
+    // At each byte: the byte contexts of a value see its bytes so far; text and layouts set their numeric contexts
+    void numeric_byte() {
+        const auto state = _reader->state();
+        _in_value = state == numeric_text_reader::value;
+        if (_in_value) {
+            const uint64_t salt = hash_mix(static_cast<uint64_t>(_reader->value_index() + 1) * 0x2545F4914F6CDD1Dull);
+            for (size_t t = 0; t < _byte_contexts; ++t) {
+                _hashes[t] += salt;
+            }
+            _num_active = numeric_count;
+            digit_contexts();
+        } else if (state == numeric_text_reader::text) {
+            // Text between numbers: what followed the last number given how it moved; the text since the last
+            // number, at its place in the line; and the line above aligned on its numbers: the byte at the same
+            // offset in the same stretch of text between numbers
+            const auto& th = _text_history;
+            const size_t k = std::min(_line_k, line_max - 1);
+            uint64_t above = 258, above2 = 258;
+            if (k < _prev_seps) {
+                const size_t start = _prev_sep_start[k], length = _prev_sep_length[k];
+                above = _sep_len < length ? th[start + _sep_len] : _sep_len == length ? 256 : 257;
+                above2 = _sep_len + 1 < length ? th[start + _sep_len + 1] : 256;
+            }
+            if (_sep_len == 0) {
+                _sep_text = 0x77;
+            }
+            const uint64_t last = th.empty() ? 0 : th.back();
+            _num_active = 5;
+            _num_base[4] = hash_mix(uint64_t{22} << 40 | std::min<uint64_t>(_line_k, 63) << 24 | std::min<uint64_t>(_commas, 255) << 8 | std::min<uint64_t>(_sep_len, 255));
+            _num_base[0] = hash_mix(_last_s1 + _last_move * 0x2545F4914F6CDD1Dull + std::min<size_t>(_sep_len, 8) * 0x9E3779B97F4A7C15ull + 21);
+            _num_base[1] = hash_mix(_sep_text * 0x2545F4914F6CDD1Dull + k * 0x9E3779B97F4A7C15ull + 22);
+            _num_base[2] = hash_mix(uint64_t{23} << 40 | above << 20 | k << 12 | std::min<uint64_t>(_sep_len, 4095));
+            _num_base[3] = hash_mix(uint64_t{24} << 40 | above << 24 | above2 << 12 | last);
+        } else {
+            _num_active = 9;
+        }
+    }
+
+    // At each digit of a value: where each prediction stands against the digits left possible
+    void digit_contexts() {
+        const int digits = _reader->value_digits();
+        const int i = _reader->value_index();
+        const auto r = static_cast<uint64_t>(digits - i);
+        const auto unit = static_cast<int64_t>(power10(static_cast<int>(r) - 1));
+        const auto prefix = static_cast<int64_t>(_reader->value_prefix());
+        const int64_t low = prefix * unit * 10;
+        uint64_t e[predictions];
+        for (size_t j = 0; j < predictions; ++j) {
+            e[j] = decimal_position(_pm[j], low, unit);
+        }
+        static const size_t ids[10] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 10};
+        size_t t = 0;
+        const int digits_ = digits;
+        static_cast<void>(digits_);
+        for (size_t j = 0; j < 10; ++j) {
+            _num_base[t++] = hash_mix((j + 1) << 24 | r << 16 | e[ids[j]] << 5 | _num_act) + 5555;
+        }
+        _num_base[t++] = hash_mix(uint64_t{11} << 40 | r << 24 | e[0] << 16 | e[1] << 8 | e[8]) + 6666;
+        const uint64_t at = static_cast<uint64_t>(i + 1) << 58 ^ static_cast<uint64_t>(prefix) * 0x9E3779B97F4A7C15ull;
+        _num_base[t++] = hash_mix(_s1 + at) + 7777;
+        _num_base[t++] = hash_mix(_s2 + at) + 8888;
+        _num_base[t++] = hash_mix(uint64_t{14} << 40 | r << 24 | e[9] << 16 | e[4] << 8 | e[11]) + 9999;
+        _num_base[t++] = hash_mix(uint64_t{15} << 40 | r << 16 | e[12] << 5 | _num_act) + 5555;
+        _num_base[t++] = hash_mix(uint64_t{19} << 40 | r << 16 | e[13] << 5 | (_r1.src > 0)) + 5555;
+        _num_base[t++] = hash_mix(uint64_t{20} << 40 | r << 16 | e[14] << 5 | _num_act) + 5555;
+        _num_base[t++] = hash_mix(uint64_t{22} << 40 | r << 24 | e[0] << 16 | e[4] << 8 | _carry << 2 | (i == 0)) + 2222;
+        _num_base[t++] = hash_mix(uint64_t{21} << 40 | r << 16 | e[15] << 5 | std::min<uint64_t>(_r1.lag_hits, 3) << 3 | (_r1.lag > 0)) + 5555;
+        // A float32 printed with more digits than it holds: the prints of the float32 nearest the middle of the
+        // values left, and of the short decimals at either end of them (127.49 prints as 127.489998)
+        const int f = _reader->number().frac_digits;
+        if (digits >= 6 && f >= 3) {
+            const auto print = [&](const int64_t v) -> int64_t {
+                const auto x = float32_print(static_cast<uint64_t>(v), f);
+                return x ? static_cast<int64_t>(*x) : -1;
+            };
+            const int64_t pc = print(low + 5 * unit), plo = print(low), phi = print(low + 10 * unit);
+            const uint64_t ec = decimal_position(pc, low, unit), elo = decimal_position(plo, low, unit), ehi = decimal_position(phi, low, unit);
+            const uint64_t same = static_cast<uint64_t>(pc == plo) << 1 | static_cast<uint64_t>(pc == phi);
+            _num_base[t++] = hash_mix(uint64_t{16} << 40 | r << 24 | ec << 8 | same) + 1717;
+            _num_base[t++] = hash_mix(uint64_t{17} << 40 | r << 24 | elo << 8 | ehi) + 1818;
+            _num_base[t++] = hash_mix(uint64_t{18} << 40 | r << 24 | ec << 8 | e[0]) + 1919;
+            const uint64_t c12 = ec < 40 ? ec / 4 : ec < 80 ? 10 : 11;
+            _num_set3 = static_cast<size_t>(((std::min<uint64_t>(r, 15) * 12 + c12) * 4) + same);
+        } else {
+            _num_base[t++] = hash_mix(uint64_t{16} << 40 | r << 24) + 1717;
+            _num_base[t++] = hash_mix(uint64_t{17} << 40 | r << 24 | e[3] << 8 | e[2]) + 1818;
+            _num_base[t++] = hash_mix(uint64_t{18} << 40 | r << 24 | e[12] << 8 | e[0]) + 1919;
+            _num_set3 = 770 + static_cast<size_t>(std::min<uint64_t>(r, 15));
+        }
+        _num_set1 = static_cast<size_t>(std::min<uint64_t>(r, 19)) * 96 + static_cast<size_t>(e[8]);
+        _num_set2 = static_cast<size_t>(_s1 & 1023);
+        _num_apm_context = static_cast<size_t>(std::min<uint64_t>(r, 19)) * 96 + static_cast<size_t>(e[0]);
+    }
+
+    // At each bit: the numeric contexts with the bits of the byte known so far; in a digit, where predictions stand
+    // against the value that splits the digits left, in eighths of the digit's weight
+    void numeric_contexts() {
+        size_t t = _num_first;
+        const size_t byte_level = std::min(_num_active, byte_numeric);
+        for (size_t i = 0; i < byte_level; ++i) {
+            _hashes[t + i] = (_num_base[i] + _c0) * 0x9E3779B97F4A7C15ull;
+        }
+        // A digit's first 4 bits are 0011, coded as near certain: only a corrupted message decodes others
+        if (_in_value && _bit_count >= 4) {
+            // The node in the digit's code, after the 0011 of every digit (bits 4 to 7 of the byte)
+            const uint32_t level = (1u << (_bit_count - 4)) | (_c0 & ((1u << (_bit_count - 4)) - 1));
+            const auto split = split_at(level);
+            const int digits = _reader->value_digits();
+            const int r = digits - _reader->value_index();
+            const auto unit = static_cast<int64_t>(power10(r - 1));
+            const int64_t at = static_cast<int64_t>(_reader->value_prefix()) * unit * 10 + split.split * unit;
+            const auto rel = [&](const int64_t pm) {
+                const int64_t d = pm - at;
+                return quantize_difference(unit >= 8 ? d / (unit / 8) : d * 8 / unit);
+            };
+            const uint64_t rc = static_cast<uint64_t>(std::min(r, 15));
+            static const size_t ids[6] = {0, 1, 8, 13, 4, 12};
+            int q[6];
+            for (size_t j = 0; j < 6; ++j) {
+                q[j] = rel(_pm[ids[j]]);
+                _hashes[t + byte_numeric + j] = hash_mix((j + 41) << 32 | uint64_t{level} << 20 | rc << 16 | static_cast<uint64_t>(q[j] + 128) << 4 | _num_act);
+            }
+            _hashes[t + byte_numeric + 6] = hash_mix(uint64_t{47} << 40 | uint64_t{level} << 28 | rc << 24 | static_cast<uint64_t>(q[0] + 128) << 16 | static_cast<uint64_t>(q[2] + 128) << 8 | static_cast<uint64_t>(q[1] + 128));
+            _num_set4 = static_cast<size_t>(level) * 33 + static_cast<size_t>(std::max(-16, std::min(16, q[2] / 2)) + 16);
+            _num_bit_apm = static_cast<size_t>(level) * 64 + static_cast<size_t>(std::max(-31, std::min(32, q[0] / 2)) + 31);
+        } else {
+            _num_set4 = 16 * 33 + (_reader->state() == numeric_text_reader::text ? 0 : 1);
+        }
+        if (!_in_value) {
+            _num_set1 = (_reader->state() == numeric_text_reader::text ? 20 : 21) * 96;
+            _num_set2 = 1024 + (_c0 & 0xFF);
+            _num_set3 = _reader->state() == numeric_text_reader::text ? 768 : 769;
+        }
     }
 
     // Binary data: bytes 2 and 3 back alone, the high nibbles of the last 4, bytes 4 and 8 back, the 2 last bytes
@@ -596,10 +1214,30 @@ private:
     void new_byte() {
         _c0 = 1;
         _bit_count = 0;
+        byte_contexts();
+        if (_cfg.numeric) {
+            numeric_byte();
+            if (_buckets) {
+                refresh_buckets();
+            }
+        }
+    }
+
+    // Nibble buckets: the slots of each half byte. With numbers, set even when the half's first bit is decided
+    void refresh_buckets() {
+        const uint64_t first = _bit_count == 4 ? _c0 : 0;
+        for (size_t t = 0; t < _byte_contexts; ++t) {
+            _nibble_hashes[t] = _hashes[t] + first * 0x9E3779B97F4A7C15ull;
+        }
+    }
+
+    void byte_contexts() {
         const size_t pos = _history.size();
         size_t t = 0;
+        const auto& th = *_th;
+        const size_t tpos = th.size();
         for (const auto order : _orders) {
-            _hashes[t++] = context_hash(_history, pos, order);
+            _hashes[t++] = context_hash(th, tpos, order);
         }
         if (_image_byte_contexts > 0) {
             sample_new_byte(pos, t);
@@ -638,11 +1276,11 @@ private:
         _hashes[t++] = hash_mix(_previous_word * 17 + _word) + 202;
 
         // Line structure: the byte above, the column, the previous line's length
-        const uint64_t last = pos > 0 ? _history[pos - 1] : 256;
-        const size_t column = _lines.column(_history);
+        const uint64_t last = tpos > 0 ? th[tpos - 1] : 256;
+        const size_t column = _lines.column(th);
         const size_t previous = _lines.previous_length();
         if (_full_text) {
-            const uint64_t above = _lines.above(_history);
+            const uint64_t above = _lines.above(th);
             _hashes[t++] = hash_mix(above * 257 + last) + 707;
             _hashes[t++] = hash_mix(above * 64 + std::min<size_t>(column, 63)) + 808;
         }
@@ -657,7 +1295,7 @@ private:
         _word_slot = &_last_word->at(_word + 0x77);
         _hashes[t++] = hash_mix((_word_slot->count > 0 ? _word_slot->byte : 256u) * 257 + last) + 1212;
         if (_full_text) {
-            _three_slot = &_last_three->at(context_hash(_history, pos, 3) + 0x99);
+            _three_slot = &_last_three->at(context_hash(th, tpos, 3) + 0x99);
             _hashes[t++] = hash_mix((_three_slot->count > 0 ? _three_slot->byte : 256u) * 257 + last) + 1313;
         }
     }
@@ -696,7 +1334,8 @@ private:
     match_model _match;
     bit_counter _match_counters[33];
     line_tracker _lines;
-    std::vector<uint8_t> _history, _stream;
+    std::vector<uint8_t> _history, _stream, _text_history;
+    std::vector<uint8_t>* _th = &_history;   // the history of the text contexts: without the numbers' values
     size_t _bits = 0, _bucket = 0, _fold_set = 0;
     uint32_t _c0 = 1;
     int _bit_count = 0, _expected = -1;
@@ -708,7 +1347,76 @@ private:
     std::unique_ptr<checked_table<last_byte_slot>> _last_instruction;
     last_byte_slot *_instruction_slot = nullptr, *_instruction_slot2 = nullptr;
     int _mixed = 32768;
+
+    // Numbers in text
+    size_t _numeric = 0, _num_first = 0, _num_active = 0;
+    std::optional<numeric_text_reader> _reader;
+    std::vector<slot_record> _slot_table;
+    std::vector<lms_predictor> _num_lms;
+    bool _forced = false, _in_value = false;
+    byte_set _digit_bytes = [] {
+        byte_set s;
+        for (int d = 0; d <= 9; ++d) {
+            s.add(digit_code(d));
+        }
+        s.finish();
+        return s;
+    }();
+    uint8_t _cur_layout = 0, _src = 0, _lag_k = 0;
+    uint64_t _carry = 3;
+    uint32_t _lag = 0, _line_no = 0;
+    struct value_place {
+        uint32_t check = 0, line = 0;
+        uint8_t k = 0;
+    };
+    std::vector<value_place> _values = std::vector<value_place>(size_t{1} << 16);
+    std::vector<std::pair<int64_t, int>> _hist = std::vector<std::pair<int64_t, int>>(ring * line_max);
+    size_t _hist_n[ring] = {};
+    bool _derived_valid = false;
+    int64_t _derived_v[derived_count] = {}, _derived_utc_minutes = 0, _derived_utc_second = -1;
+    int8_t _derived_f[derived_count] = {};
+    uint32_t _tz_votes[96] = {};
+    size_t _tz = 0;
+    size_t _k = 0, _line_k = 0, _prev_n = 0, _commas = 0, _sep_len = 0, _bank = 0;
+    uint64_t _s1 = 0, _s2 = 0, _s3 = 0, _cond_key = 0, _last_s1 = 0, _last_move = 1;
+    slot_record _r1, _r2, _r3, _r4;
+    uint64_t _s4 = 0, _seps[3] = {}, _sep_text = 0x77;
+    size_t _sep_start[line_max] = {}, _sep_length[line_max] = {}, _prev_sep_start[line_max] = {}, _prev_sep_length[line_max] = {}, _prev_seps = 0;
+    int64_t _line_v[line_max] = {}, _prev_v[line_max] = {}, _line_delta[line_max] = {};
+    int8_t _line_f[line_max] = {}, _prev_f[line_max] = {};
+    uint8_t _line_layout[line_max] = {}, _prev_layout[line_max] = {};
+    int64_t _pv[predictions] = {}, _pm[predictions] = {}, _lms_base_value = 0;
+    uint64_t _num_base[numeric_count] = {};
+    size_t _num_act = 0, _num_set1 = 0, _num_set2 = 0, _num_set3 = 0, _num_set4 = 0, _num_apm_context = 0, _num_bit_apm = 0;
+    probability_map _num_bit_apm_map{16 * 64, 1311};
+    probability_map _num_apm{20 * 96, 1311};
 };
+
+// A set of bytes in a header, each bit predicted from the previous one
+void encode_set(arithmetic_encoder& encoder, const byte_set& set) {
+    int p[2] = {32768, 32768}, previous = 0;
+    for (int b = 0; b < 256; ++b) {
+        const int bit = set.has(static_cast<uint8_t>(b)) ? 1 : 0;
+        encoder.encode(bit, std::max(64, std::min(65472, p[previous])));
+        p[previous] += ((bit ? 65535 : 0) - p[previous]) >> 3;
+        previous = bit;
+    }
+}
+
+byte_set decode_set(arithmetic_decoder& decoder) {
+    byte_set set;
+    int p[2] = {32768, 32768}, previous = 0;
+    for (int b = 0; b < 256; ++b) {
+        const int bit = decoder.decode(std::max(64, std::min(65472, p[previous])));
+        if (bit) {
+            set.add(static_cast<uint8_t>(b));
+        }
+        p[previous] += ((bit ? 65535 : 0) - p[previous]) >> 3;
+        previous = bit;
+    }
+    set.finish();
+    return set;
+}
 
 void encode_number(arithmetic_encoder& encoder, const size_t value, const int bits) {
     for (int i = bits - 1; i >= 0; --i) {
@@ -740,7 +1448,8 @@ gmprime compress(const std::vector<uint8_t>& payload, config cfg, const bool cap
     encode_number(encoder, cfg.binary ? 1 : 0, 1);
     encode_number(encoder, static_cast<size_t>(cfg.x86), 2);
     // The structure found beyond the fold, only when there is one
-    const bool structured = cfg.width >= 65536 || cfg.record > 0 || cfg.lattice_width > 0 || cfg.sample_bytes > 0 || cfg.swap > 0 || cfg.no_text;
+    const bool structured = cfg.width >= 65536 || cfg.record > 0 || cfg.lattice_width > 0 || cfg.sample_bytes > 0 || cfg.swap > 0 || cfg.no_text
+                            || cfg.numeric;
     encode_number(encoder, structured ? 1 : 0, 1);
     if (structured) {
         encode_number(encoder, cfg.width >> 16, 8);
@@ -752,6 +1461,25 @@ gmprime compress(const std::vector<uint8_t>& payload, config cfg, const bool cap
         encode_number(encoder, cfg.image_phase, 16);
         encode_number(encoder, cfg.swap, 2);
         encode_number(encoder, cfg.no_text ? 1 : 0, 1);
+        encode_number(encoder, cfg.numeric ? 1 : 0, 1);
+        if (cfg.numeric) {
+            encode_number(encoder, cfg.marker, 8);
+            // The bytes of the text and the layouts in the stream
+            numeric_text_reader reader(cfg.marker);
+            for (const auto byte : payload) {
+                const auto state = reader.state();
+                if (state == numeric_text_reader::text) {
+                    cfg.text_bytes.add(byte);
+                } else if (state == numeric_text_reader::layout) {
+                    cfg.layout_bytes.add(byte);
+                }
+                reader.byte_added(byte);
+            }
+            cfg.text_bytes.finish();
+            cfg.layout_bytes.finish();
+            encode_set(encoder, cfg.text_bytes);
+            encode_set(encoder, cfg.layout_bytes);
+        }
         encode_number(encoder, cfg.lattice.size(), 4);
         for (const auto& f : cfg.lattice) {
             encode_number(encoder, f.offset, 16);
@@ -803,6 +1531,12 @@ std::optional<std::vector<uint8_t>> decompress(const gmprime& code, const int fo
         cfg.image_phase = decode_number(decoder, 16);
         cfg.swap = decode_number(decoder, 2);
         cfg.no_text = decode_number(decoder, 1) == 1;
+        cfg.numeric = decode_number(decoder, 1) == 1;
+        if (cfg.numeric) {
+            cfg.marker = static_cast<uint8_t>(decode_number(decoder, 8));
+            cfg.text_bytes = decode_set(decoder);
+            cfg.layout_bytes = decode_set(decoder);
+        }
         cfg.lattice.resize(decode_number(decoder, 4));
         for (auto& f : cfg.lattice) {
             f.offset = decode_number(decoder, 16);
@@ -831,6 +1565,13 @@ std::optional<std::vector<uint8_t>> decompress(const gmprime& code, const int fo
         payload.push_back(static_cast<uint8_t>(byte));
     }
     const auto check = static_cast<uint32_t>(decode_number(decoder, 32));
+    if (cfg.numeric) {
+        auto text = numeric_text_decode(payload, cfg.marker);
+        if (!text) {
+            return std::nullopt; // LCOV_EXCL_LINE: only a corrupted message, which fuzzing finds the checksum rejects
+        }
+        payload = std::move(*text);
+    }
     auto data = capitals ? capitals_decode(payload) : std::move(payload);
     if (cfg.x86 > 0) {
         x86_branches(data, false);
@@ -865,14 +1606,50 @@ struct plan {
 };
 
 std::vector<uint8_t> transformed(const std::vector<uint8_t>& data, const plan& p) {
-    if (p.capitals) {
-        return *capitals_encode(data);
+    if (p.capitals || p.cfg.numeric) {
+        auto text = p.capitals ? *capitals_encode(data) : data;
+        return p.cfg.numeric ? numeric_text_encode(text, p.cfg.marker) : text;
     }
     auto result = p.cfg.lattice_width > 0 ? lattice_encode(data, p.cfg.lattice_width, p.cfg.lattice) : data;
     if (p.cfg.swap > 0) {
         swap_pairs(result, p.cfg.swap - 1);
     }
     return result;
+}
+
+// Numbers written in text, when digits are 3% of the first bytes: the text plans again with the numbers as tokens
+void add_numeric_plans(std::vector<plan>& plans, const std::vector<uint8_t>& data, const std::string& numeric_mode) {
+    if (numeric_mode == "off" || (numeric_mode == "auto" && digit_density(data) < 300)) {
+        return;
+    }
+    const auto marker = numeric_text_marker(data);
+    if (!marker || *marker == 0x01 || *marker == 0x02) {
+        return;
+    }
+    if (std::none_of(plans.begin(), plans.end(), [](const plan& p) { return !p.cfg.fold; })) {
+        // A strong fold: the numbers are tried with the text model too
+        config c = plans.empty() ? config{} : plans[0].cfg;
+        c.fold = c.bitmap = false;
+        c.width = c.layer = c.record = c.lattice_width = c.sample_bytes = c.sample_stride = c.image_row = c.image_phase = c.swap = 0;
+        c.lattice.clear();
+        c.no_text = false;
+        c.numeric = true;
+        c.marker = *marker;
+        plans.push_back({"numeric", c});
+        return;
+    }
+    // Text plans only here: folded data that is not text goes the way above
+    const size_t n = plans.size();
+    for (size_t i = 0; i < n; ++i) {
+        plan p = plans[i];
+        p.name = p.capitals ? "num+caps" : "numeric";
+        p.cfg.numeric = true;
+        p.cfg.marker = *marker;
+        plans.push_back(p);
+    }
+    if (numeric_mode == "on") {
+        plans.erase(plans.begin(), plans.begin() + static_cast<std::ptrdiff_t>(n));
+    }
 }
 
 // The plans for data that is not x86 code: text (with the capitals transform) unless the fold is strong, the fold
@@ -963,9 +1740,13 @@ choice compress_plans(const std::vector<uint8_t>& data, const std::vector<plan>&
         if (verbose) {
             std::fprintf(stderr, "  %-8s %zu bytes\n", p.name, size);
         }
-        // Weighed: a folded plan against a text one counts 1% larger
+        // Weighed: a folded plan against a text one counts 1% larger; numbers as tokens 0.25% smaller against plain
+        // text, since their statistics need more data to learn
         const bool slower = p.cfg.fold && best_size > 0 && !best.cfg.fold;
-        if (best_size == 0 || (slower ? size + size / 100 < best_size : size < best_size)) {
+        const bool learner = p.cfg.numeric && best_size > 0 && !best.cfg.numeric && !best.cfg.fold;
+        const bool plain = !p.cfg.numeric && best_size > 0 && best.cfg.numeric;
+        if (best_size == 0 || (slower ? size + size / 100 < best_size : learner ? size < best_size + best_size / 400
+                                                                              : plain ? size + size / 400 < best_size : size < best_size)) {
             best_size = size;
             best.cfg = p.cfg;
             best.capitals = p.capitals;
@@ -987,7 +1768,7 @@ choice compress_plans(const std::vector<uint8_t>& data, const std::vector<plan>&
 // In auto mode, binary data that is not x86 code, and data that folds, is compressed the way of the best structure
 // plan instead.
 choice compress_best(const gmprime& file, const std::string& mode, const std::string& capitals_mode, const int forced_table_bits,
-                     const size_t sample, const int level, const std::string& code_mode, const bool verbose) {
+                     const size_t sample, const int level, const std::string& code_mode, const bool verbose, const std::string& numeric_mode) {
     auto data = file.bytes();
     const uint32_t check = crc32(data);
     choice best;
@@ -1001,7 +1782,25 @@ choice compress_best(const gmprime& file, const std::string& mode, const std::st
     // Binary data, or data that folds, may hide records or images: each way the analysis suggests is tried. Text
     // keeps the way below, which only compares the capitals transform
     if (mode == "auto" && best.cfg.x86 == 0 && capitals_mode != "on" && (best.cfg.binary || file.analyze_folds(64, 8192, 131072).strong())) {
-        return compress_plans(data, structure_plans(file, data, best.cfg, capitals_mode), forced_table_bits, sample, verbose);
+        auto plans = structure_plans(file, data, best.cfg, capitals_mode);
+        if (!best.cfg.binary) {
+            add_numeric_plans(plans, data, numeric_mode);
+        }
+        return compress_plans(data, plans, forced_table_bits, sample, verbose);
+    }
+    // Text with numbers: the text plans and their numeric versions compared
+    if (mode == "auto" && best.cfg.x86 == 0 && !best.cfg.binary && numeric_mode != "off" && (numeric_mode == "on" || digit_density(data) >= 300)) {
+        std::vector<plan> plans;
+        if (capitals_mode != "on") {
+            plans.push_back({"text", best.cfg});
+        }
+        if (capitals_mode != "off" && (level == 0 || capitals_mode == "on") && capitals_encode(data).has_value()) {
+            plans.push_back({"capitals", best.cfg, true});
+        }
+        add_numeric_plans(plans, data, numeric_mode);
+        if (!plans.empty()) {
+            return compress_plans(data, plans, forced_table_bits, sample, verbose);
+        }
     }
     if (best.cfg.x86 > 0) {
         x86_branches(data, true);
@@ -1050,7 +1849,7 @@ choice compress_best(const gmprime& file, const std::string& mode, const std::st
 }
 
 int usage() {
-    std::fprintf(stderr, "usage: gmz [-1|-2] [-m auto|text|fold|fold-full|bitmap] [-C auto|on|off] [-x auto|off|bin|32|64] [-S bytes]\n"
+    std::fprintf(stderr, "usage: gmz [-1|-2] [-m auto|text|fold|fold-full|bitmap] [-C auto|on|off] [-x auto|off|bin|32|64] [-N auto|on|off] [-S bytes]\n"
                          "           [-T bits] c|d INPUT OUTPUT\n"
                          "       gmz [options] t INPUT\n");
     return 2;
@@ -1059,7 +1858,7 @@ int usage() {
 } // namespace
 
 int main(int argc, char** argv) {
-    std::string mode = "auto", capitals_mode = "auto", code_mode = "auto";
+    std::string mode = "auto", capitals_mode = "auto", code_mode = "auto", numeric_mode = "auto";
     int forced_table_bits = 0;
     size_t sample = 65536;
     int level = 0;
@@ -1074,6 +1873,7 @@ int main(int argc, char** argv) {
         const char* value = argv[arg + 1];
         if (flag == "-m") mode = value;
         else if (flag == "-C") capitals_mode = value;
+        else if (flag == "-N" && (std::string(value) == "auto" || std::string(value) == "on" || std::string(value) == "off")) numeric_mode = value;
         else if (flag == "-x" && (std::string(value) == "auto" || std::string(value) == "off" || std::string(value) == "bin"
                                   || std::string(value) == "32" || std::string(value) == "64")) code_mode = value;
         else if (flag == "-S") sample = std::stoul(value);
@@ -1105,7 +1905,7 @@ int main(int argc, char** argv) {
 
     const auto start = std::chrono::steady_clock::now();
     // The test reports the sizes of the plans compared, on standard error
-    const auto best = compress_best(input, mode, capitals_mode, forced_table_bits, sample, level, code_mode, command == "t");
+    const auto best = compress_best(input, mode, capitals_mode, forced_table_bits, sample, level, code_mode, command == "t", numeric_mode);
     if (command == "c") {
         best.code.save_to_file(argv[arg + 2]);
         return 0;
@@ -1118,7 +1918,7 @@ int main(int argc, char** argv) {
     const size_t size = best.code.bytes().size();
     std::printf("%zu -> %zu bytes, %.3f bits/byte, %s, %.1f s, %s%s", data.size(), size, data.empty() ? 0.0 : 8.0 * size / data.size(),
                 same ? "round trip ok" : "ROUND TRIP FAILED", seconds, best.cfg.fold ? "fold" : "text", best.capitals ? " + capitals" : "");
-    std::printf("%s%s", best.cfg.binary ? " + binary" : "", best.cfg.x86 == 1 ? " + x86-32" : best.cfg.x86 == 2 ? " + x86-64" : "");
+    std::printf("%s%s%s", best.cfg.numeric ? " + numbers" : "", best.cfg.binary ? " + binary" : "", best.cfg.x86 == 1 ? " + x86-32" : best.cfg.x86 == 2 ? " + x86-64" : "");
     if (best.cfg.fold) {
         std::printf(" (width %zu bits, layer %zu%s)", best.cfg.width, best.cfg.layer, best.cfg.bitmap ? ", bitmap" : "");
     }

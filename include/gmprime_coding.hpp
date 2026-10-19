@@ -1111,6 +1111,40 @@ inline uint32_t crc32(const std::vector<uint8_t>& bytes, uint32_t crc = 0) {
     return ~crc;
 }
 
+// The bytes a stream may hold at some place, and the bits they decide: at a node of a byte (its bits so far, after
+// a leading 1), the only bit that some byte of the set continues with, or -1 if both do. A model need not code
+// those bits
+class byte_set {
+public:
+    void add(const uint8_t b) {
+        _bits[b >> 6] |= uint64_t{1} << (b & 63);
+    }
+    [[nodiscard]] bool has(const uint8_t b) const {
+        return (_bits[b >> 6] >> (b & 63)) & 1;
+    }
+
+    // Computes the decided bits, once the set is complete
+    void finish() {
+        bool possible[512] = {};
+        for (int b = 0; b < 256; ++b) {
+            possible[256 + b] = has(static_cast<uint8_t>(b));
+        }
+        for (int n = 255; n >= 1; --n) {
+            possible[n] = possible[2 * n] || possible[2 * n + 1];
+            _decided[n] = static_cast<int8_t>(possible[2 * n] && possible[2 * n + 1] ? -1 : possible[2 * n + 1] ? 1 : possible[2 * n] ? 0 : -1);
+        }
+    }
+
+    // The bit decided at node (1 to 255), or -1
+    [[nodiscard]] int decided(const uint32_t node) const {
+        return _decided[node & 0xFF];
+    }
+
+private:
+    uint64_t _bits[4] = {};
+    int8_t _decided[256] = {};
+};
+
 // Cost of each byte coded with a model, -log2 of the probabilities given to its actual bits: where the bits
 // go, to compare models or study the data
 class cost_profile {

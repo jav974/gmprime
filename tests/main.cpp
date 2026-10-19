@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <cstring>
+#include <ctime>
 #include <boost/ut.hpp>
 #include <gmprime.hpp>
 #include <gmprime_coding.hpp>
@@ -1832,6 +1833,23 @@ suite<"gmprime::coding"> coding_suite = [] {
         expect(throws<std::invalid_argument>([&] { [[maybe_unused]] const auto s = from_multiset_rank(-1, counts); }));
     };
 
+    "byte_set"_test = [] {
+        byte_set digits;
+        for (uint8_t d = '0'; d <= '9'; ++d) {
+            digits.add(d);
+        }
+        digits.finish();
+        expect(digits.has('5') && !digits.has('a'));
+        // 0x30 to 0x39: 0011 decided, then the low half open
+        expect(digits.decided(1) == 0 && digits.decided(2) == 0 && digits.decided(4) == 1 && digits.decided(9) == 1);
+        expect(digits.decided(19) == -1) << "the low half";
+        expect(digits.decided(0b10011100) == -1) << "no digit 1100: both bits impossible";
+
+        byte_set none;
+        none.finish();
+        expect(none.decided(1) == -1);
+    };
+
     "crc32"_test = [] {
         const std::string text = "123456789";
         const std::vector<uint8_t> bytes(text.begin(), text.end());
@@ -2085,6 +2103,179 @@ suite<"gmprime::records"> records_suite = [] {
             scattered.push_back(std::sqrt(static_cast<double>(i * 7919 % 10007)) * 1.234567);
         }
         expect(!find_lattice_step(scattered)) << "no lattice";
+    };
+
+    "numeric_text"_test = [] {
+        const auto bytes = [](const std::string& t) { return std::vector<uint8_t>(t.begin(), t.end()); };
+        const std::string text = "x=-12.50, ip 192.168.0.1 v2.3.4 on 2005.06.03: 1e-5 +3 -0 007 .5 a-5 x-7 9.-1 "
+                                 "1234567890123456789012 3.14159265358979323846 12345678.1234567 1.1234567 5. -";
+        const auto marker = numeric_text_marker(bytes(text));
+        expect(marker && *marker == 0x1A);
+        const auto encoded = numeric_text_encode(bytes(text), *marker);
+        expect(numeric_text_decode(encoded, *marker) == std::optional(bytes(text)));
+
+        // -12.50: the marker, sign | (2 * 18 + 2 - 1), then the digits 1, 2, 5, 0 in their code
+        const std::vector<uint8_t> first{0x1A, 0x80 | 37, digit_code(1), digit_code(2), digit_code(5), digit_code(0)};
+        expect(std::equal(first.begin(), first.end(), encoded.begin() + 2)) << "after x=";
+
+        // Random texts of digits, signs, points and letters come back
+        bool all = true;
+        uint32_t seed = 5;
+        for (int t = 0; t < 300; ++t) {
+            std::string random;
+            for (int i = 0; i < 60; ++i) {
+                seed = seed * 1664525u + 1013904223u;
+                random += "0123456789.-+e,a \n"[(seed >> 16) % 18];
+            }
+            const auto e = numeric_text_encode(bytes(random), 0x1A);
+            all = all && numeric_text_decode(e, 0x1A) == std::optional(bytes(random));
+        }
+        expect(all);
+
+        // Invalid streams: a marker at the end, layout 126, a missing long layout, no integer digit, digits missing
+        // or not digits
+        const auto invalid = [](std::vector<uint8_t> e) { return !numeric_text_decode(e, 0x1A); };
+        expect(invalid({'a', 0x1A}) && invalid({0x1A, 126}) && invalid({0x1A, 127, 2}) && invalid({0x1A, 127, 0, 1, digit_code(1)}));
+        expect(invalid({0x1A, 1, digit_code(1)}) && invalid({0x1A, 0, 'x'}) && invalid({0x1A, 127, 10, 10}));
+
+        std::vector<uint8_t> every(256);
+        for (int b = 0; b < 256; ++b) {
+            every[static_cast<size_t>(b)] = static_cast<uint8_t>(b);
+        }
+        expect(!numeric_text_marker(every)) << "no free byte";
+        every.erase(every.begin() + 0x80);
+        std::vector<uint8_t> controls(every.begin(), every.begin() + 0x80);
+        expect(numeric_text_marker(controls) == std::optional<uint8_t>(0x80)) << "after the control bytes, the high ones";
+
+        expect(digit_density(bytes("ab12")) == 5000 && digit_density({}) == 0 && digit_density(bytes("12ab"), 2) == 10000);
+        bool codes = true;
+        for (int d = 0; d < 10; ++d) {
+            codes = codes && code_digit(digit_code(d)) == d;
+        }
+        expect(codes && code_digit(0x31) == -1 && code_digit('a') == -1);
+        expect(split_at(1).low == 0 && split_at(1).split == 5 && split_at(1).high == 9);
+        expect(split_at(2).high == 4 && split_at(2).split == 2 && split_at(3).low == 5 && split_at(3).split == 7);
+        expect(power10(0) == 1 && power10(19) == 10000000000000000000ull);
+    };
+
+    "decimal_prediction"_test = [] {
+        expect(rescale_decimal(1234, 2, 4) == 123400 && rescale_decimal(1235, 3, 1) == 12 && rescale_decimal(1250, 3, 1) == 13);
+        expect(rescale_decimal(-1250, 3, 1) == -13) << "half away from zero";
+        expect(rescale_decimal(int64_t{100000000000000000}, 0, 5) == int64_t{1000000000000000000}) << "within 10^18";
+        expect(decimal_position(5, 100, 10) == 68 && decimal_position(260, 100, 10) == 83) << "below, above";
+        expect(decimal_position(137, 100, 10) == 14 && decimal_position(5, 0, 1) == 20) << "digit 3, its third quarter";
+    };
+
+    "float32_print"_test = [] {
+        // 127.49f prints 127.489998 with 6 decimals, 127.49 with 2
+        expect(float32_print(127489998, 6) == std::optional<uint64_t>(127489998) && float32_print(12749, 2) == std::optional<uint64_t>(12749));
+        expect(float32_print(127490000, 6) == std::optional<uint64_t>(127489998)) << "what the float near it prints";
+        const auto one = nearest_float32(1, 18);
+        expect(one.m == 9671407 && one.e == -83) << "10^-18";
+        const auto tie = nearest_float32(167772155, 1);
+        expect(tie.m == (1u << 23) && tie.e == 1) << "16777215.5 rounds to 2^24";
+        expect(nearest_float32(0, 3).m == 0);
+
+        // Against the C library's printing of random floats
+        bool same = true;
+        uint32_t seed = 9;
+        char buffer[64];
+        for (int i = 0; i < 20000; ++i) {
+            seed = seed * 1664525u + 1013904223u;
+            const uint32_t bits = (seed & 0x807FFFFF) | ((90 + (seed >> 23) % 70) << 23);
+            float x;
+            std::memcpy(&x, &bits, 4);
+            const int f = static_cast<int>(seed % 10);
+            std::snprintf(buffer, sizeof buffer, "%.*f", f, static_cast<double>(std::fabs(x)));
+            std::string digits;
+            for (const char* c = buffer; *c; ++c) {
+                if (*c != '.') {
+                    digits += *c;
+                }
+            }
+            const uint64_t n = std::stoull(digits);
+            const auto x32 = nearest_float32(n, f);
+            // The print of the float nearest to the printed value is the print; with 9 digits or more, that float is x
+            same = same && (n < 100000000 || std::ldexp(static_cast<double>(x32.m), x32.e) == static_cast<double>(std::fabs(x)))
+                   && float32_print(n, f) == std::optional<uint64_t>(n);
+        }
+        expect(same);
+
+        expect(!render_decimal({1u << 23, 0}, 13) && !render_decimal({1u << 23, 50}, 0)) << "beyond 64 bits";
+        expect(!render_decimal({9094948, 40}, 0) && render_decimal({9094947, 40}, 0) == std::optional<uint64_t>(9999999980506447872ull)) << "10^19 or more";
+        expect(render_decimal({1, -200}, 0) == std::optional<uint64_t>(0) && render_decimal({3, -1}, 0) == std::optional<uint64_t>(2));
+        expect(!render_decimal({(1u << 24) - 1, -1}, 18) && !render_decimal({(1u << 24) - 1, -10}, 15));
+        expect(render_decimal({(1u << 24) - 1, -70}, 18) == std::optional<uint64_t>(14211)) << "(2^24 - 1) 2^-70, 18 decimals";
+    };
+
+    "wide_division"_test = [] {
+        bool same = true;
+        uint64_t seed = 77;
+        for (int i = 0; i < 20000; ++i) {
+            seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+            const uint64_t d = (seed >> (i % 60)) | 1;
+            seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+            const uint64_t high = seed % d, low = seed * 31 + static_cast<uint64_t>(i);
+            const auto [q, r] = GMPrime::coding::detail::divide_wide(high, low, d);
+            const gmprime num = (gmprime(high) << 64) + gmprime(low);
+            same = same && gmprime(q) == num / gmprime(d) && gmprime(r) == num % gmprime(d);
+        }
+        expect(same);
+    };
+
+    "civil_time"_test = [] {
+        const auto epoch = civil_from_seconds(0);
+        expect(epoch.year == 1970 && epoch.month == 1 && epoch.day == 1 && epoch.hour == 0);
+        const auto leap = civil_from_seconds(951782400);
+        expect(leap.year == 2000 && leap.month == 2 && leap.day == 29);
+        const auto before = civil_from_seconds(-1);
+        expect(before.year == 1969 && before.month == 12 && before.day == 31 && before.hour == 23 && before.minute == 59 && before.second == 59);
+        bool same = true;
+        uint64_t seed = 3;
+        for (int i = 0; i < 5000; ++i) {
+            seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+            const auto t = static_cast<std::time_t>((seed >> 32) % 4000000000u);
+            const std::tm* g = std::gmtime(&t);
+            const auto c = civil_from_seconds(static_cast<int64_t>(t));
+            same = same && c.year == g->tm_year + 1900 && c.month == g->tm_mon + 1 && c.day == g->tm_mday && c.hour == g->tm_hour
+                   && c.minute == g->tm_min && c.second == g->tm_sec;
+        }
+        expect(same);
+    };
+
+    "numeric_text_reader"_test = [] {
+        const std::string text = "a -12.5b 1.1234567 ";
+        const auto encoded = numeric_text_encode(std::vector<uint8_t>(text.begin(), text.end()), 0x1A);
+        numeric_text_reader reader(0x1A);
+        expect(reader.state() == numeric_text_reader::text);
+        std::vector<int> states;
+        int completed = 0;
+        bool checked = false;
+        for (const auto b : encoded) {
+            if (reader.state() == numeric_text_reader::value && reader.value_index() == 2 && !checked) {
+                checked = reader.value_digits() == 3 && reader.value_prefix() == 12;
+            }
+            if (reader.byte_added(b)) {
+                ++completed;
+                if (completed == 1) {
+                    const auto& n = reader.number();
+                    checked = checked && n.negative && n.int_digits == 2 && n.frac_digits == 1 && n.mantissa == 125;
+                }
+            }
+            states.push_back(reader.state());
+        }
+        expect(checked && completed == 2 && reader.number().frac_digits == 7 && reader.number().mantissa == 11234567);
+        expect(std::count(states.begin(), states.end(), numeric_text_reader::layout_f) == 1) << "the long layout";
+
+        // Any bytes are read: layout 126 and out of range lengths are kept within bounds
+        numeric_text_reader odd(0x1A), any(0x1A);
+        odd.byte_added(0x1A);
+        odd.byte_added(126);
+        expect(odd.state() == numeric_text_reader::value && odd.number().int_digits == 1 && odd.number().frac_digits == 7);
+        for (const uint8_t b : {uint8_t{0x1A}, uint8_t{127}, uint8_t{40}, uint8_t{40}}) {
+            any.byte_added(b);
+        }
+        expect(any.state() == numeric_text_reader::value && any.number().int_digits == 18 && any.number().frac_digits == 0);
     };
 
     "lattice_transform"_test = [] {
