@@ -16,7 +16,7 @@
 //             smaller tables, no capitals comparison; folded data only loses its text contexts; -2 also drops the
 //             chained maps. The level is stored in the message for the decompressor
 //   -x MODE   machine code: auto (default), off, bin (sparse contexts for binary data), 32 or 64 (x86 code)
-//   -N MODE   numbers in text: auto (default: tried when digits are 3% of the first 64 KB), on (only), off
+//   -N MODE   numbers in text: auto (default: tried when digits are 1% of the first 64 KB), on (only), off
 //
 // The file is first analyzed with gmprime::analyze_folds. Data that folds (bitmap rows, fixed-size records)
 // is coded with bit and byte templates across the fold, in 2D and 3D; anything else with the text model:
@@ -30,7 +30,7 @@
 // (k * step stored as k and a residual of a few units in the last place; a 4-byte field also as a signal,
 // predicted from the records before), and images of 16-bit samples (byte order and row width found, pixels
 // coded high byte first, with numeric contexts: where predictions stand from the values the known bits allow).
-// Text with numbers (3% of digits) is also tried with its numbers as tokens (numeric_text_encode: a marker, the
+// Text with numbers (1% of digits) is also tried with its numbers as tokens (numeric_text_encode: a marker, the
 // layout, the digits): each number fills slots (its place in the line after the same text, the text before it,
 // its column of separators, the local template of the last texts), and is predicted from them (last values,
 // trend, step, the line above, the number before it, its offset from it, adaptive linear predictors, the number
@@ -624,7 +624,9 @@ private:
     // is predicted from the layouts of its slots, its value from their last values (trend, step, the same
     // number a line above, the number before it in the line, adaptive linear predictors), all brought to its
     // count of fraction digits
-    static constexpr size_t numeric_count = 29, byte_numeric = 22, lms_features = 8, line_max = 64, predictions = 16, ring = 1024;
+    // Predictions 16 and 17: a smooth series, and a relation with two numbers before it in the line
+    static constexpr size_t numeric_count = 31, byte_numeric = 24, lms_features = 8, line_max = 64, predictions = 18, ring = 1024,
+                            p_smooth = 16, p_arith = 17;
 
     struct slot_record {
         uint32_t check = 0, count = 0;
@@ -639,6 +641,7 @@ private:
         uint8_t lag_k = 0, lag_hits = 0;
         uint32_t lag = 0;     // a number of an earlier line that it copied: lines back, and its place in its line
         uint8_t layout = 0, layout2 = 0;
+        uint8_t ar_op = 0, ar_i = 0, ar_j = 0, ar_hits = 0;   // a relation with two numbers before it in the line
     };
 
     slot_record& slot(const uint64_t key) {
@@ -686,6 +689,16 @@ private:
                 r.src = _src;
             }
         }
+        if (_ar_op > 0 && _ar_op == r.ar_op && _ar_i == r.ar_i && _ar_j == r.ar_j) {
+            r.ar_hits = static_cast<uint8_t>(std::min(255, r.ar_hits + 1));
+        } else {
+            r.ar_hits = 0;
+            if (_ar_op > 0) {
+                r.ar_op = _ar_op;
+                r.ar_i = _ar_i;
+                r.ar_j = _ar_j;
+            }
+        }
         r.pil = _k > 0 ? _line_v[_k - 1] : 0;
         r.pil_f = _k > 0 ? _line_f[_k - 1] : 0;
         r.count = std::min<uint32_t>(r.count + 1, 1u << 30);
@@ -724,7 +737,9 @@ private:
         if (_sep_len == 0) {
             _sep_start[std::min(_line_k, line_max - 1)] = pos;
         }
-        if (byte == '\n') {
+        // A line of more numbers than the line structures hold (JSON on one line): its rows start at '[' and '{'
+        const bool row = _long_line && (byte == '[' || byte == '{');
+        if (byte == '\n' || row) {
             _sep_length[std::min(_line_k, line_max - 1)] = pos - _sep_start[std::min(_line_k, line_max - 1)];
             for (size_t i = 0; i < line_max; ++i) {
                 _prev_sep_start[i] = _sep_start[i];
@@ -744,7 +759,11 @@ private:
             _seps[0] = _seps[1] = _seps[2] = 0;
             _commas = 0;
             _sep_len = 0;
-            return;
+            if (!row) {
+                _long_line = false;
+                return;
+            }
+            _sep_start[0] = pos;
         }
         ++_sep_len;
         _sep_text = (_sep_text + byte + 1) * 0x9E3779B97F4A7C15ull;
@@ -853,6 +872,20 @@ private:
         } else {
             P[11] = P[0];
         }
+        // The relation with two numbers before it in the line that the slot followed last time (a sum, a
+        // difference, a product: the total of a table, the price times the quantity)
+        P[p_arith] = P[0];
+        if (r1.ar_op > 0 && _line_k < line_max && r1.ar_j <= _k) {
+            const size_t a = _k - r1.ar_i, b = _k - r1.ar_j;
+            if (const auto v = apply_relation(r1.ar_op, _line_v[a], _line_f[a], _line_v[b], _line_f[b], f)) {
+                P[p_arith] = *v;
+            }
+        }
+        // A smooth series: the parabola through the slot's last 3 values (the cosines of a twiddle table, a track)
+        P[p_smooth] = r1.count > 2 ? smooth_extrapolation(P[0], P[2], sc(r1.v[2], r1.f[2])) : P[1];
+        if (r1.count > 3) {
+            P[p_smooth] = cubic_extrapolation(P[0], P[2], sc(r1.v[2], r1.f[2]), sc(r1.v[3], r1.f[3]));
+        }
         // Adaptive linear predictors of the difference from P0, one pair per bank of slots
         const auto limit = [](const int64_t v) { return std::max<int64_t>(-(int64_t{1} << 24), std::min<int64_t>(int64_t{1} << 24, v)); };
         const int64_t comove = _k > 0 ? sc(_line_delta[_k - 1], _line_f[_k - 1]) : 0;
@@ -908,6 +941,36 @@ private:
                 _src = static_cast<uint8_t>(_k - j);
             }
         }
+        _ar_op = _ar_i = _ar_j = 0;
+        if (_line_k < line_max) {
+            const auto fits = [&](const uint8_t op, const size_t i, const size_t j) {
+                const size_t x = _k - i, y = _k - j;
+                const auto v = apply_relation(op, _line_v[x], _line_f[x], _line_v[y], _line_f[y], f);
+                return v && (op == 4 ? std::abs(*v - a) <= 1 : *v == a);
+            };
+            if (_r1.ar_op > 0 && _r1.ar_j <= _k && fits(_r1.ar_op, _r1.ar_i, _r1.ar_j)) {
+                _ar_op = _r1.ar_op;
+                _ar_i = _r1.ar_i;
+                _ar_j = _r1.ar_j;
+            } else if (std::abs(a) >= 2) {
+                const size_t far = std::min<size_t>(_k, 24);
+                for (size_t i = 1; _ar_op == 0 && i <= far; ++i) {
+                    for (size_t j = i + 1; _ar_op == 0 && j <= far; ++j) {
+                        if (!relation_operands(_line_v[_k - i], _line_f[_k - i], _line_v[_k - j], _line_f[_k - j])) {
+                            continue;
+                        }
+                        for (uint8_t op = 1; op <= 4; ++op) {
+                            if (fits(op, i, j)) {
+                                _ar_op = op;
+                                _ar_i = static_cast<uint8_t>(i);
+                                _ar_j = static_cast<uint8_t>(j);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         time_done(a, num);
         // Earlier lines: the last line and place where this value appeared
         _lag = 0;
@@ -941,6 +1004,7 @@ private:
         _line_layout[_k] = _cur_layout;
         _line_delta[_k] = _r1.count > 0 ? a - _pv[0] : 0;
         ++_line_k;
+        _long_line = _long_line || _line_k >= line_max;
         _last_s1 = _s1;
         _last_move = a > _pv[0] ? 2 : a < _pv[0] ? 0 : 1;
         _sep_len = 0;
@@ -1086,6 +1150,8 @@ private:
         _num_base[t++] = hash_mix(uint64_t{20} << 40 | r << 16 | e[14] << 5 | _num_act) + 5555;
         _num_base[t++] = hash_mix(uint64_t{22} << 40 | r << 24 | e[0] << 16 | e[4] << 8 | _carry << 2 | (i == 0)) + 2222;
         _num_base[t++] = hash_mix(uint64_t{21} << 40 | r << 16 | e[15] << 5 | std::min<uint64_t>(_r1.lag_hits, 3) << 3 | (_r1.lag > 0)) + 5555;
+        _num_base[t++] = hash_mix(uint64_t{24} << 40 | r << 16 | e[p_arith] << 5 | std::min<uint64_t>(_r1.ar_hits, 3) << 3 | (_r1.ar_op > 0)) + 5555;
+        _num_base[t++] = hash_mix(uint64_t{23} << 40 | r << 16 | e[p_smooth] << 5 | _num_act) + 5555;
         // A float32 printed with more digits than it holds: the prints of the float32 nearest the middle of the
         // values left, and of the short decimals at either end of them (127.49 prints as 127.489998)
         const int f = _reader->number().frac_digits;
@@ -1382,6 +1448,16 @@ private:
     uint64_t _s1 = 0, _s2 = 0, _s3 = 0, _cond_key = 0, _last_s1 = 0, _last_move = 1;
     slot_record _r1, _r2, _r3, _r4;
     uint64_t _s4 = 0, _seps[3] = {}, _sep_text = 0x77;
+    bool _long_line = false;
+    uint8_t _ar_op = 0, _ar_i = 0, _ar_j = 0;
+    struct wide_number {
+        int64_t v = 0;
+        int8_t f = 0;
+        uint8_t layout = 0;
+    };
+    static constexpr size_t wide_max = 16384;
+    std::vector<wide_number> _wide_v = std::vector<wide_number>(wide_max), _wide_prev = std::vector<wide_number>(wide_max);
+    size_t _wide_prev_n = 0;
     size_t _sep_start[line_max] = {}, _sep_length[line_max] = {}, _prev_sep_start[line_max] = {}, _prev_sep_length[line_max] = {}, _prev_seps = 0;
     int64_t _line_v[line_max] = {}, _prev_v[line_max] = {}, _line_delta[line_max] = {};
     int8_t _line_f[line_max] = {}, _prev_f[line_max] = {};
@@ -1642,7 +1718,7 @@ struct plan {
 std::vector<uint8_t> transformed(const std::vector<uint8_t>& data, const plan& p) {
     if (p.capitals || p.cfg.numeric) {
         auto text = p.capitals ? *capitals_encode(data) : data;
-        return p.cfg.numeric ? numeric_text_encode(text, p.cfg.marker) : text;
+        return p.cfg.numeric ? numeric_text_encode(text, p.cfg.marker, keep_random | keep_hex) : text;
     }
     auto result = p.cfg.lattice_width > 0 ? lattice_encode(data, p.cfg.lattice_width, p.cfg.lattice)
                 : !p.cfg.scan.kinds.empty() ? scan_any_encode(data, p.cfg.scan) : data;
@@ -1652,9 +1728,10 @@ std::vector<uint8_t> transformed(const std::vector<uint8_t>& data, const plan& p
     return result;
 }
 
-// Numbers written in text, when digits are 3% of the first bytes: the text plans again with the numbers as tokens
+// Numbers written in text, when digits are 1% of the first bytes: the text plans again with the numbers as tokens
 void add_numeric_plans(std::vector<plan>& plans, const std::vector<uint8_t>& data, const std::string& numeric_mode) {
-    if (numeric_mode == "off" || (numeric_mode == "auto" && digit_density(data) < 300)) {
+    // Text only: digits by chance in binary data (bytes 30 to 39) would pass the gate
+    if (numeric_mode == "off" || (numeric_mode == "auto" && (digit_density(data) < 100 || control_density(data) >= 100))) {
         return;
     }
     const auto marker = numeric_text_marker(data);
@@ -1864,7 +1941,7 @@ choice compress_best(const gmprime& file, const std::string& mode, const std::st
         return compress_plans(data, plans, forced_table_bits, sample, verbose);
     }
     // Text with numbers: the text plans and their numeric versions compared
-    if (mode == "auto" && best.cfg.x86 == 0 && !best.cfg.binary && numeric_mode != "off" && (numeric_mode == "on" || digit_density(data) >= 300)) {
+    if (mode == "auto" && best.cfg.x86 == 0 && !best.cfg.binary && numeric_mode != "off" && (numeric_mode == "on" || digit_density(data) >= 100)) {
         std::vector<plan> plans;
         if (capitals_mode != "on") {
             plans.push_back({"text", best.cfg});

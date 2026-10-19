@@ -65,6 +65,7 @@ if (BUILD_TESTING AND (PROJECT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR))
     add_test(NAME gmz_numbers_only COMMAND gmz -2 -N on t ${GMZ_SAMPLES}/numbers.log)
     add_test(NAME gmz_numbers_off COMMAND gmz -N off t ${GMZ_SAMPLES}/numbers.csv)
     add_test(NAME gmz_numbers_crowded COMMAND gmz -N on t ${GMZ_SAMPLES}/crowded.txt)
+    add_test(NAME gmz_numbers_one_line COMMAND gmz t ${GMZ_SAMPLES}/oneline.json)
     add_test(NAME gmz_numbers_files COMMAND ${CMAKE_COMMAND} -DGMZ=$<TARGET_FILE:gmz> -DINPUT=${GMZ_SAMPLES}/numbers.csv
              -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/numbers -DOPTIONS=-T\;18 -P ${CMAKE_CURRENT_SOURCE_DIR}/round_trip.cmake)
     add_test(NAME gmz_numbers_checksum COMMAND ${CMAKE_COMMAND} -DGMZ=$<TARGET_FILE:gmz> -DINPUT=${GMZ_SAMPLES}/numbers.csv
@@ -79,7 +80,7 @@ if (BUILD_TESTING AND (PROJECT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR))
     set_tests_properties(gmz_scan gmz_scan_level1 gmz_scan_files gmz_header_records PROPERTIES FIXTURES_REQUIRED gmz_samples)
     set_tests_properties(gmz_records gmz_records_level1 gmz_image_little_endian gmz_image_big_endian gmz_records_files
                          gmz_records_checksum gmz_numbers_checksum gmz_numbers_csv gmz_numbers_json gmz_numbers_log gmz_numbers_only gmz_numbers_off
-                         gmz_numbers_crowded gmz_numbers_files PROPERTIES FIXTURES_REQUIRED gmz_samples)
+                         gmz_numbers_crowded gmz_numbers_one_line gmz_numbers_files PROPERTIES FIXTURES_REQUIRED gmz_samples)
 
     # Invalid command lines
     add_test(NAME gmz_unknown_option COMMAND gmz -q t ${GMZ_SAMPLE})

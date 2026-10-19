@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <tuple>
 #include <unordered_map>
@@ -1497,15 +1498,70 @@ inline void put_layout(std::vector<uint8_t>& out, const text_number& n) {
     }
 }
 
-inline std::vector<uint8_t> numeric_text_encode(const std::vector<uint8_t>& text, const uint8_t marker) {
+// Digits that numeric_text_encode leaves as text, when asked (numeric_text_decode needs no change: what stays text
+// is only text). Measured on logs and code: random names lose when cut into numbers, and so does hexadecimal
+enum numeric_text_rules : unsigned {
+    keep_random = 1,   // runs of letters and digits that alternate 5 times or more (CMwJl820SlYyy434c8, e3b0c442):
+                       // random names; YAL069W, blk_42, NC_000001 or 18T04 stay numbers
+    keep_hex = 2,      // 0x and its hexadecimal digits
+};
+
+namespace detail {
+
+// The end of a run of letters and digits from start that alternate 5 times or more, or start if it does not
+inline size_t random_word_end(const std::vector<uint8_t>& text, const size_t start) {
+    size_t q = start, runs = 0;
+    int last = 0;   // 1 digit, 2 letter
+    while (q < text.size() && is_alnum(text[q])) {
+        const int kind = is_digit(text[q]) ? 1 : 2;
+        runs += kind != last;
+        last = kind;
+        ++q;
+    }
+    return runs >= 5 ? q : start;
+}
+
+inline bool is_hex(const uint8_t c) {
+    return is_digit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+} // namespace detail
+
+inline std::vector<uint8_t> numeric_text_encode(const std::vector<uint8_t>& text, const uint8_t marker, const unsigned rules = 0) {
     std::vector<uint8_t> out;
     const size_t n = text.size();
     // Allocation failures abort: no cleanup to plan for
     [&]() noexcept {
         out.reserve(n + n / 4);
+        const auto copy = [&](const size_t from, const size_t to) {
+            out.insert(out.end(), text.begin() + static_cast<std::ptrdiff_t>(from), text.begin() + static_cast<std::ptrdiff_t>(to));
+        };
         size_t i = 0;
+        bool at_word_start = true;
         while (i < n) {
             const uint8_t c = text[i];
+            const bool word_byte = detail::is_alnum(c);
+            if ((rules & keep_random) != 0 && word_byte && at_word_start) {
+                const size_t end = detail::random_word_end(text, i);
+                if (end > i) {
+                    copy(i, end);
+                    i = end;
+                    at_word_start = false;
+                    continue;
+                }
+            }
+            at_word_start = !word_byte;
+            if ((rules & keep_hex) != 0 && c == '0' && i + 2 < n && (text[i + 1] == 'x' || text[i + 1] == 'X') && detail::is_hex(text[i + 2])
+                && (i == 0 || !(detail::is_alnum(text[i - 1]) || text[i - 1] == '_'))) {
+                size_t q = i + 2;
+                while (q < n && detail::is_hex(text[q])) {
+                    ++q;
+                }
+                copy(i, q);
+                i = q;
+                at_word_start = false;
+                continue;
+            }
             const bool sign = c == '-' && i + 1 < n && detail::is_digit(text[i + 1]) && (i == 0 || (!detail::is_alnum(text[i - 1]) && text[i - 1] != '.'));
             if (!detail::is_digit(c) && !sign) {
                 out.push_back(c);
@@ -1516,10 +1572,8 @@ inline std::vector<uint8_t> numeric_text_encode(const std::vector<uint8_t>& text
             size_t p = sign ? i + 1 : i;
             num.negative = sign;
             const size_t start = p;
-            uint64_t m = 0;
             int digits = 0;
             while (p < n && detail::is_digit(text[p]) && digits < 18) {
-                m = m * 10 + (text[p] - '0');
                 ++digits;
                 ++p;
             }
@@ -1534,14 +1588,10 @@ inline std::vector<uint8_t> numeric_text_encode(const std::vector<uint8_t>& text
                 const int frac = static_cast<int>(q - p - 1);
                 const bool dotted_after = q + 1 < n && text[q] == '.' && detail::is_digit(text[q + 1]);
                 if (!dotted_after && digits + frac <= 18) {
-                    for (size_t k = p + 1; k < q; ++k) {
-                        m = m * 10 + (text[k] - '0');
-                    }
                     num.frac_digits = frac;
                     p = q;
                 }
             }
-            num.mantissa = m;
             out.push_back(marker);
             put_layout(out, num);
             for (size_t k = start; k < p; ++k) {
@@ -1773,6 +1823,95 @@ inline std::optional<uint64_t> render_decimal(const binary_float x, const int f)
 // What a float32 near n / 10^f prints with f decimals (f from 0 to 18): n itself if n is such a print
 inline std::optional<uint64_t> float32_print(const uint64_t n, const int f) {
     return render_decimal(nearest_float32(n, f), f);
+}
+
+// RELATIONS BETWEEN NUMBERS OF A LINE, AND SMOOTH SERIES. Numbers that programs computed from others: a total, a
+// difference, a price times a quantity; values of a smooth function. Integers only
+
+namespace detail {
+
+// a + b, saturated at the int64 limits
+inline int64_t saturated_add(const int64_t a, const int64_t b) {
+    if (b > 0 && a > std::numeric_limits<int64_t>::max() - b) {
+        return std::numeric_limits<int64_t>::max();
+    }
+    if (b < 0 && a < std::numeric_limits<int64_t>::min() - b) {
+        return std::numeric_limits<int64_t>::min();
+    }
+    return a + b;
+}
+
+inline int64_t clamp62(const int64_t v) {
+    constexpr int64_t limit = int64_t{1} << 62;
+    return std::max(-limit, std::min(limit, v));
+}
+
+} // namespace detail
+
+// The parabola through three values a step apart, one step on: 3 v0 - 3 v1 + v2 (v0 the last); the values within
+// +-10^18, the result within +-2^62
+inline int64_t smooth_extrapolation(const int64_t v0, const int64_t v1, const int64_t v2) {
+    // Within +-7 10^18: no overflow
+    return detail::clamp62(3 * v0 + v2 - 3 * v1);
+}
+
+// The cubic through four values a step apart, one step on: 4 v0 - 6 v1 + 4 v2 - v3; the values within +-10^18,
+// the result within +-2^62
+inline int64_t cubic_extrapolation(const int64_t v0, const int64_t v1, const int64_t v2, const int64_t v3) {
+    // Two groups within +-8 10^18, one addition that may saturate: beyond the int64 limits, beyond 2^62 too
+    return detail::clamp62(detail::saturated_add(4 * v0 + 4 * v2, -(6 * v1 + v3)));
+}
+
+// A number computed from two numbers before it (values a and b, within +-10^18, with fa and fb fraction digits up to
+// 18), at f fraction digits: 1 a + b, 2 a - b, 3 b - a, 4 a * b (rounded half away from zero). Nothing beyond +-10^18
+inline std::optional<int64_t> apply_relation(const uint8_t op, const int64_t a, const int fa, const int64_t b, const int fb, const int f) {
+    constexpr int64_t limit = 1000000000000000000;
+    if (op <= 3) {
+        const int64_t x = rescale_decimal(a, fa, f), y = rescale_decimal(b, fb, f);
+        const int64_t v = op == 1 ? x + y : op == 2 ? x - y : y - x;
+        return v > -limit && v < limit ? std::optional<int64_t>(v) : std::nullopt;
+    }
+    // The product of the magnitudes on 128 bits, brought to f fraction digits
+    const bool negative = (a < 0) != (b < 0);
+    const auto magnitude = [](const int64_t v) { return v < 0 ? static_cast<uint64_t>(-(v + 1)) + 1 : static_cast<uint64_t>(v); };
+    const auto p = multiply_wide(magnitude(a), magnitude(b));
+    const int pf = fa + fb;
+    uint64_t v;
+    if (f >= pf) {
+        const int up = f - pf;
+        if (p.high != 0 || (up > 0 && p.low > static_cast<uint64_t>(limit) / power10(up))) {
+            return std::nullopt;
+        }
+        v = p.low * power10(up);
+    } else {
+        // Divided by 10^d, d from 1 to 36: by 10^18 first when d is beyond 18 (the product being below 2^120, its high
+        // word is below 10^18), rounding half away from zero on what the division leaves
+        const int d = pf - f;
+        if (d <= 18) {
+            const uint64_t divisor = power10(d);
+            if (p.high >= divisor) {
+                return std::nullopt;   // a quotient of 64 bits or more
+            }
+            const auto [q, r] = detail::divide_wide(p.high, p.low, divisor);
+            v = q + (r >= divisor - r ? 1 : 0);
+        } else {
+            // p / 10^d = (q1 + r1 / 10^18) / 10^(d - 18), r1 / 10^18 below 1: the rounding depends on q1 alone
+            const uint64_t q1 = detail::divide_wide(p.high, p.low, power10(18)).first;
+            const uint64_t m = power10(d - 18);
+            v = q1 / m + (q1 % m >= 5 * power10(d - 19) ? 1 : 0);
+        }
+    }
+    if (v >= static_cast<uint64_t>(limit)) {
+        return std::nullopt;
+    }
+    return negative ? -static_cast<int64_t>(v) : static_cast<int64_t>(v);
+}
+
+// Operands worth a relation: neither is 0, nor 1 at its precision (sums with 0 and products with 1 are copies, which
+// the model sees otherwise)
+inline bool relation_operands(const int64_t a, const int fa, const int64_t b, const int fb) {
+    const auto one = [](const int64_t v, const int f) { return v == static_cast<int64_t>(power10(f)) || v == -static_cast<int64_t>(power10(f)); };
+    return a != 0 && b != 0 && !one(a, fa) && !one(b, fb);
 }
 
 // TIMES. A count of seconds since 1970 written in a text is often written again as a date and a time: the civil

@@ -341,8 +341,20 @@ below its text model overall, never worse, the controls untouched:
 Its failures: numbers that are categories (addresses, status codes, ports), random identifiers and hexadecimal
 cut into decimal fragments, JSON on a single line (no line above to predict from), smooth functions (tables of
 cosines), and columns computed from others. That last one is the axis again: in ETHBTC trades quote = price ×
-quantity, in the census NPOPCHG = POP(t) - POP(t-1); a prototype learning, per column, a sum, difference or
-product of two earlier numbers of the line takes ETHBTC 34% and the census 22.5% below paq8px.
+quantity, in the census NPOPCHG = POP(t) - POP(t-1).
+
+The fixes, now in gmz:
+- per column, the sum, difference or product of two earlier numbers of the line that it followed last time, found
+  by trying the pairs when a number comes (products exact on 128 bits, at the precision written);
+- a cubic extrapolation for smooth series;
+- '[' and '{' starting rows when a line holds more numbers than the line structures;
+- random identifiers and hexadecimal left as text;
+- the gate lowered to 1% of digits (a JSON API at 1.9% gained 8.9%).
+
+Over the 30 files: 877,043 to 845,534 bytes (-3.6%), 15.2% below the text model, 3.9% above paq8px overall. ETHBTC
+trades 11,928 bytes (paq8px 17,992: -34%), census 70,496 (paq8px 90,942: -22.5%), C tables of floats 4,088
+(paq8px 4,942: -17%). Rejected: keeping identifiers with letters (blk_42) and dotted sequences as text (HDFS
++6.2%, BGL +13.1%), and copying long lines from the line above (no effect: VCF genotypes are at the floor).
 
 ### A million random digits
 

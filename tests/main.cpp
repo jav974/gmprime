@@ -2304,6 +2304,39 @@ suite<"gmprime::records"> records_suite = [] {
         expect(power10(0) == 1 && power10(19) == 10000000000000000000ull);
     };
 
+    "number_relations"_test = [] {
+        // 12.5 + 3.25 = 15.75; 12.5 - 3.25; 3.25 - 12.5; 12.5 * 3.25 = 40.625, at 2 decimals 40.63 (half away)
+        expect(apply_relation(1, 125, 1, 325, 2, 2) == std::optional<int64_t>(1575) && apply_relation(2, 125, 1, 325, 2, 2) == std::optional<int64_t>(925));
+        expect(apply_relation(3, 125, 1, 325, 2, 2) == std::optional<int64_t>(-925) && apply_relation(4, 125, 1, 325, 2, 2) == std::optional<int64_t>(4063));
+        expect(apply_relation(4, -125, 1, 325, 2, 3) == std::optional<int64_t>(-40625) && apply_relation(4, 125, 1, 325, 2, 5) == std::optional<int64_t>(4062500));
+        const int64_t big = 999999999999999999;
+        expect(!apply_relation(1, big, 0, big, 0, 0) && !apply_relation(4, big, 0, big, 0, 0) && !apply_relation(4, big, 0, 10, 0, 1));
+        expect(!apply_relation(4, big, 0, 999999999, 0, 18)) << "a product beyond 64 bits";
+        expect(apply_relation(4, big, 17, big, 17, 2) == std::optional<int64_t>(10000)) << "divided by 10^32";
+        expect(!apply_relation(4, big, 0, big, 0, 0)) << "beyond 10^18";
+        expect(!apply_relation(4, big, 1, big, 0, 0) && !apply_relation(4, big, 1, 20, 0, 0)) << "divided, still beyond 64 bits or 10^18";
+
+        expect(relation_operands(5, 0, 7, 1) && !relation_operands(0, 0, 7, 0) && !relation_operands(100, 2, 7, 0) && !relation_operands(7, 0, -10, 1));
+
+        expect(smooth_extrapolation(9, 4, 1) == 16 && cubic_extrapolation(27, 8, 1, 0) == 64) << "squares, cubes";
+        const int64_t e = 1000000000000000000;
+        expect(cubic_extrapolation(e, -e, -e, e) == int64_t{1} << 62 && cubic_extrapolation(-e, e, e, -e) == -(int64_t{1} << 62));
+        expect(smooth_extrapolation(e, -e, e) == int64_t{1} << 62);
+        expect(GMPrime::coding::detail::saturated_add(std::numeric_limits<int64_t>::max(), 5) == std::numeric_limits<int64_t>::max());
+        expect(GMPrime::coding::detail::saturated_add(std::numeric_limits<int64_t>::min(), -5) == std::numeric_limits<int64_t>::min());
+    };
+
+    "numeric_text_rules"_test = [] {
+        const std::string text = "id=CMwJl820SlYyy434c8 crc 0xFF blk_42 YAL069W 0xg 10x5 a0x7 e3b0c442 len 15";
+        const std::vector<uint8_t> bytes(text.begin(), text.end());
+        const auto plain = numeric_text_encode(bytes, 0x1A), ruled = numeric_text_encode(bytes, 0x1A, keep_random | keep_hex);
+        expect(numeric_text_decode(ruled, 0x1A) == std::optional(bytes) && numeric_text_decode(plain, 0x1A) == std::optional(bytes));
+        const auto tokens = [](const std::vector<uint8_t>& e) { return std::count(e.begin(), e.end(), uint8_t{0x1A}); };
+        // Plain: 820, 434, 8, 0, 42, 069, 0, 10, 5, 0, 7, 3, 0, 442, 15; ruled: the random names and 0xFF stay text
+        expect(tokens(plain) == 15 && tokens(ruled) == 8) << tokens(plain) << tokens(ruled);
+        expect(numeric_text_encode(bytes, 0x1A, keep_hex) != ruled && numeric_text_encode(bytes, 0x1A, keep_random) != ruled);
+    };
+
     "decimal_prediction"_test = [] {
         expect(rescale_decimal(1234, 2, 4) == 123400 && rescale_decimal(1235, 3, 1) == 12 && rescale_decimal(1250, 3, 1) == 13);
         expect(rescale_decimal(-1250, 3, 1) == -13) << "half away from zero";

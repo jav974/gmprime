@@ -4,9 +4,11 @@
 //   image_le.bin  a smooth image of 16-bit little-endian pixels, rows of 72 pixels
 //   image_be.bin  the same in big-endian, rows of 60 pixels
 //   numbers.csv   a time series: a count of seconds, the same time as a local date (UTC-7), a price printed from a
-//                 float32 with 6 decimals, a temperature, a counter, the time in milliseconds
+//                 float32 with 6 decimals, a temperature, a counter, the time in milliseconds, a quantity and the
+//                 price times it, a smooth series
+//   oneline.json  records as JSON on a single line
 //   numbers.json  records as JSON, keyed numbers of various precisions, a title repeating one of them
-//   numbers.log   log lines with dates, addresses and counters
+//   numbers.log   log lines with dates, addresses, counters, random identifiers and hexadecimal
 //   crowded.txt   numbers, and every byte that could mark them, so that none can
 //   polylines.bin shapes of varying length, as GIS files store them: a count, then points as decimal doubles
 //   header_records.bin  a header, then records of 10 decimal floats
@@ -85,7 +87,7 @@ std::vector<uint8_t> text(const std::string& s) {
 }
 
 std::string time_series() {
-    std::string out = "epoch,local,price,temperature,count,millis\n";
+    std::string out = "epoch,local,price,temperature,count,millis,quantity,total,square\n";
     int64_t seconds = 1128000000;
     float price = 127.49f;
     int temperature = 215, count = 1000;
@@ -98,9 +100,12 @@ std::string time_series() {
         temperature += static_cast<int>(next() % 5) - 2;
         count += 1 + static_cast<int>(next() % 3);
         const auto millis = static_cast<long long>(seconds) * 1000 + next() % 1000;
-        std::snprintf(line, sizeof line, "%lld,%04d-%02d-%02d %02d:%02d:%02d,%.6f,%d.%d,%d,%lld\n", static_cast<long long>(seconds),
+        const int quantity = 1 + static_cast<int>(next() % 50);
+        // The total of the price as printed, to the cent
+        const long long cents = (static_cast<long long>(std::llround(static_cast<double>(price) * 1e6)) * quantity + 5000) / 10000;
+        std::snprintf(line, sizeof line, "%lld,%04d-%02d-%02d %02d:%02d:%02d,%.6f,%d.%d,%d,%lld,%d,%lld.%02lld,%d\n", static_cast<long long>(seconds),
                       t->tm_year + 1900, t->tm_mon + 1, t->tm_mday, t->tm_hour, t->tm_min, t->tm_sec, static_cast<double>(price),
-                      temperature / 10, temperature % 10, count, millis);
+                      temperature / 10, temperature % 10, count, millis, quantity, cents / 100, cents % 100, (i + 3) * (i + 3));
         // Now and then a missing count of seconds
         out += i % 37 == 20 ? "NA" + std::string(std::strchr(line, ',')) : std::string(line);
     }
@@ -124,6 +129,17 @@ std::string json_records() {
     return out + "]\n";
 }
 
+std::string one_line_json() {
+    std::string out = "[";
+    char item[120];
+    for (int i = 0; i < 150; ++i) {
+        const double value = static_cast<double>(next() % 10000) / 100;
+        std::snprintf(item, sizeof item, "%s{\"n\":%d,\"v\":%.2f,\"w\":[%u,%u]}", i ? "," : "", i, value, next() % 100, next() % 100);
+        out += item;
+    }
+    return out + "]";
+}
+
 std::string log_lines() {
     std::string out;
     char line[200];
@@ -134,9 +150,9 @@ std::string log_lines() {
         second %= 60;
         bytes += static_cast<int>(next() % 4000);
         // One call per statement: the order of evaluation of arguments differs between compilers
-        const uint32_t subnet = next() % 4, host = next() % 256, item = next() % 100, delta = next() % 9;
-        std::snprintf(line, sizeof line, "2005.06.03 22:%02d:%02d 192.168.%u.%u GET /item/%u %d -%u.5\n", minute % 60, second, subnet,
-                      host, item, bytes, delta);
+        const uint32_t subnet = next() % 4, host = next() % 256, item = next() % 100, delta = next() % 9, id = next(), flags = next() % 4096;
+        std::snprintf(line, sizeof line, "2005.06.03 22:%02d:%02d 192.168.%u.%u GET /item/%u %d -%u.5 uid=C%xq%uZ flags=0x%03x\n", minute % 60,
+                      second, subnet, host, item, bytes, delta, id % 4096, id % 977, flags);
         out += line;
     }
     return out;
@@ -167,6 +183,7 @@ int main(int argc, char** argv) {
     save(dir + "numbers.csv", text(time_series()));
     save(dir + "numbers.json", text(json_records()));
     save(dir + "numbers.log", text(log_lines()));
+    save(dir + "oneline.json", text(one_line_json()));
 
     // Every byte a marker could be, among numbers
     std::vector<uint8_t> crowded = text(log_lines());
