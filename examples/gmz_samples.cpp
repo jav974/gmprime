@@ -8,8 +8,11 @@
 //   numbers.json  records as JSON, keyed numbers of various precisions, a title repeating one of them
 //   numbers.log   log lines with dates, addresses and counters
 //   crowded.txt   numbers, and every byte that could mark them, so that none can
+//   polylines.bin shapes of varying length, as GIS files store them: a count, then points as decimal doubles
+//   header_records.bin  a header, then records of 10 decimal floats
 // Each just large enough for gmz to find its structure, so that the tests stay short
 //   gmz_samples DIRECTORY
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -173,5 +176,33 @@ int main(int argc, char** argv) {
         }
     }
     save(dir + "crowded.txt", crowded);
+
+    std::vector<uint8_t> shapes;
+    double x = -122.4, y = 37.7;
+    for (int s = 0; s < 120; ++s) {
+        const uint32_t points = 2 + next() % 9;
+        put(shapes, s, 4, false);
+        put(shapes, points, 4, false);
+        for (uint32_t p = 0; p < points; ++p) {
+            x += static_cast<double>(static_cast<int>(next() % 2001) - 1000) * 1e-6;
+            y += static_cast<double>(static_cast<int>(next() % 2001) - 1000) * 1e-6;
+            put(shapes, double_bits(std::round(x * 1e6) / 1e6), 8, false);
+            put(shapes, double_bits(std::round(y * 1e6) / 1e6), 8, false);
+        }
+    }
+    save(dir + "polylines.bin", shapes);
+
+    std::vector<uint8_t> table;
+    for (int i = 0; i < 300; ++i) {
+        table.push_back(static_cast<uint8_t>(next()));
+    }
+    int columns[10] = {};
+    for (int r = 0; r < 300; ++r) {
+        for (int j = 0; j < 10; ++j) {
+            columns[j] += static_cast<int>(next() % 41) - 20;
+            put(table, float_bits(static_cast<float>(1000 * (j + 1) + columns[j]) * 0.01f), 4, false);
+        }
+    }
+    save(dir + "header_records.bin", table);
     return 0;
 }

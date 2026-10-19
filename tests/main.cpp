@@ -2105,6 +2105,152 @@ suite<"gmprime::records"> records_suite = [] {
         expect(!find_lattice_step(scattered)) << "no lattice";
     };
 
+    "decimal_steps"_test = [] {
+        const float_format binary64{8, false, false};
+        std::vector<uint64_t> values;
+        uint32_t seed = 21;
+        for (int i = 0; i < 400; ++i) {
+            seed = seed * 1664525u + 1013904223u;
+            // One in five off the lattice
+            values.push_back(double_bits(i % 5 == 4 ? std::sqrt(static_cast<double>(seed % 1000) + 2) : static_cast<double>(seed % 100000) * 0.01));
+        }
+        const auto step = find_decimal_step(values, binary64);
+        expect(step && *step == 0.01);
+        expect(!find_decimal_step(std::vector<uint64_t>(values.begin(), values.begin() + 30), binary64)) << "too few values";
+        expect(!find_decimal_step(values, {4, true, true})) << "IBM steps are powers of 2";
+        std::vector<uint64_t> scattered;
+        for (int i = 1; i <= 300; ++i) {
+            scattered.push_back(double_bits(std::sqrt(static_cast<double>(i * 7919 % 10007)) * 1.234567));
+        }
+        expect(!find_decimal_step(scattered, binary64));
+
+        std::vector<uint8_t> records(8 * 300, 7);
+        for (size_t r = 0; r < 300; ++r) {
+            seed = seed * 1664525u + 1013904223u;
+            records[r * 8 + 3] = static_cast<uint8_t>(seed >> 24);
+        }
+        expect(raw_field_cost(records, 8, 0, 2, 300) < 300 && raw_field_cost(records, 8, 3, 1, 300) > 300 * 6) << "constant bytes cost little";
+    };
+
+    "lattice_window"_test = [] {
+        // A header of 1000 bytes that is not records, then records of 16 bytes: two decimal doubles
+        std::vector<uint8_t> data;
+        uint32_t seed = 5;
+        for (int i = 0; i < 1000; ++i) {
+            seed = seed * 1664525u + 1013904223u;
+            data.push_back(static_cast<uint8_t>(seed >> 24));
+        }
+        const size_t header = data.size();
+        for (int r = 0; r < 1500; ++r) {
+            seed = seed * 1664525u + 1013904223u;
+            put_field(data, double_bits(static_cast<double>(100000 + r * 37 + seed % 30) * 1e-7), 8, false);
+            put_field(data, double_bits(static_cast<double>(seed % 900000) * 1e-6), 8, false);
+        }
+        const std::vector<uint8_t> records(data.begin() + static_cast<std::ptrdiff_t>(header), data.end());
+        const auto fields = find_lattice_fields_window(data, 16);
+        expect(fields.size() == 2 && fields[0].offset == 0 && fields[1].offset == 8 && header % 16 == 8) << "the records' doubles, out of phase";
+        expect(find_lattice_fields_window(records, 16).size() == 2 && find_lattice_fields_window(records, 16)[0].offset == 0);
+        expect(find_lattice_fields_window(records, 3).empty() && find_lattice_fields_window(lattice_records(200), 24).empty());
+
+        // Two floats side by side are not one double; more than 8 fields take more flag bytes
+        std::vector<uint8_t> wide;
+        for (int r = 0; r < 600; ++r) {
+            for (int j = 0; j < 12; ++j) {
+                put_field(wide, float_bits(static_cast<float>((r * (j + 3) * 31) % 500) * 0.5f), 4, false);
+            }
+        }
+        const auto twelve = find_lattice_fields_window(wide, 48);
+        bool floats = twelve.size() == 12;
+        for (const auto& f : twelve) {
+            floats = floats && f.format.size == 4;
+        }
+        expect(floats) << twelve.size();
+        expect(find_lattice_fields_window(wide, 48, 20000, 10).size() == 10) << "at most max_fields";
+        expect(lattice_flag_bytes(12) == 2 && lattice_flag_bytes(8) == 1 && lattice_flag_bytes(0) == 0);
+        const auto encoded = lattice_encode(wide, 48, twelve);
+        expect(encoded.size() == wide.size() + 600 * 2 && lattice_decode(encoded, 48, twelve) == std::optional(wide));
+    };
+
+    "scan_transform"_test = [] {
+        // Decimal doubles at any place, among other bytes, the marker among them
+        std::vector<uint8_t> data;
+        uint32_t seed = 9;
+        double x = 2.0, y = 48.0;
+        for (int i = 0; i < 800; ++i) {
+            seed = seed * 1664525u + 1013904223u;
+            const int junk = static_cast<int>(seed % 5);
+            for (int j = 0; j < junk; ++j) {
+                data.push_back(static_cast<uint8_t>(seed >> (8 * j)));
+            }
+            x += static_cast<double>(static_cast<int>(seed % 2001) - 1000) * 1e-6;
+            y += static_cast<double>(static_cast<int>((seed >> 11) % 2001) - 1000) * 1e-6;
+            put_field(data, double_bits(std::round(x * 1e6) / 1e6), 8, false);
+            put_field(data, double_bits(std::round(y * 1e6) / 1e6), 8, false);
+        }
+        const auto cfg = find_scan_config(data);
+        expect(!cfg.kinds.empty() && cfg.kinds[0].format.size == 8 && field_value(cfg.kinds[0].step_bits, cfg.kinds[0].format) == 1e-6);
+        bool lagged = false;
+        for (const auto& k : cfg.kinds) {
+            lagged = lagged || k.lag == 2;
+        }
+        expect(lagged) << "x and y alternate: each against the one two values before";
+
+        for (const bool in_place : {false, true}) {
+            auto c = cfg;
+            c.in_place = in_place;
+            const auto encoded = scan_any_encode(data, c);
+            expect(scan_any_decode(encoded, c) == std::optional(data)) << "in place" << in_place;
+        }
+        // A residual of 40 bits leaves no room for large codes: those values stay as they are
+        auto roomy = cfg;
+        for (auto& k : roomy.kinds) {
+            k.residual_bits = 40;
+        }
+        expect(scan_decode(scan_encode(data, roomy), roomy) == std::optional(data) && scan_place_decode(scan_place_encode(data, roomy), roomy) == std::optional(data));
+
+        // Every kind of lag
+        for (const int lag : {0, 1, 2}) {
+            auto c = cfg;
+            for (auto& k : c.kinds) {
+                k.lag = lag;
+            }
+            expect(scan_decode(scan_encode(data, c), c) == std::optional(data) && scan_place_decode(scan_place_encode(data, c), c) == std::optional(data));
+        }
+
+        std::string text;
+        random_text(4000, 26, 3, text);
+        expect(find_scan_config(std::vector<uint8_t>(text.begin(), text.end())).kinds.empty()) << "no doubles in text";
+        expect(find_scan_config(std::vector<uint8_t>(data.begin(), data.begin() + 500)).kinds.empty()) << "too short";
+
+        // Invalid streams
+        const uint8_t m = cfg.marker;
+        expect(!scan_decode({1, m}, cfg) && !scan_decode({m, 0x0F}, cfg) && !scan_decode({m, 0x71, 1}, cfg)) << "cut, bad kind, cut code";
+        expect(scan_decode({m, 0}, cfg) == std::optional(std::vector<uint8_t>{m})) << "the marker itself";
+        auto broken = cfg;
+        broken.kinds[0].step_bits = 0;
+        expect(!scan_decode({m, 0x01, 2}, broken)) << "no value for the kind";
+        const auto place = [&](std::vector<uint8_t> side) {
+            std::vector<uint8_t> e(32, 0);
+            e.insert(e.end(), side.begin(), side.end());
+            for (int b = 3; b >= 0; --b) {
+                e.push_back(static_cast<uint8_t>(side.size() >> (8 * b)));
+            }
+            return scan_place_decode(e, cfg);
+        };
+        expect(!scan_place_decode({1, 2}, cfg) && !scan_place_decode({0, 0, 0, 9}, cfg)) << "no length, side too long";
+        expect(!place({0x80}) && !place({0}) && !place({0, 9, 1}) && !place({0, 1, 0x80})) << "gap cut, kind missing, bad kind, count cut";
+        expect(!place({0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 1, 1})) << "a gap beyond the data";
+        expect(!place({30, 1, 1}) && !place({0, 1, 5})) << "values beyond the data";
+        auto broken_place = cfg;
+        broken_place.kinds[0].step_bits = 0;
+        std::vector<uint8_t> e(32, 0);
+        e[7] = 4;
+        for (const uint8_t b : {uint8_t{0}, uint8_t{1}, uint8_t{1}, uint8_t{0}, uint8_t{0}, uint8_t{0}, uint8_t{3}}) {
+            e.push_back(b);
+        }
+        expect(!scan_place_decode(e, broken_place));
+    };
+
     "numeric_text"_test = [] {
         const auto bytes = [](const std::string& t) { return std::vector<uint8_t>(t.begin(), t.end()); };
         const std::string text = "x=-12.50, ip 192.168.0.1 v2.3.4 on 2005.06.03: 1e-5 +3 -0 007 .5 a-5 x-7 9.-1 "
@@ -2302,6 +2448,7 @@ suite<"gmprime::records"> records_suite = [] {
         auto broken = fields;
         broken[1].step_bits = 0;
         expect(!lattice_decode(encoded, 28, broken)) << "no value for these fields";
+        expect(broken != fields && broken[0] == fields[0] && !(broken[1] == fields[1]));
 
         expect(find_lattice_fields(data, 3).empty() && find_lattice_fields(lattice_records(100), 28).empty());
 

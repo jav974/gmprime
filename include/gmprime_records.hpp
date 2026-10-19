@@ -14,6 +14,7 @@
 #include <cstring>
 #include <optional>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include <gmprime_coding.hpp>
@@ -367,6 +368,15 @@ struct lattice_field {
     bool delta = false;           // k coded as the difference with the previous record's
     bool offset_binary = false;   // k coded in offset binary (k + 2^(n - 1), in order: numeric contexts can predict
                                   // it), else zigzag (small magnitudes of either sign leave the high bytes 0)
+
+    bool operator==(const lattice_field& other) const {
+        return offset == other.offset && format.size == other.format.size && format.big_endian == other.format.big_endian
+               && format.ibm == other.format.ibm && step_bits == other.step_bits && residual_bits == other.residual_bits
+               && delta == other.delta && offset_binary == other.offset_binary;
+    }
+    bool operator!=(const lattice_field& other) const {
+        return !(*this == other);
+    }
 };
 
 // Values of a format as doubles, for the encoder's analysis only (the transform itself is exact on integers)
@@ -658,14 +668,20 @@ inline std::vector<lattice_field> find_lattice_fields(const std::vector<uint8_t>
     return found;
 }
 
-// The transform: each record of width bytes gets a first byte of flags (bit j: field j kept as it was), and each
-// field on its lattice is replaced by zigzag(k or its delta) << residual_bits | residual biased, big-endian in
-// the field's bytes: the high bytes, mostly zero or alike, come first, and the field's information sits in its
-// low bytes. Bytes after the last whole record are kept. Records grow by one byte
+// Flag bytes of a record: one per 8 fields
+inline size_t lattice_flag_bytes(const size_t fields) {
+    return (fields + 7) / 8;
+}
+
+// The transform: each record of width bytes gets flag bytes first (bit j of byte j / 8: field j kept as it was),
+// and each field on its lattice is replaced by zigzag(k or its delta) << residual_bits | residual biased,
+// big-endian in the field's bytes: the high bytes, mostly zero or alike, come first, and the field's information
+// sits in its low bytes. Bytes after the last whole record are kept. Records grow by one byte per 8 fields
 inline std::vector<uint8_t> lattice_encode(const std::vector<uint8_t>& data, const size_t width, const std::vector<lattice_field>& fields) {
+    const size_t nf = lattice_flag_bytes(fields.size());
     std::vector<uint8_t> out;
     const size_t records = width ? data.size() / width : 0;
-    out.reserve(data.size() + records + 16);
+    out.reserve(data.size() + records * nf + 16);
     std::vector<int64_t> previous(fields.size(), 0);
     std::vector<double> steps;
     for (const auto& field : fields) {
@@ -674,9 +690,8 @@ inline std::vector<uint8_t> lattice_encode(const std::vector<uint8_t>& data, con
     for (size_t r = 0; r < records; ++r) {
         const uint8_t* rec = &data[r * width];
         const size_t start = out.size();
-        out.push_back(0);
+        out.insert(out.end(), nf, 0);
         out.insert(out.end(), rec, rec + width);
-        uint8_t flags = 0;
         for (size_t j = 0; j < fields.size(); ++j) {
             const auto& field = fields[j];
             const auto v = read_field(rec + field.offset, field.format);
@@ -684,16 +699,15 @@ inline std::vector<uint8_t> lattice_encode(const std::vector<uint8_t>& data, con
             const int64_t coded = point ? (field.delta ? point->k - previous[j] : point->k) : 0;
             const auto packed = point ? pack_point(field, coded, point->residual) : std::nullopt;
             if (!packed) {
-                flags |= static_cast<uint8_t>(1 << j);
+                out[start + j / 8] |= static_cast<uint8_t>(1 << (j % 8));
                 continue;
             }
             previous[j] = point->k;
             const uint64_t u = *packed;
             for (int i = 0; i < field.format.size; ++i) {
-                out[start + 1 + field.offset + static_cast<size_t>(i)] = static_cast<uint8_t>(u >> (8 * (field.format.size - 1 - i)));
+                out[start + nf + field.offset + static_cast<size_t>(i)] = static_cast<uint8_t>(u >> (8 * (field.format.size - 1 - i)));
             }
         }
-        out[start] = flags;
     }
     out.insert(out.end(), data.begin() + static_cast<std::ptrdiff_t>(records * width), data.end());
     return out;
@@ -701,41 +715,660 @@ inline std::vector<uint8_t> lattice_encode(const std::vector<uint8_t>& data, con
 
 // The inverse: nothing if the encoded data is not a transform of records of this width and fields
 inline std::optional<std::vector<uint8_t>> lattice_decode(const std::vector<uint8_t>& encoded, const size_t width, const std::vector<lattice_field>& fields) {
+    const size_t nf = lattice_flag_bytes(fields.size());
     std::vector<uint8_t> out;
-    const size_t records = encoded.size() / (width + 1);
+    const size_t records = encoded.size() / (width + nf);
     out.reserve(encoded.size());
     std::vector<int64_t> previous(fields.size(), 0);
     for (size_t r = 0; r < records; ++r) {
-        const uint8_t* rec = &encoded[r * (width + 1)];
-        const uint8_t flags = rec[0];
+        const uint8_t* rec = &encoded[r * (width + nf)];
         const size_t start = out.size();
-        out.insert(out.end(), rec + 1, rec + 1 + width);
+        out.insert(out.end(), rec + nf, rec + nf + width);
         for (size_t j = 0; j < fields.size(); ++j) {
-            if (flags & (1 << j)) {
+            if (rec[j / 8] & (1 << (j % 8))) {
                 continue;
             }
             const auto& field = fields[j];
             uint64_t u = 0;
             for (int i = 0; i < field.format.size; ++i) {
-                u = (u << 8) | rec[1 + field.offset + static_cast<size_t>(i)];
+                u = (u << 8) | rec[nf + field.offset + static_cast<size_t>(i)];
             }
             const auto point = unpack_point(field, u);
-            const int64_t residual = point.residual, coded = point.k;
-            const int64_t k = field.delta ? previous[j] + coded : coded;
+            const int64_t k = field.delta ? previous[j] + point.k : point.k;
             previous[j] = k;
             const auto bits = lattice_bits(k, field.step_bits, field.format);
             if (!bits) {
                 return std::nullopt;
             }
             const uint64_t sign_bit = uint64_t{1} << (field.format.size * 8 - 1);
-            const uint64_t v = (*bits & sign_bit) | static_cast<uint64_t>(static_cast<int64_t>(*bits & (sign_bit - 1)) + residual);
+            const uint64_t v = (*bits & sign_bit) | static_cast<uint64_t>(static_cast<int64_t>(*bits & (sign_bit - 1)) + point.residual);
             write_field(&out[start + field.offset], field.format, v);
         }
     }
-    // Records are width + 1 bytes: the tail is what remains after them
-    const size_t tail = records * (width + 1);
+    // Records are width + nf bytes: the tail is what remains after them
+    const size_t tail = records * (width + nf);
     out.insert(out.end(), encoded.begin() + static_cast<std::ptrdiff_t>(tail), encoded.end());
     return out;
+}
+
+// DECIMAL STEPS AND FIELDS AWAY FROM HEADERS
+
+// The largest power of 10 (from 10^4 down to 10^-12) such that at least min_share of the values (bit patterns of
+// format f, with their repetitions) are k * step within +-2 units in the last place. Checked on the first 256
+// values before all of them
+inline std::optional<double> find_decimal_step(const std::vector<uint64_t>& values, const float_format f, const double min_share = 0.75) {
+    if (f.ibm || values.size() < 64) {
+        return std::nullopt;
+    }
+    const size_t probe = std::min<size_t>(values.size(), 256);
+    for (int d = -4; d <= 12; ++d) {
+        const double step = std::pow(10.0, -d);
+        lattice_field field;
+        field.format = f;
+        field.step_bits = value_bits(step, f);
+        field.residual_bits = 3;
+        const double s = field_value(field.step_bits, f);
+        const auto share = [&](const size_t n) {
+            size_t hits = 0;
+            for (size_t i = 0; i < n; ++i) {
+                hits += to_lattice(values[i], field, s).has_value();
+            }
+            return static_cast<double>(hits) / static_cast<double>(n);
+        };
+        if (share(probe) >= min_share - 0.1 && share(values.size()) >= min_share) {
+            return s;
+        }
+    }
+    return std::nullopt;
+}
+
+// The bits the raw bytes of a field would take with the estimator of lattice_cost: each byte by an adaptive model,
+// the better of order 0 and of the same byte in the record above as context. Savings are measured against it,
+// not against the field's size: bytes that repeat cost the model little already
+inline double raw_field_cost(const std::vector<uint8_t>& data, const size_t width, const size_t offset, const size_t size, const size_t records) {
+    std::vector<uint32_t> order0(size * 257, 0), above(size * 256 * 257, 0);
+    std::vector<double> cost0(size, 0), cost1(size, 0);
+    const double alpha = 1.0 / 16;
+    for (size_t r = 0; r < records; ++r) {
+        for (size_t i = 0; i < size; ++i) {
+            const size_t b = data[r * width + offset + i], a = r > 0 ? data[(r - 1) * width + offset + i] : 0;
+            uint32_t* c0 = &order0[i * 257];
+            uint32_t* c1 = &above[(i * 256 + a) * 257];
+            cost0[i] -= std::log2((c0[b] + alpha) / (c0[256] + 256 * alpha));
+            cost1[i] -= std::log2((c1[b] + alpha) / (c1[256] + 256 * alpha));
+            ++c0[b], ++c0[256], ++c1[b], ++c1[256];
+        }
+    }
+    double bits = 0;
+    for (size_t i = 0; i < size; ++i) {
+        bits += std::min(cost0[i], cost1[i]);
+    }
+    return bits;
+}
+
+// find_lattice_fields with the decimal steps first, on a window of records away from the start (the middle
+// max_records, or all but the first eighth), and up to max_fields fields
+inline std::vector<lattice_field> find_lattice_fields_window(const std::vector<uint8_t>& all, const size_t width, const size_t max_records = 20000,
+                                                             const size_t max_fields = 24) {
+    std::vector<lattice_field> found;
+    if (width < 4) {
+        return found;
+    }
+    const size_t n = all.size() / width;
+    const size_t first = std::max(n / 8, n > max_records ? (n - max_records) / 2 : 0);
+    const size_t records = std::min(n - first, max_records);
+    if (records < 256) {
+        return found;
+    }
+    const std::vector<uint8_t> data(all.begin() + static_cast<std::ptrdiff_t>(first * width), all.begin() + static_cast<std::ptrdiff_t>((first + records) * width));
+    struct candidate {
+        lattice_field field;
+        double saving;
+    };
+    std::vector<candidate> candidates;
+    const float_format formats[] = {{8, false, false}, {8, true, false}, {4, false, false}, {4, true, false}, {4, true, true}};
+    for (const auto f : formats) {
+        const uint8_t size = f.size;
+        for (size_t offset = 0; offset + size <= width; ++offset) {
+            std::vector<double> values;
+            std::vector<uint64_t> bits;
+            for (size_t r = 0; r < records; ++r) {
+                bits.push_back(read_field(&data[r * width + offset], f));
+                values.push_back(field_value(bits.back(), f));
+            }
+            auto step = find_decimal_step(bits, f);
+            if (!step) {
+                step = find_lattice_step(values);
+            }
+            if (!step) {
+                continue;
+            }
+            lattice_field field;
+            field.offset = offset;
+            field.format = f;
+            field.step_bits = value_bits(*step, f);
+            std::vector<double> sorted_k;
+            for (const double v : values) {
+                if (std::isfinite(v)) {
+                    sorted_k.push_back(std::fabs(v) / *step);
+                }
+            }
+            // A step comes from 64 finite values at least: sorted_k is not empty
+            std::nth_element(sorted_k.begin(), sorted_k.begin() + static_cast<std::ptrdiff_t>(sorted_k.size() * 99 / 100), sorted_k.end());
+            if (sorted_k[sorted_k.size() * 99 / 100] > std::ldexp(1.0, f.mantissa_bits() - 2)) {
+                continue;
+            }
+            double best = 0;
+            lattice_field chosen;
+            const double raw = raw_field_cost(data, width, offset, size, records);
+            const std::vector<int> residuals = f.ibm ? std::vector<int>{0} : std::vector<int>{0, 2, 3, 4, 5};
+            for (const int residual_bits : residuals) {
+                for (const int variant : {0, 1, 2, 3}) {
+                    field.residual_bits = residual_bits;
+                    field.delta = variant & 1;
+                    field.offset_binary = variant & 2;
+                    size_t escapes = 0;
+                    const double cost = lattice_cost(data, width, field, records, &escapes);
+                    const double saving = raw - cost;
+                    if (escapes < records / 4 && saving > best) {
+                        best = saving;
+                        chosen = field;
+                    }
+                }
+            }
+            if (best > static_cast<double>(records) * 2) {
+                candidates.push_back({chosen, best});
+            }
+        }
+    }
+    // A double over two floats that are fields of their own is two fields read as one
+    const auto float_at = [&](const size_t offset, const bool big_endian) {
+        for (const auto& c : candidates) {
+            if (c.field.format.size == 4 && !c.field.format.ibm && c.field.offset == offset && c.field.format.big_endian == big_endian) {
+                return true;
+            }
+        }
+        return false;
+    };
+    std::vector<candidate> kept;
+    for (const auto& c : candidates) {
+        if (!(c.field.format.size == 8 && float_at(c.field.offset, c.field.format.big_endian) && float_at(c.field.offset + 4, c.field.format.big_endian))) {
+            kept.push_back(c);
+        }
+    }
+    candidates = kept;
+    std::sort(candidates.begin(), candidates.end(), [](const candidate& a, const candidate& b) { return a.saving > b.saving; });
+    std::vector<bool> used(width, false);
+    for (const auto& c : candidates) {
+        if (found.size() == max_fields) {
+            break;
+        }
+        bool overlap = false;
+        for (size_t i = 0; i < c.field.format.size; ++i) {
+            overlap = overlap || used[c.field.offset + i];
+        }
+        if (!overlap) {
+            for (size_t i = 0; i < c.field.format.size; ++i) {
+                used[c.field.offset + i] = true;
+            }
+            found.push_back(c.field);
+        }
+    }
+    std::sort(found.begin(), found.end(), [](const lattice_field& a, const lattice_field& b) { return a.offset < b.offset; });
+    return found;
+}
+
+// SCAN TRANSFORM
+
+// A kind of value the scan replaces: a format, its decimal step, the residual bits, and how k is coded: as is
+// (lag 0) or as the difference with the k of the same kind lag tokens before (1 or 2: coordinates alternate)
+struct scan_kind {
+    float_format format;
+    uint64_t step_bits = 0;
+    int residual_bits = 2;
+    int lag = 0;
+};
+
+struct scan_config {
+    uint8_t marker = 0;
+    std::vector<scan_kind> kinds;   // up to 15, tried in order at each position
+    bool in_place = false;          // codes in place of the values, their positions in a side stream at the end
+};
+
+namespace detail {
+
+inline lattice_field scan_field(const scan_kind& kind) {
+    lattice_field f;
+    f.format = kind.format;
+    f.step_bits = kind.step_bits;
+    f.residual_bits = kind.residual_bits;
+    return f;
+}
+
+// The value of kind at p as k and residual, if it is one the scan replaces: on the lattice, k not 0
+inline std::optional<lattice_point> scan_point(const uint8_t* p, const scan_kind& kind, const double step) {
+    const uint64_t v = read_field(p, kind.format);
+    const auto point = to_lattice(v, scan_field(kind), step);
+    // k must take clearly fewer bits than the significand: a step at the precision of the values holds anything
+    const uint64_t magnitude = point ? static_cast<uint64_t>(point->k < 0 ? -point->k : point->k) : 0;
+    if (!point || point->k == 0 || magnitude >> (kind.format.mantissa_bits() - 7) != 0) {
+        return std::nullopt;
+    }
+    return point;
+}
+
+} // namespace detail
+
+// The tokens: marker, then a byte of the kind (1 to 15) and the code length in bytes minus 1 (high nibble), then
+// zigzag(coded k) << residual_bits | biased residual, big-endian in that many bytes. A marker byte of the data is
+// the marker followed by 0
+inline std::vector<uint8_t> scan_encode(const std::vector<uint8_t>& data, const scan_config& cfg, std::vector<std::vector<int64_t>>* coded_out = nullptr) {
+    std::vector<uint8_t> out;
+    out.reserve(data.size() + data.size() / 16);
+    std::vector<double> steps;
+    for (const auto& kind : cfg.kinds) {
+        steps.push_back(field_value(kind.step_bits, kind.format));
+    }
+    std::vector<std::array<int64_t, 2>> history(cfg.kinds.size(), {0, 0});
+    if (coded_out) {
+        coded_out->assign(cfg.kinds.size() * 3, {});
+    }
+    size_t i = 0;
+    while (i < data.size()) {
+        bool token = false;
+        for (size_t j = 0; j < cfg.kinds.size() && !token; ++j) {
+            const auto& kind = cfg.kinds[j];
+            if (i + kind.format.size > data.size()) {
+                continue;
+            }
+            const auto point = detail::scan_point(&data[i], kind, steps[j]);
+            if (!point) {
+                continue;
+            }
+            const int64_t base = kind.lag == 0 ? 0 : history[j][static_cast<size_t>(kind.lag - 1)];
+            const int64_t coded = point->k - base;
+            const uint64_t z = zigzag(coded);
+            const int rb = kind.residual_bits;
+            if (z >> (63 - rb) != 0) {
+                continue;
+            }
+            const uint64_t bias = rb > 0 ? uint64_t{1} << (rb - 1) : 0;
+            const uint64_t u = z << rb | static_cast<uint64_t>(point->residual + static_cast<int64_t>(bias));
+            int len = 1;
+            while (len < 8 && (u >> (8 * len)) != 0) {
+                ++len;
+            }
+            if (coded_out) {
+                for (int lag = 0; lag < 3; ++lag) {
+                    (*coded_out)[j * 3 + static_cast<size_t>(lag)].push_back(point->k - (lag == 0 ? 0 : history[j][static_cast<size_t>(lag - 1)]));
+                }
+            }
+            history[j][1] = history[j][0];
+            history[j][0] = point->k;
+            out.push_back(cfg.marker);
+            out.push_back(static_cast<uint8_t>((j + 1) | static_cast<size_t>(len - 1) << 4));
+            for (int b = len - 1; b >= 0; --b) {
+                out.push_back(static_cast<uint8_t>(u >> (8 * b)));
+            }
+            i += kind.format.size;
+            token = true;
+        }
+        if (!token) {
+            out.push_back(data[i]);
+            if (data[i] == cfg.marker) {
+                out.push_back(0);
+            }
+            ++i;
+        }
+    }
+    return out;
+}
+
+inline std::optional<std::vector<uint8_t>> scan_decode(const std::vector<uint8_t>& enc, const scan_config& cfg) {
+    std::vector<uint8_t> out;
+    out.reserve(enc.size() + enc.size() / 4);
+    std::vector<std::array<int64_t, 2>> history(cfg.kinds.size(), {0, 0});
+    size_t i = 0;
+    while (i < enc.size()) {
+        if (enc[i] != cfg.marker) {
+            out.push_back(enc[i++]);
+            continue;
+        }
+        if (i + 1 >= enc.size()) {
+            return std::nullopt;
+        }
+        const uint8_t b = enc[i + 1];
+        i += 2;
+        if (b == 0) {
+            out.push_back(cfg.marker);
+            continue;
+        }
+        const size_t j = (b & 15) - 1;
+        const size_t len = (b >> 4) + 1;
+        if (j >= cfg.kinds.size() || i + len > enc.size()) {
+            return std::nullopt;
+        }
+        uint64_t u = 0;
+        for (size_t n = 0; n < len; ++n) {
+            u = u << 8 | enc[i + n];
+        }
+        i += len;
+        const auto& kind = cfg.kinds[j];
+        const int rb = kind.residual_bits;
+        const int64_t bias = rb > 0 ? int64_t{1} << (rb - 1) : 0;
+        const int64_t residual = static_cast<int64_t>(u & ((uint64_t{1} << rb) - 1)) - bias;
+        const int64_t base = kind.lag == 0 ? 0 : history[j][static_cast<size_t>(kind.lag - 1)];
+        const int64_t k = unzigzag(u >> rb) + base;
+        history[j][1] = history[j][0];
+        history[j][0] = k;
+        const auto bits = lattice_bits(k, kind.step_bits, kind.format);
+        if (!bits) {
+            return std::nullopt;
+        }
+        const uint64_t sign_bit = uint64_t{1} << (kind.format.size * 8 - 1);
+        const uint64_t v = (*bits & sign_bit) | static_cast<uint64_t>(static_cast<int64_t>(*bits & (sign_bit - 1)) + residual);
+        const size_t at = out.size();
+        out.resize(at + kind.format.size);
+        write_field(&out[at], kind.format, v);
+    }
+    return out;
+}
+
+// The scan in place: each value replaced by its code in as many bytes (big-endian: zigzag(coded k) <<
+// residual_bits | biased residual), so that records and rows keep their alignment; the positions follow the data
+// as runs (gap since the previous run as a varint, kind + 1, count as a varint), then the side stream's length in
+// 4 bytes
+namespace detail {
+
+inline void put_varint(std::vector<uint8_t>& out, uint64_t v) {
+    while (v >= 128) {
+        out.push_back(static_cast<uint8_t>(v | 128));
+        v >>= 7;
+    }
+    out.push_back(static_cast<uint8_t>(v));
+}
+
+inline std::optional<uint64_t> get_varint(const std::vector<uint8_t>& in, size_t& i, const size_t end) {
+    uint64_t v = 0;
+    for (int shift = 0; shift < 64 && i < end; shift += 7) {
+        const uint8_t b = in[i++];
+        v |= static_cast<uint64_t>(b & 127) << shift;
+        if (!(b & 128)) {
+            return v;
+        }
+    }
+    return std::nullopt;
+}
+
+} // namespace detail
+
+inline std::vector<uint8_t> scan_place_encode(const std::vector<uint8_t>& data, const scan_config& cfg) {
+    std::vector<uint8_t> out(data);
+    std::vector<uint8_t> side;
+    std::vector<double> steps;
+    for (const auto& kind : cfg.kinds) {
+        steps.push_back(field_value(kind.step_bits, kind.format));
+    }
+    std::vector<std::array<int64_t, 2>> history(cfg.kinds.size(), {0, 0});
+    size_t last_end = 0, run_start = 0, run_end = 0, run_count = 0, run_kind = 0;
+    const auto flush = [&]() {
+        if (run_count > 0) {
+            detail::put_varint(side, run_start - last_end);
+            side.push_back(static_cast<uint8_t>(run_kind + 1));
+            detail::put_varint(side, run_count);
+            last_end = run_end;
+        }
+        run_count = 0;
+    };
+    size_t i = 0;
+    while (i < data.size()) {
+        bool token = false;
+        for (size_t j = 0; j < cfg.kinds.size() && !token; ++j) {
+            const auto& kind = cfg.kinds[j];
+            const size_t size = kind.format.size;
+            if (i + size > data.size()) {
+                continue;
+            }
+            const auto point = detail::scan_point(&data[i], kind, steps[j]);
+            if (!point) {
+                continue;
+            }
+            const int64_t base = kind.lag == 0 ? 0 : history[j][static_cast<size_t>(kind.lag - 1)];
+            const uint64_t z = zigzag(point->k - base);
+            const int rb = kind.residual_bits;
+            if (z >> (8 * size - 1 - static_cast<size_t>(rb)) != 0) {
+                continue;
+            }
+            const uint64_t bias = rb > 0 ? uint64_t{1} << (rb - 1) : 0;
+            const uint64_t u = z << rb | static_cast<uint64_t>(point->residual + static_cast<int64_t>(bias));
+            history[j][1] = history[j][0];
+            history[j][0] = point->k;
+            for (size_t b = 0; b < size; ++b) {
+                out[i + b] = static_cast<uint8_t>(u >> (8 * (size - 1 - b)));
+            }
+            if (!(run_count > 0 && run_kind == j && run_end == i)) {
+                flush();
+                run_start = i;
+                run_kind = j;
+            }
+            ++run_count;
+            i += size;
+            run_end = i;
+            token = true;
+        }
+        if (!token) {
+            ++i;
+        }
+    }
+    flush();
+    out.insert(out.end(), side.begin(), side.end());
+    for (int b = 3; b >= 0; --b) {
+        out.push_back(static_cast<uint8_t>(side.size() >> (8 * b)));
+    }
+    return out;
+}
+
+inline std::optional<std::vector<uint8_t>> scan_place_decode(const std::vector<uint8_t>& enc, const scan_config& cfg) {
+    if (enc.size() < 4) {
+        return std::nullopt;
+    }
+    size_t side_size = 0;
+    for (size_t b = enc.size() - 4; b < enc.size(); ++b) {
+        side_size = side_size << 8 | enc[b];
+    }
+    if (side_size > enc.size() - 4) {
+        return std::nullopt;
+    }
+    const size_t n = enc.size() - 4 - side_size;
+    std::vector<uint8_t> out(enc.begin(), enc.begin() + static_cast<std::ptrdiff_t>(n));
+    std::vector<std::array<int64_t, 2>> history(cfg.kinds.size(), {0, 0});
+    size_t s = n, pos = 0;
+    const size_t end = enc.size() - 4;
+    while (s < end) {
+        const auto gap = detail::get_varint(enc, s, end);
+        if (!gap || s >= end) {
+            return std::nullopt;
+        }
+        const size_t j = static_cast<size_t>(enc[s++]) - 1;
+        const auto count = detail::get_varint(enc, s, end);
+        if (!count || j >= cfg.kinds.size()) {
+            return std::nullopt;
+        }
+        if (*gap > n - pos) {
+            return std::nullopt;
+        }
+        pos += *gap;
+        const auto& kind = cfg.kinds[j];
+        const size_t size = kind.format.size;
+        const int rb = kind.residual_bits;
+        const int64_t bias = rb > 0 ? int64_t{1} << (rb - 1) : 0;
+        for (uint64_t c = 0; c < *count; ++c, pos += size) {
+            if (size > n - pos) {
+                return std::nullopt;
+            }
+            uint64_t u = 0;
+            for (size_t b = 0; b < size; ++b) {
+                u = u << 8 | out[pos + b];
+            }
+            const int64_t residual = static_cast<int64_t>(u & ((uint64_t{1} << rb) - 1)) - bias;
+            const int64_t base = kind.lag == 0 ? 0 : history[j][static_cast<size_t>(kind.lag - 1)];
+            const int64_t k = unzigzag(u >> rb) + base;
+            history[j][1] = history[j][0];
+            history[j][0] = k;
+            const auto bits = lattice_bits(k, kind.step_bits, kind.format);
+            if (!bits) {
+                return std::nullopt;
+            }
+            const uint64_t sign_bit = uint64_t{1} << (size * 8 - 1);
+            write_field(&out[pos], kind.format, (*bits & sign_bit) | static_cast<uint64_t>(static_cast<int64_t>(*bits & (sign_bit - 1)) + residual));
+        }
+    }
+    return out;
+}
+
+inline std::vector<uint8_t> scan_any_encode(const std::vector<uint8_t>& data, const scan_config& cfg) {
+    return cfg.in_place ? scan_place_encode(data, cfg) : scan_encode(data, cfg);
+}
+
+inline std::optional<std::vector<uint8_t>> scan_any_decode(const std::vector<uint8_t>& enc, const scan_config& cfg) {
+    return cfg.in_place ? scan_place_decode(enc, cfg) : scan_decode(enc, cfg);
+}
+
+// The kinds for the data: for each format (doubles before floats, either byte order), the number of positions
+// (over the first max_bytes) that hold a value of d decimals at most, k not 0 and |value| in a plausible range,
+// for d from -4 to 12. The kind's step is the coarsest that keeps 95% of the finest one's hits; a kind needs its
+// values to cover min_cover of the bytes. Then each kind's lag is the one whose coded k are smallest
+inline scan_config find_scan_config(const std::vector<uint8_t>& all, const size_t max_bytes = 1 << 20, const double min_cover = 0.05,
+                                    const size_t max_kinds_per_format = 3) {
+    scan_config cfg;
+    const size_t n = std::min(all.size(), max_bytes);
+    if (n < 1024) {
+        return cfg;
+    }
+    const std::vector<uint8_t> data(all.begin(), all.begin() + static_cast<std::ptrdiff_t>(n));
+    std::array<size_t, 256> counts{};
+    for (const auto b : all) {
+        ++counts[b];
+    }
+    cfg.marker = static_cast<uint8_t>(std::min_element(counts.begin(), counts.end()) - counts.begin());
+    constexpr int dmin = -4, dmax = 12, nd = dmax - dmin + 1;
+    const float_format formats[] = {{8, false, false}, {8, true, false}, {4, false, false}, {4, true, false}};
+    for (const auto f : formats) {
+        std::array<double, nd> steps{};
+        std::array<lattice_field, nd> fields{};
+        for (int d = dmin; d <= dmax; ++d) {
+            auto& field = fields[static_cast<size_t>(d - dmin)];
+            field.format = f;
+            field.step_bits = value_bits(std::pow(10.0, -d), f);
+            field.residual_bits = 2;
+            steps[static_cast<size_t>(d - dmin)] = field_value(field.step_bits, f);
+        }
+        const double low = f.size == 8 ? 1e-9 : 1e-6, high = f.size == 8 ? 1e15 : 1e7;
+        // The steps each plausible position is on (bit d - dmin), k within the scan's limit
+        std::vector<uint32_t> masks;
+        for (size_t i = 0; i + f.size <= n; ++i) {
+            const uint64_t v = read_field(&data[i], f);
+            const double x = std::fabs(field_value(v, f));
+            // A double with 32 low zero bits is as likely two floats, the first 0: it does not choose kinds
+            if (!(x >= low && x <= high) || (f.size == 8 && (v & 0xFFFFFFFFu) == 0)) {
+                continue;
+            }
+            uint32_t mask = 0;
+            for (size_t d = 0; d < nd; ++d) {
+                scan_kind probe;
+                probe.format = f;
+                probe.step_bits = fields[d].step_bits;
+                if (detail::scan_point(&data[i], probe, steps[d])) {
+                    mask |= uint32_t{1} << d;
+                }
+            }
+            if (mask != 0) {
+                masks.push_back(mask);
+            }
+        }
+        // Greedy cover: the step that holds the most positions not held yet (the coarsest within 3% of the best),
+        // while it holds min_cover of the bytes (the first) or a third of that (the next ones)
+        std::vector<scan_kind> chosen;
+        uint32_t used = 0;
+        std::vector<bool> covered(masks.size(), false);
+        for (size_t round = 0; round < max_kinds_per_format; ++round) {
+            std::array<size_t, nd> gain{};
+            for (size_t i = 0; i < masks.size(); ++i) {
+                if (!covered[i]) {
+                    for (size_t d = 0; d < nd; ++d) {
+                        gain[d] += (masks[i] >> d) & 1;
+                    }
+                }
+            }
+            size_t best = 0;
+            for (size_t d = 0; d < nd; ++d) {
+                if (!((used >> d) & 1)) {
+                    best = std::max(best, gain[d]);
+                }
+            }
+            const double need = (round == 0 ? min_cover : min_cover / 3) * static_cast<double>(n);
+            if (best == 0 || static_cast<double>(best) * f.size < need) {
+                break;
+            }
+            size_t pick = 0;
+            for (size_t d = 0; d < nd; ++d) {
+                if (!((used >> d) & 1) && gain[d] * 100 >= best * 97) {
+                    pick = d;
+                    break;
+                }
+            }
+            used |= uint32_t{1} << pick;
+            for (size_t i = 0; i < masks.size(); ++i) {
+                covered[i] = covered[i] || ((masks[i] >> pick) & 1);
+            }
+            scan_kind kind;
+            kind.format = f;
+            kind.step_bits = fields[pick].step_bits;
+            kind.residual_bits = 2;
+            chosen.push_back(kind);
+        }
+        // The finest step first: each value goes to the finest kind whose k fits
+        std::sort(chosen.begin(), chosen.end(), [&](const scan_kind& a, const scan_kind& b) { return field_value(a.step_bits, f) < field_value(b.step_bits, f); });
+        cfg.kinds.insert(cfg.kinds.end(), chosen.begin(), chosen.end());
+    }
+    if (cfg.kinds.empty()) {
+        return cfg;
+    }
+    // Lags: the coded values of each kind under each lag, from one parse (the lags do not change it)
+    std::vector<std::vector<int64_t>> coded;
+    scan_encode(data, cfg, &coded);
+    std::vector<scan_kind> kept;
+    for (size_t j = 0; j < cfg.kinds.size(); ++j) {
+        double best = 0;
+        int best_lag = 0;
+        for (int lag = 0; lag < 3; ++lag) {
+            // Adaptive order-0 cost of the coded values (a value seen before is cheap: repeated values, as in
+            // columns of few distinct values, favour k itself; smooth series favour differences), escapes costing
+            // the magnitude's bits
+            double cost = 0;
+            std::unordered_map<int64_t, uint32_t> seen;
+            uint32_t total = 0;
+            for (const auto c : coded[j * 3 + static_cast<size_t>(lag)]) {
+                const auto it = seen.find(c);
+                const double hits = it == seen.end() ? 0.0 : it->second;
+                const double fresh = std::log2(2.0 + std::fabs(static_cast<double>(c))) * 2 + 1;
+                cost += hits > 0 ? -std::log2(hits / (total + 1.0)) : -std::log2(1.0 / (total + 1.0)) + fresh;
+                ++seen[c];
+                ++total;
+            }
+            if (lag == 0 || cost < best) {
+                best = cost;
+                best_lag = lag;
+            }
+        }
+        cfg.kinds[j].lag = best_lag;
+        // A kind that the parse leaves with few tokens is noise
+        if (static_cast<double>(coded[j * 3].size()) * cfg.kinds[j].format.size >= min_cover / 3 * static_cast<double>(n)) {
+            kept.push_back(cfg.kinds[j]);
+        }
+    }
+    cfg.kinds = kept;
+    return cfg;
 }
 
 // NUMBERS IN TEXT. A reversible transform replaces each decimal number of a text by a token: a marker byte (absent

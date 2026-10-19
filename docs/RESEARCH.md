@@ -226,6 +226,44 @@ Integrating it found two bugs that macOS release builds hid:
 
 AddressSanitizer on Linux caught the first; the unit tests the second.
 
+### The lattice on real floating point files
+
+Is sao a lucky case? 23 public files that store values in binary floating point, each round trip verified:
+shapefiles and a GeoPackage (TIGER roads, Natural Earth), FITS and raw tables of the Hipparcos catalog, NetCDF,
+HDF5, SQLite, Parquet and Feather of a weather buoy, an Argo float profile, meshes, and negative controls (float
+audio, satellite images, simulation output).
+
+The lattice wins on decimal values of high cardinality, where almost every value is new: their mantissas' low
+bytes look random to any model, and only the lattice makes them computed. It gains nothing on sensor readings of
+low cardinality (a buoy: 100 to 500 distinct values per column), whatever the container: column and order
+contexts already learn each value's bytes, and paq8px stays 1% to 55% ahead there. It is never chosen wrongly
+on the negative controls.
+
+Why the first version missed some:
+- a header before the records (4 KB in the NetCDF, 11 KB in the FITS) sent the step search astray;
+- values off the lattice mixed in (computed points among the places of Natural Earth);
+- 8 fields at most (the buoy's records have 12 floats);
+- records of varying length (polylines, GeoPackage and SQLite pages): no fixed width at all;
+- pure streams of doubles taken for text (under 10% of control bytes), so never analyzed.
+
+The fixes: decimal steps (powers of 10) tried first, robust to a quarter of the values off the lattice; fields
+searched on records away from the start, up to 24; and the scan transform, which finds decimal doubles and floats
+anywhere and codes each as its k, or its difference with the value one or two before (x and y alternate), as a
+token or in place. Both the scan and the record plans are compared on the sample, the scan with a margin of 2%
+(the sample may not show how scanned columns spread over the file).
+
+| File | zpaq -m5 | gmz before | gmz | paq8px -8 |
+|---|---|---|---|---|
+| Natural Earth places (.shp) | 101,022 | 73,856 | **56,111** | 84,786 |
+| TIGER roads (.shp) | 253,907 | 200,550 | **161,136** | (128 KB slice: gmz 33% below) |
+| TIGER roads (.gpkg) | 280,582 | 235,236 | **170,105** | (slice: gmz 37% below) |
+| TIGER coordinates as raw doubles | 195,776 | 203,108 | **115,645** | (slice: gmz 43% below) |
+| Hipparcos (FITS table) | 307,166 | 238,122 | **223,704** | (slice: gmz 1% above) |
+| buoy (SQLite) | 178,296 | 166,118 | 158,998 | (slice: gmz 55% above) |
+
+Not done: choosing the step value by value for columns that mix precisions (USGS coordinates: 4 decimals and
+1/60000 of a degree), and fields across the boundary of a record.
+
 ### Numbers in text
 
 Logs, CSV, JSON and tables spend most of gmz's bits on digits: 61% to 98% of the coded bits for 15% to 74% of the
@@ -286,6 +324,25 @@ of digits pays the comparison of two more plans for little (bib -1%, trans 0%).
 Integrating it found that decoding a corrupted message could crash: a digit's first bits, coded as near certain,
 came out otherwise, and a shift went negative. 126 decodings of corrupted messages under AddressSanitizer now all
 end in a clean refusal.
+
+Validated on 30 more files from new sources (finance, astronomy, genomics, logs, GPS, OpenStreetMap, government
+CSV, JSON APIs, SQL dumps, C tables, and negative controls), the numeric plan is chosen on 23 and takes gmz 12.1%
+below its text model overall, never worse, the controls untouched:
+
+| Kind of data | Gain | Against paq8px |
+|---|---|---|
+| finance (Binance, EUR/USD ticks, ECB, VIX, CoinGecko) | 9% to 32% | -1.8% to +1.4% (ETHBTC trades +6.4%) |
+| scientific tables (exoplanets, UCSC genes) | 24% to 29% | +3% to +5% |
+| census CSV | 18% | -3.3% |
+| SQL dumps, C tables of floats | 8% to 30% | +7% to +15% |
+| genomics (VCF, GFF), geography (OSM, GPX, GeoJSON) | 5% to 14% | +4% to +27%, the text around the numbers |
+| web logs (nginx, Zeek) | 0% to 0.6% | the plan rightly rejected |
+
+Its failures: numbers that are categories (addresses, status codes, ports), random identifiers and hexadecimal
+cut into decimal fragments, JSON on a single line (no line above to predict from), smooth functions (tables of
+cosines), and columns computed from others. That last one is the axis again: in ETHBTC trades quote = price ×
+quantity, in the census NPOPCHG = POP(t) - POP(t-1); a prototype learning, per column, a sum, difference or
+product of two earlier numbers of the line takes ETHBTC 34% and the census 22.5% below paq8px.
 
 ### A million random digits
 

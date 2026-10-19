@@ -70,6 +70,13 @@ if (BUILD_TESTING AND (PROJECT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR))
     add_test(NAME gmz_numbers_checksum COMMAND ${CMAKE_COMMAND} -DGMZ=$<TARGET_FILE:gmz> -DINPUT=${GMZ_SAMPLES}/numbers.csv
              -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/numbers_mismatch -DOPTIONS=-T\;18 -DDECOMPRESS_OPTIONS=-T\;17
              -P ${CMAKE_CURRENT_SOURCE_DIR}/round_trip.cmake)
+    # Decimal doubles in shapes of varying length, and floats in records behind a header
+    add_test(NAME gmz_scan COMMAND gmz t ${GMZ_SAMPLES}/polylines.bin)
+    add_test(NAME gmz_scan_level1 COMMAND gmz -1 -S 4096 t ${GMZ_SAMPLES}/polylines.bin)
+    add_test(NAME gmz_scan_files COMMAND ${CMAKE_COMMAND} -DGMZ=$<TARGET_FILE:gmz> -DINPUT=${GMZ_SAMPLES}/polylines.bin
+             -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/polylines -DOPTIONS=-T\;18 -P ${CMAKE_CURRENT_SOURCE_DIR}/round_trip.cmake)
+    add_test(NAME gmz_header_records COMMAND gmz t ${GMZ_SAMPLES}/header_records.bin)
+    set_tests_properties(gmz_scan gmz_scan_level1 gmz_scan_files gmz_header_records PROPERTIES FIXTURES_REQUIRED gmz_samples)
     set_tests_properties(gmz_records gmz_records_level1 gmz_image_little_endian gmz_image_big_endian gmz_records_files
                          gmz_records_checksum gmz_numbers_checksum gmz_numbers_csv gmz_numbers_json gmz_numbers_log gmz_numbers_only gmz_numbers_off
                          gmz_numbers_crowded gmz_numbers_files PROPERTIES FIXTURES_REQUIRED gmz_samples)
@@ -89,4 +96,8 @@ if (BUILD_TESTING AND (PROJECT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR))
     # stack frame on most calls, which costs these runs about 200 times more with GCC on ARM64
     get_property(gmz_tests DIRECTORY PROPERTY TESTS)
     set_tests_properties(${gmz_tests} PROPERTIES TIMEOUT 60 ENVIRONMENT "ASAN_OPTIONS=detect_stack_use_after_return=0")
+    # The structure plans compare many ways on the samples: under sanitizers and emulation (Rosetta, QEMU), minutes
+    get_property(sample_tests DIRECTORY PROPERTY TESTS)
+    list(FILTER sample_tests INCLUDE REGEX "gmz_(records|image|numbers|scan|header)")
+    set_tests_properties(${sample_tests} PROPERTIES TIMEOUT 180)
 endif ()

@@ -63,6 +63,7 @@ struct config {
     size_t record = 0;      // record width in bytes for the column contexts, 0 for none
     size_t lattice_width = 0;                // records of the lattice transform, 0 for none
     std::vector<lattice_field> lattice;      // its fields
+    scan_config scan;                        // decimal values anywhere, no kinds for none
     size_t sample_bytes = 0;  // numeric samples of 2 or 4 bytes, high byte first, 0 for none
     size_t sample_stride = 0; // bytes from one sample to the next
     size_t image_row = 0;     // bytes per row of an image of samples, 0 for a signal (one dimension)
@@ -1449,7 +1450,7 @@ gmprime compress(const std::vector<uint8_t>& payload, config cfg, const bool cap
     encode_number(encoder, static_cast<size_t>(cfg.x86), 2);
     // The structure found beyond the fold, only when there is one
     const bool structured = cfg.width >= 65536 || cfg.record > 0 || cfg.lattice_width > 0 || cfg.sample_bytes > 0 || cfg.swap > 0 || cfg.no_text
-                            || cfg.numeric;
+                            || cfg.numeric || !cfg.scan.kinds.empty();
     encode_number(encoder, structured ? 1 : 0, 1);
     if (structured) {
         encode_number(encoder, cfg.width >> 16, 8);
@@ -1480,7 +1481,7 @@ gmprime compress(const std::vector<uint8_t>& payload, config cfg, const bool cap
             encode_set(encoder, cfg.text_bytes);
             encode_set(encoder, cfg.layout_bytes);
         }
-        encode_number(encoder, cfg.lattice.size(), 4);
+        encode_number(encoder, cfg.lattice.size(), 5);
         for (const auto& f : cfg.lattice) {
             encode_number(encoder, f.offset, 16);
             encode_number(encoder, f.format.size == 8 ? 1 : 0, 1);
@@ -1491,6 +1492,19 @@ gmprime compress(const std::vector<uint8_t>& payload, config cfg, const bool cap
             encode_number(encoder, f.step_bits & 0xFFFFFFFFu, 32);
             encode_number(encoder, static_cast<size_t>(f.residual_bits), 3);
             encode_number(encoder, f.delta ? 1 : 0, 1);
+        }
+        encode_number(encoder, cfg.scan.kinds.size(), 4);
+        if (!cfg.scan.kinds.empty()) {
+            encode_number(encoder, cfg.scan.marker, 8);
+            encode_number(encoder, cfg.scan.in_place ? 1 : 0, 1);
+            for (const auto& k : cfg.scan.kinds) {
+                encode_number(encoder, k.format.size == 8 ? 1 : 0, 1);
+                encode_number(encoder, k.format.big_endian ? 1 : 0, 1);
+                encode_number(encoder, k.step_bits >> 32, 32);
+                encode_number(encoder, k.step_bits & 0xFFFFFFFFu, 32);
+                encode_number(encoder, static_cast<size_t>(k.residual_bits), 3);
+                encode_number(encoder, static_cast<size_t>(k.lag), 2);
+            }
         }
     }
 
@@ -1537,7 +1551,7 @@ std::optional<std::vector<uint8_t>> decompress(const gmprime& code, const int fo
             cfg.text_bytes = decode_set(decoder);
             cfg.layout_bytes = decode_set(decoder);
         }
-        cfg.lattice.resize(decode_number(decoder, 4));
+        cfg.lattice.resize(decode_number(decoder, 5));
         for (auto& f : cfg.lattice) {
             f.offset = decode_number(decoder, 16);
             f.format.size = decode_number(decoder, 1) ? 8 : 4;
@@ -1548,6 +1562,19 @@ std::optional<std::vector<uint8_t>> decompress(const gmprime& code, const int fo
             f.step_bits |= decode_number(decoder, 32);
             f.residual_bits = static_cast<int>(decode_number(decoder, 3));
             f.delta = decode_number(decoder, 1) == 1;
+        }
+        cfg.scan.kinds.resize(decode_number(decoder, 4));
+        if (!cfg.scan.kinds.empty()) {
+            cfg.scan.marker = static_cast<uint8_t>(decode_number(decoder, 8));
+            cfg.scan.in_place = decode_number(decoder, 1) == 1;
+            for (auto& k : cfg.scan.kinds) {
+                k.format.size = decode_number(decoder, 1) ? 8 : 4;
+                k.format.big_endian = decode_number(decoder, 1) == 1;
+                k.step_bits = decode_number(decoder, 32) << 32;
+                k.step_bits |= decode_number(decoder, 32);
+                k.residual_bits = static_cast<int>(decode_number(decoder, 3));
+                k.lag = static_cast<int>(decode_number(decoder, 2));
+            }
         }
     }
 
@@ -1586,6 +1613,13 @@ std::optional<std::vector<uint8_t>> decompress(const gmprime& code, const int fo
         }
         data = std::move(*original);
     }
+    if (!cfg.scan.kinds.empty()) {
+        auto original = scan_any_decode(data, cfg.scan);
+        if (!original) {
+            return std::nullopt; // LCOV_EXCL_LINE: only a corrupted message, which fuzzing finds the checksum rejects
+        }
+        data = std::move(*original);
+    }
     if (crc32(data) != check) {
         return std::nullopt;
     }
@@ -1610,7 +1644,8 @@ std::vector<uint8_t> transformed(const std::vector<uint8_t>& data, const plan& p
         auto text = p.capitals ? *capitals_encode(data) : data;
         return p.cfg.numeric ? numeric_text_encode(text, p.cfg.marker) : text;
     }
-    auto result = p.cfg.lattice_width > 0 ? lattice_encode(data, p.cfg.lattice_width, p.cfg.lattice) : data;
+    auto result = p.cfg.lattice_width > 0 ? lattice_encode(data, p.cfg.lattice_width, p.cfg.lattice)
+                : !p.cfg.scan.kinds.empty() ? scan_any_encode(data, p.cfg.scan) : data;
     if (p.cfg.swap > 0) {
         swap_pairs(result, p.cfg.swap - 1);
     }
@@ -1685,26 +1720,61 @@ std::vector<plan> structure_plans(const gmprime& file, const std::vector<uint8_t
         c.width = 8 * records.width;
         c.record = records.width;
         plans.push_back({"records", c});
-        const auto fields = find_lattice_fields(data, records.width);
-        if (!fields.empty()) {
-            c.lattice_width = records.width;
-            c.lattice = fields;
-            c.record = records.width + 1;
-            c.width = 8 * c.record;
-            c.no_text = true;
-            plans.push_back({"lattice", c});
+        // Floating point fields on a lattice: those of the decimal steps on records away from a header, and those
+        // of the first records, both tried when they differ, the estimates of either being rough
+        const auto add_lattice = [&](const std::vector<lattice_field>& fields, const char* name, const char* signal_name) {
+            config d = c;
+            d.lattice_width = records.width;
+            d.lattice = fields;
+            d.record = records.width + lattice_flag_bytes(fields.size());
+            d.width = 8 * d.record;
+            d.no_text = true;
+            plans.push_back({name, d});
             // A 4-byte field as a signal: k in offset binary, predicted from the same field in the records before
             for (size_t j = 0; j < fields.size(); ++j) {
                 if (fields[j].format.size == 4) {
-                    config d = c;
-                    d.lattice[j].delta = false;
-                    d.lattice[j].offset_binary = true;
-                    d.sample_bytes = 4;
-                    d.sample_stride = d.record;
-                    d.image_phase = 1 + d.lattice[j].offset;
-                    plans.push_back({"signal", d});
+                    config e = d;
+                    e.lattice[j].delta = false;
+                    e.lattice[j].offset_binary = true;
+                    e.sample_bytes = 4;
+                    e.sample_stride = e.record;
+                    e.image_phase = lattice_flag_bytes(fields.size()) + e.lattice[j].offset;
+                    plans.push_back({signal_name, e});
                 }
             }
+        };
+        const auto window = find_lattice_fields_window(data, records.width);
+        const auto first = find_lattice_fields(data, records.width);
+        if (!window.empty()) {
+            add_lattice(window, "lattice", "signal");
+        }
+        if (!first.empty() && first != window) {
+            add_lattice(first, "lattice0", "signal0");
+        }
+    }
+
+    // Decimal values anywhere (variable-length records, columns): the scan transform, as tokens or in place, with
+    // the fold or the records when there are some
+    const auto scan = find_scan_config(data);
+    if (!scan.kinds.empty()) {
+        config c = base;
+        c.scan = scan;
+        plans.push_back({"scan", c});
+        c.scan.in_place = true;
+        plans.push_back({"scanp", c});
+        if (folds.width > 0) {
+            config d = c;
+            d.fold = true;
+            d.width = folds.width;
+            d.layer = folds.layer < 256 ? folds.layer : 0;
+            plans.push_back({"scanp+fold", d});
+        }
+        if (records.width >= 2) {
+            config d = c;
+            d.fold = true;
+            d.width = 8 * records.width;
+            d.record = records.width;
+            plans.push_back({"scanp+rec", d});
         }
     }
 
@@ -1745,8 +1815,12 @@ choice compress_plans(const std::vector<uint8_t>& data, const std::vector<plan>&
         const bool slower = p.cfg.fold && best_size > 0 && !best.cfg.fold;
         const bool learner = p.cfg.numeric && best_size > 0 && !best.cfg.numeric && !best.cfg.fold;
         const bool plain = !p.cfg.numeric && best_size > 0 && best.cfg.numeric;
-        if (best_size == 0 || (slower ? size + size / 100 < best_size : learner ? size < best_size + best_size / 400
-                                                                              : plain ? size + size / 400 < best_size : size < best_size)) {
+        // A scan plan against one without: 2% larger, the sample not showing how the scanned values spread over the
+        // data (columns stored one after the other)
+        const bool scanned = !p.cfg.scan.kinds.empty() && best_size > 0 && best.cfg.scan.kinds.empty();
+        const size_t weighed = size + (scanned ? size / 50 : 0);
+        if (best_size == 0 || (slower ? weighed + size / 100 < best_size : learner ? weighed < best_size + best_size / 400
+                                                                                 : plain ? weighed + size / 400 < best_size : weighed < best_size)) {
             best_size = size;
             best.cfg = p.cfg;
             best.capitals = p.capitals;
@@ -1779,9 +1853,10 @@ choice compress_best(const gmprime& file, const std::string& mode, const std::st
     best.cfg.binary = code_mode == "auto" ? control_density(data) >= 1000 : code_mode != "off";
     best.cfg.x86 = code_mode == "32" ? 1 : code_mode == "64" ? 2 : code_mode != "auto" ? 0
                  : best.cfg.binary && x86_branch_density(data) >= 50 ? (x86_long_mode(data) ? 2 : 1) : 0;
-    // Binary data, or data that folds, may hide records or images: each way the analysis suggests is tried. Text
-    // keeps the way below, which only compares the capitals transform
-    if (mode == "auto" && best.cfg.x86 == 0 && capitals_mode != "on" && (best.cfg.binary || file.analyze_folds(64, 8192, 131072).strong())) {
+    // Binary data, data that folds, or decimal values stored in binary may hide records or images: each way the
+    // analysis suggests is tried. Text keeps the way below, which only compares the capitals transform
+    if (mode == "auto" && best.cfg.x86 == 0 && capitals_mode != "on"
+        && (best.cfg.binary || file.analyze_folds(64, 8192, 131072).strong() || !find_scan_config(data).kinds.empty())) {
         auto plans = structure_plans(file, data, best.cfg, capitals_mode);
         if (!best.cfg.binary) {
             add_numeric_plans(plans, data, numeric_mode);
