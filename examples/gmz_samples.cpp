@@ -11,7 +11,7 @@
 //   numbers.log   log lines with dates, addresses, counters, random identifiers and hexadecimal
 //   crowded.txt   numbers, and every byte that could mark them, so that none can
 //   polylines.bin shapes of varying length, as GIS files store them: a count, then points as decimal doubles
-//   header_records.bin  a header, then records of 10 decimal floats
+//   header_records.bin  a header, then records of 3 decimal doubles
 // Each just large enough for gmz to find its structure, so that the tests stay short
 //   gmz_samples DIRECTORY
 #include <cmath>
@@ -213,11 +213,11 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 300; ++i) {
         table.push_back(static_cast<uint8_t>(next()));
     }
-    int columns[10] = {};
+    int columns[3] = {};
     for (int r = 0; r < 300; ++r) {
-        for (int j = 0; j < 10; ++j) {
+        for (int j = 0; j < 3; ++j) {
             columns[j] += static_cast<int>(next() % 41) - 20;
-            put(table, float_bits(static_cast<float>(1000 * (j + 1) + columns[j]) * 0.01f), 4, false);
+            put(table, double_bits(static_cast<double>(1000 * (j + 1) + columns[j]) * 0.01), 8, false);
         }
     }
     save(dir + "header_records.bin", table);
